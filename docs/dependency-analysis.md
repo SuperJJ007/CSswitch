@@ -2,7 +2,7 @@
 
 > 目的：把「缺 node」这类报错的**问题本身**研究清楚，供决策与实机测试对照。不含具体改法（改法见 [`../CHANGELOG.md`](../CHANGELOG.md) / [`known-issues.md`](known-issues.md)）。
 
-> **进展（2026-07-03，v0.1.4 开发中）：node 缺口已从根上拔掉。** 虚拟 OAuth 伪造器已用 Rust 原生密码学重写（`desktop/src-tauri/src/oauth_forge.rs`），与 `.mjs` 的 v2 GCM 格式字节兼容（node↔rust 对拍单测过），一键流程零 node。**A 类和 B 类都解决**（不管装没装 node）。**剩 python3 一个缺口**（代理，下一步同法移 axum）。下文分析保留为问题记录。
+> **进展（2026-07-03，v0.1.4 已发布）：node 缺口已从根上拔掉。** 虚拟 OAuth 伪造器已用 Rust 原生密码学重写（`desktop/src-tauri/src/oauth_forge.rs`），与 `.mjs` 的 v2 GCM 格式字节兼容（node↔rust 对拍单测过），一键流程零 node。**A 类和 B 类都解决**（不管装没装 node）。**剩 python3 一个缺口**（代理，下一步同法移 axum）。下文分析保留为问题记录。
 
 ## 一句话结论
 

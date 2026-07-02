@@ -65,5 +65,5 @@ findings/                         证据、二进制分析、诊断记录；auto
 
 - 真实 Science 数据目录 `~/.claude-science`、端口 8765，绝对不碰。
 - 上游 key 在用户 shell 环境：`DEEPSEEK_API_KEY` / `DASHSCOPE_API_KEY`（值不显示、不入库）。DashScope 兼容端点 `https://dashscope.aliyuncs.com/compatible-mode/v1`。
-- **代理端口坑**（gh/git 也踩）：小写 `https_proxy`/`ALL_PROXY`→`127.0.0.1:7890`（活的）；大写 `HTTPS_PROXY`→`127.0.0.1:8001`（死的）。operon 认小写。详见记忆 `github-repo`。
+- **代理端口坑（gh/git/operon 都踩，反复中招）**：小写 `https_proxy`/`http_proxy`/`ALL_PROXY`→`127.0.0.1:7890`（**活**）；大写 `HTTPS_PROXY`/`HTTP_PROXY`→`127.0.0.1:8001`（**死，连接被拒**）。gh（Go）读大写 → 连不上 GitHub，**还会把 token 误报 `invalid`（假阴性，别当成要重新登录）**。**跑任何 gh/git 前先**：`export HTTPS_PROXY=http://127.0.0.1:7890 HTTP_PROXY=http://127.0.0.1:7890 ALL_PROXY=http://127.0.0.1:7890`。operon 认小写、本就走 7890。详见记忆 `github-repo`。
 - Python 用 conda 环境（见用户全局记忆），避免系统 3.9。
