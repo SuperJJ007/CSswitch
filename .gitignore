@@ -16,3 +16,7 @@ __pycache__/
 # macOS 与工作区杂物
 .DS_Store
 .superpowers/
+
+# 每日巡检运行产物：全是本机运行态（报告/版本基线/日志/锁），只保留空目录占位
+findings/auto-maint/*
+!findings/auto-maint/.gitkeep
