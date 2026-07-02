@@ -1,0 +1,26 @@
+# CSSwitch gitleaks 配置：默认规则 + 明确 allowlist。
+# 用法：
+#   gitleaks git .            扫 git 历史（committed，= 将被推送的内容）
+#   gitleaks dir .            扫工作树（含未提交文件）
+#   gitleaks protect --staged 扫待提交暂存区
+# 原则：真实密钥（encryption.key / .oauth-tokens / *.env）从不入库，已由 .gitignore 挡住；
+#       此处只把「文档示例、测试假 token、运行期沙箱资产」列入 allowlist，避免假阳性淹没真信号。
+
+title = "CSSwitch gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "运行期资产（gitignore 之外的双保险）+ 测试假 token / 占位常量"
+paths = [
+  '''\.sandbox/''',            # 隔离沙箱运行时（大文件、克隆资产），已 gitignore
+  '''findings/auto-maint/''',  # 每日巡检运行态产物，已 gitignore
+]
+# 测试与文档里的假 token / 占位常量（非真实密钥，出现在 test/ 与 docs/）
+regexes = [
+  '''fake-key''',
+  '''s3cr3t-test-token''',
+  '''verify-test-secret''',
+  '''DUMMY-KEY-abc123XYZ-should-never-print''',
+]
