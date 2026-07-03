@@ -1,0 +1,71 @@
+# CSSwitch 容器化代理 — Docker Compose 编排
+#
+# 快速启动：
+#   cp docker/.env.example docker/.env
+#   # 编辑 docker/.env，填入你的 API key
+#   docker compose -f docker/docker-compose.yml up -d
+#
+# 可选 Caddy TLS 反代（保护 path secret 不在明文 HTTP 上传输）：
+#   取消下方 caddy 服务的注释，并：
+#   docker compose -f docker/docker-compose.yml --profile tls up -d
+#
+# 健康检查：
+#   curl http://localhost:18991/<secret>/health
+
+name: csswitch
+
+services:
+  csswitch-proxy:
+    image: csswitch-proxy:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: csswitch-proxy
+    env_file:
+      - .env
+    ports:
+      - "${CSSWITCH_PROXY_PORT:-18991}:${CSSWITCH_PROXY_PORT:-18991}"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+        "import urllib.request, os, sys; \
+         t=os.environ.get('CSSWITCH_AUTH_TOKEN',''); \
+         p=os.environ.get('CSSWITCH_PROXY_PORT','18991'); \
+         u=f'http://127.0.0.1:{p}/{\"\" if not t else t}/health'; \
+         sys.exit(0 if 200==urllib.request.urlopen(u,timeout=3).getcode() else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    volumes:
+      - csswitch-logs:/app/logs
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ── 可选：Caddy 本地 HTTPS/TLS 反代 ──────────────────────────
+# 启用方式：docker compose -f docker/docker-compose.yml --profile tls up -d
+#
+# 注意：Caddy 使用自签名证书（tls internal），适合本地/内网环境。
+# 浏览器首次访问需确认安全例外；curl 加 -k 或 --insecure。
+#
+#  caddy:
+#    profiles: ["tls"]
+#    image: caddy:2-alpine
+#    container_name: csswitch-caddy
+#    restart: unless-stopped
+#    ports:
+#      - "8443:8443"
+#    volumes:
+#      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+#      - caddy-data:/data
+#      - caddy-config:/config
+#    depends_on:
+#      - csswitch-proxy
+
+volumes:
+  csswitch-logs:
+  caddy-data:
+  caddy-config:

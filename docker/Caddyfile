@@ -1,0 +1,22 @@
+# CSSwitch Caddy TLS 反代配置
+# 用于 docker-compose.yml 的 caddy 服务（需启用 tls profile）
+# 提供本地 HTTPS 保护 path secret 不在 WSL2 内部明文传输。
+#
+# 使用自签名证书（tls internal），适合本地/内网环境。
+# 生产环境请替换 tls internal 为你的真实证书。
+
+:8443 {
+    # 自签名 TLS（本地/内网适用）
+    tls internal
+
+    # 反代到 csswitch-proxy 容器
+    reverse_proxy csswitch-proxy:{$CSSWITCH_PROXY_PORT:-18991} {
+        # 透传原始 Host 与 path（含 path secret）
+        header_up Host {host}
+    }
+
+    # 访问日志
+    log {
+        output file /data/access.log
+    }
+}
