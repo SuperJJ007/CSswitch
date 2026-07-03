@@ -98,7 +98,7 @@ DeepSeek 原生 Anthropic 端点  /  通义千问等 OpenAI 兼容端点
 - 本项目仅供**个人学习与研究**用途，**使用者自负风险**。
 - 推理请求经本地代理直连你自己付费的第三方模型，**不经过 Anthropic 服务端**做推理，用的是本地自造的虚拟登录，**零真实 Anthropic 凭证**。
 - Science 在**启动阶段**仍会尝试访问其硬编码的 profile / account 接口（`api.anthropic.com` / `claude.ai`）；代理对这些请求即时短路（返回「未登录」），Science 以未登录态正常启动、不影响第三方推理。因此本项目**不宣称**「完全零 Anthropic 接触」这类绝对说法。
-- 虚拟登录下，**Anthropic 托管的远程 MCP 服务**（如 pubmed / clinical-trials / chembl / biorxiv，位于 `*.mcp.claude.com`）不可用：它们需真实 Anthropic 授权，代理已将其短路，Science 会自动跳过（启动日志有 `load failed (skipped)` 属正常）。**本地内置的 bio-tools MCP 仍正常可用。**
+- 虚拟登录下，**Anthropic 托管的远程 MCP 服务**（如 pubmed / clinical-trials / chembl / biorxiv，位于 `*.mcp.claude.com`）不可用：它们需真实 Anthropic 授权，代理已将其短路，Science 会自动跳过（启动日志有 `load failed (skipped)` 属正常）。**本地内置的 bio-tools MCP 仍正常可用**；需要这四个 HCLS 连接器时，可运行 [`scripts/install-local-bio-connectors.sh`](./scripts/install-local-bio-connectors.sh) 把它们补成本地 stdio 连接器，细节见 [`docs/local-bio-connectors.md`](./docs/local-bio-connectors.md)。
 - 对 Science 登录令牌加密格式的逆向、以及「越过登录」的实现，可能触及相关服务条款与版权法规（如美国 DMCA §1201 反规避条款）。是否适用、有无豁免需专业法律判断。
 - 本项目与 Anthropic **无任何从属、合作或背书关系**；不偷取算力（推理走你自付第三方）、不泄露用户密钥、不含恶意代码。
 - 软件按「现状」提供，**不提供任何形式的担保**。
