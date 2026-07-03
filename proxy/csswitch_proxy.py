@@ -640,6 +640,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--provider", default=os.environ.get("CSSWITCH_PROVIDER", "deepseek"),
                     choices=list(PROVIDERS.keys()))
+    ap.add_argument("--host", default=os.environ.get("CSSWITCH_BIND_HOST", "127.0.0.1"),
+                    help="绑定地址（默认 127.0.0.1；容器内可设 0.0.0.0）")
     ap.add_argument("--port", type=int, default=18991)
     ap.add_argument("--env-file", default=None)
     ap.add_argument("--log", default=None)
@@ -648,6 +650,7 @@ if __name__ == "__main__":
     PROV_NAME = args.provider
     PROV = PROVIDERS[PROV_NAME]
     LOG = args.log
+    HOST = args.host
     KEY = load_key(PROV, args)
     AUTH_SECRET = os.environ.get("CSSWITCH_AUTH_TOKEN") or args.auth_token
     _up = os.environ.get("CSSWITCH_UPSTREAM_URL")
@@ -657,14 +660,14 @@ if __name__ == "__main__":
     if not KEY:
         print(f"找不到 {PROV['key_env']}。用环境变量或 --env-file <路径> 提供。", file=sys.stderr)
         sys.exit(1)
-    log(f"CSSwitch 代理启动 127.0.0.1:{args.port}  provider={PROV_NAME}  "
+    log(f"CSSwitch 代理启动 {HOST}:{args.port}  provider={PROV_NAME}  "
         f"key=已加载(未显示)  上游={PROV['url']}")
     # 绑定重试：上次会话遗留的孤儿代理可能还占着端口（app 侧会主动清，但退干净需一点时间）。
     # 重试 ~3s 等端口释放，避免一次绑不上就直接失败（Errno 48）。
     srv = None
     for attempt in range(10):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", args.port), H)
+            srv = ThreadingHTTPServer((HOST, args.port), H)
             break
         except OSError as e:
             if attempt == 9:
