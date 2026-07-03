@@ -39,6 +39,7 @@ pub fn match_base_url(url: &str) -> Option<&'static str> {
 /// PR #4 用单槽 `providers["relay"]` + `provider="relay"`；多槽落地后把它迁到 `relay-<preset>`：
 ///   - 有旧 `relay` 槽 → 按 base_url match_base_url（不中→relay-custom）搬 key/base_url/model，删旧槽。
 ///   - provider=="relay" → 改成迁移后的目标 id；无槽可搬则落 deepseek（不留非法 provider）。
+///
 /// 改动了返回 true。已是多槽 / 非 relay 配置 → 不动，返回 false。
 pub fn migrate_legacy_relay(cfg: &mut crate::config::Config) -> bool {
     let mut changed = false;

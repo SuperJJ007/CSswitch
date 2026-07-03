@@ -570,9 +570,8 @@ fn set_config(cfg: UiSettings) -> Result<(), String> {
     // 的流程会在切 provider 时就被拦下。必填校验放在真正要用它的 ensure_proxy /
     // fetch_relay_models（那里给的提示也更贴合动作）。
     let base_url = cfg.base_url.clone().unwrap_or_default().trim().to_string();
-    if !base_url.is_empty()
-        && !(base_url.starts_with("http://") || base_url.starts_with("https://"))
-    {
+    let has_scheme = base_url.starts_with("http://") || base_url.starts_with("https://");
+    if !base_url.is_empty() && !has_scheme {
         return Err("中转站 base_url 必须以 http:// 或 https:// 开头。".into());
     }
     let dir = config::default_dir();
