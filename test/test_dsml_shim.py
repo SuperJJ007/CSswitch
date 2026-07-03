@@ -480,5 +480,41 @@ class RewriterDsml(unittest.TestCase):
         self.assertLess(kinds.index("content_block_stop"), kinds.index("message_stop"))
 
 
+class NonStream(unittest.TestCase):
+    def _resp(self, text):
+        return json.dumps({"id": "m", "type": "message", "role": "assistant",
+            "model": "deepseek-v4-pro", "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 2}},
+            ensure_ascii=False).encode("utf-8")
+
+    def test_leak_rewritten_to_tool_use_and_stop_reason(self):
+        leak = ('<｜｜DSML｜｜tool_calls> <｜｜DSML｜｜invoke name="web_search">'
+                '<｜｜DSML｜｜parameter name="query" string="true">q</｜｜DSML｜｜parameter>'
+                ' </｜｜DSML｜｜invoke> </｜｜DSML｜｜tool_calls>')
+        out = json.loads(ds.rewrite_nonstream_body(self._resp("A" + leak + "B"), WS, nonce="t"))
+        types = [b["type"] for b in out["content"]]
+        self.assertEqual(types, ["text", "tool_use", "text"])
+        self.assertEqual(out["content"][1]["name"], "web_search")
+        self.assertEqual(out["content"][1]["input"], {"query": "q"})
+        self.assertEqual(out["stop_reason"], "tool_use")
+
+    def test_no_dsml_unchanged_semantics(self):
+        raw = self._resp("plain answer")
+        out = json.loads(ds.rewrite_nonstream_body(raw, WS, nonce="t"))
+        self.assertEqual(out["content"], [{"type": "text", "text": "plain answer"}])
+        self.assertEqual(out["stop_reason"], "end_turn")
+
+    def test_unknown_tool_unchanged(self):
+        leak = ('<｜｜DSML｜｜tool_calls> <｜｜DSML｜｜invoke name="evil">'
+                '<｜｜DSML｜｜parameter name="c" string="true">x</｜｜DSML｜｜parameter>'
+                ' </｜｜DSML｜｜invoke> </｜｜DSML｜｜tool_calls>')
+        out = json.loads(ds.rewrite_nonstream_body(self._resp(leak), WS, nonce="t"))
+        self.assertEqual([b["type"] for b in out["content"]], ["text"])
+        self.assertEqual(out["stop_reason"], "end_turn")
+
+    def test_non_json_returned_as_is(self):
+        self.assertEqual(ds.rewrite_nonstream_body(b"not json", WS), b"not json")
+
+
 if __name__ == "__main__":
     unittest.main()

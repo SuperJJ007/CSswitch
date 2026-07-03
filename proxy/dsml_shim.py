@@ -425,3 +425,36 @@ class DsmlStreamRewriter:
     @staticmethod
     def _raw(frame):
         return (frame + "\n\n").encode("utf-8")
+
+
+def rewrite_nonstream_body(body_bytes, known_tools, nonce=""):
+    """非流式响应体：把 text content 块里的 DSML 段按分段顺序展开成 text/tool_use 块。保守：坏 JSON 原样返回。"""
+    nonce = nonce or "x"
+    try:
+        obj = json.loads(body_bytes)
+    except (ValueError, json.JSONDecodeError):
+        return body_bytes
+    if not isinstance(obj, dict) or not isinstance(obj.get("content"), list):
+        return body_bytes
+    new_content = []
+    n = 0
+    changed = False
+    for blk in obj["content"]:
+        if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
+            segs = segment_dsml_text(blk["text"], known_tools)
+            if any(s["type"] == "tool_use" for s in segs):
+                changed = True
+                for s in segs:
+                    if s["type"] == "text":
+                        new_content.append({"type": "text", "text": s["text"]})
+                    else:
+                        n += 1
+                        new_content.append({"type": "tool_use", "id": f"toolu_dsml_{nonce}_{n}",
+                                            "name": s["name"], "input": s["input"]})
+                continue
+        new_content.append(blk)
+    if changed:
+        obj["content"] = new_content
+        if obj.get("stop_reason") in ("end_turn", "stop", None):
+            obj["stop_reason"] = "tool_use"
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
