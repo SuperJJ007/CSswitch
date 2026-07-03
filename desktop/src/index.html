@@ -30,6 +30,7 @@
         <select id="provider">
           <option value="deepseek">DeepSeek（原生 Anthropic 端点）</option>
           <option value="qwen">通义千问 Qwen（DashScope 翻译）</option>
+          <option value="relay">中转站（任意 Anthropic 兼容端点）</option>
         </select>
       </div>
 
@@ -40,6 +41,16 @@
           <button class="btn small" id="saveKeyBtn">保存</button>
         </div>
         <div class="hint">存本地 <code>~/.csswitch/config.json</code>（0600）；面板只回显末 4 位。</div>
+      </div>
+
+      <div class="sec relay-only">
+        <label>中转站地址 base_url</label>
+        <div class="row">
+          <input id="relayBase" type="text" placeholder="https://your-relay/claude" autocomplete="off" spellcheck="false" />
+          <button class="btn small" id="fetchModelsBtn">获取模型</button>
+        </div>
+        <div class="hint">任意 Anthropic 兼容中转站的根地址（自动补 <code>/v1/messages</code> 与 <code>/v1/models</code>）。填好上面的 Key 与此地址后点「获取模型」。</div>
+        <div id="modelList" class="modellist" hidden></div>
       </div>
 
       <details class="sec adv tp-only">

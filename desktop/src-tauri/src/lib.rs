@@ -49,15 +49,46 @@ fn key_fingerprint(s: &str) -> u64 {
 fn key_env(provider: &str) -> &'static str {
     match provider {
         "qwen" => "DASHSCOPE_API_KEY",
+        "relay" => "CSSWITCH_RELAY_KEY",
         _ => "DEEPSEEK_API_KEY",
     }
 }
 
-fn upstream_host(provider: &str) -> &'static str {
+/// 上游主机名（供 status 上游灯做 TCP 可达性探测）。relay 从其 base_url 解析。
+fn upstream_host(provider: &str, base_url: &str) -> String {
     match provider {
-        "qwen" => "dashscope.aliyuncs.com",
-        _ => "api.deepseek.com",
+        "qwen" => "dashscope.aliyuncs.com".to_string(),
+        "relay" => parse_host(base_url).unwrap_or_default(),
+        _ => "api.deepseek.com".to_string(),
     }
+}
+
+/// 从 `http(s)://host[:port]/path` 里抽出 host。解析不出返回 None（不引 url crate）。
+fn parse_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// 判断模型 id 是否会平铺进 Science 选择器主列表（claude-{opus|sonnet|haiku}-<数字…>）。
+/// 仅用于「获取模型」结果排序（主列表项排前），非鉴权路径。
+fn is_main_list_model(id: &str) -> bool {
+    for fam in ["claude-opus-", "claude-sonnet-", "claude-haiku-"] {
+        if let Some(rest) = id.strip_prefix(fam) {
+            return rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+        }
+    }
+    false
 }
 
 // ---------- 路径与日志 ----------
@@ -221,7 +252,13 @@ fn ensure_proxy(
     let key = cfg
         .key_for(&provider)
         .ok_or_else(|| format!("缺少 {provider} 的 API key，请先在面板填写并保存。"))?;
-    let key_fp = key_fingerprint(&key);
+    // relay（中转站）：base_url 必填，作上游根地址。非 relay 为空串。
+    let base_url = cfg.base_url_for(&provider).unwrap_or_default();
+    if provider == "relay" && base_url.is_empty() {
+        return Err("中转站模式需要填 base_url（如 https://your-relay/claude），请先在面板填写并保存。".into());
+    }
+    // 指纹并入 base_url：换 key 或换中转站地址都触发代理重启（避免复用旧上游）。
+    let key_fp = key_fingerprint(&format!("{key}\n{base_url}"));
     let port = cfg.proxy_port;
     let root = asset_root(app)
         .ok_or("找不到代理脚本 proxy/csswitch_proxy.py（打包资源或仓库根均未命中）。开发态可设 CSSWITCH_REPO。")?;
@@ -267,8 +304,8 @@ fn ensure_proxy(
 
         let logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-        let child = Command::new(&py)
-            .arg(&script)
+        let mut cmd = Command::new(&py);
+        cmd.arg(&script)
             .arg("--provider")
             .arg(&provider)
             .arg("--port")
@@ -276,7 +313,12 @@ fn ensure_proxy(
             .arg("--auth-token")
             .arg(&secret)
             // key 经环境变量注入，绝不作为命令行参数（避免 ps 泄露）。
-            .env(key_env(&provider), &key)
+            .env(key_env(&provider), &key);
+        // relay：中转站 base_url 经环境变量交给代理（非密钥，但与 key 一致走 env）。
+        if provider == "relay" {
+            cmd.env("CSSWITCH_RELAY_BASE_URL", &base_url);
+        }
+        let child = cmd
             .stdout(Stdio::from(logf))
             .stderr(Stdio::from(logf2))
             .spawn()
@@ -363,7 +405,7 @@ fn get_config() -> Result<serde_json::Value, String> {
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
     let mut keys = serde_json::Map::new();
-    for p in ["deepseek", "qwen"] {
+    for p in ["deepseek", "qwen", "relay"] {
         let masked = cfg.key_for(p).map(|k| config::mask(&k)).unwrap_or_default();
         keys.insert(p.to_string(), serde_json::Value::String(masked));
     }
@@ -373,6 +415,8 @@ fn get_config() -> Result<serde_json::Value, String> {
         "sandbox_port": cfg.sandbox_port,
         "mode": cfg.mode,
         "keys": keys,
+        // 中转站 base_url（非密钥，可回显），供面板回填。
+        "relay_base_url": cfg.base_url_for("relay").unwrap_or_default(),
     }))
 }
 
@@ -448,6 +492,9 @@ struct UiSettings {
     provider: String,
     proxy_port: u16,
     sandbox_port: u16,
+    /// 仅「中转站」(relay) 用：中转站 base_url。其它 provider 前端不传（None → 不改动已存值）。
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
 #[tauri::command]
@@ -457,9 +504,9 @@ fn set_config(cfg: UiSettings) -> Result<(), String> {
         return Err("端口 8765 是真实 Science 实例保留端口，不能用。".into());
     }
     // 只认已实现的 provider，避免存进未知值后起代理时才失败（修 P2-3）。
-    if cfg.provider != "deepseek" && cfg.provider != "qwen" {
+    if cfg.provider != "deepseek" && cfg.provider != "qwen" && cfg.provider != "relay" {
         return Err(format!(
-            "未知 provider：{}（只支持 deepseek / qwen）。",
+            "未知 provider：{}（只支持 deepseek / qwen / relay）。",
             cfg.provider
         ));
     }
@@ -471,11 +518,25 @@ fn set_config(cfg: UiSettings) -> Result<(), String> {
     if cfg.proxy_port == cfg.sandbox_port {
         return Err("代理端口与沙箱端口不能相同。".into());
     }
+    // base_url 只做「非空时校验格式」——不在这里强制必填，否则「先选中转站、再填地址」
+    // 的流程会在切 provider 时就被拦下。必填校验放在真正要用它的 ensure_proxy /
+    // fetch_relay_models（那里给的提示也更贴合动作）。
+    let base_url = cfg.base_url.clone().unwrap_or_default().trim().to_string();
+    if !base_url.is_empty()
+        && !(base_url.starts_with("http://") || base_url.starts_with("https://"))
+    {
+        return Err("中转站 base_url 必须以 http:// 或 https:// 开头。".into());
+    }
     let dir = config::default_dir();
     config::update(&dir, move |c| {
         c.provider = cfg.provider;
         c.proxy_port = cfg.proxy_port;
         c.sandbox_port = cfg.sandbox_port;
+        // 只在前端传了 base_url（即用户在中转站模式）时写入 relay 的 base_url，
+        // 避免在别的 provider 下改端口时误清空已存的中转站地址。
+        if !base_url.is_empty() {
+            c.providers.entry("relay".into()).or_default().base_url = base_url;
+        }
     })
     .map(|_| ())
     .map_err(|e| e.to_string())
@@ -523,6 +584,77 @@ fn verify_key(
             "hint": format!("上游返回 {code}，可能是 key 无效、额度不足或上游异常。")
         })),
         None => Err("验证请求无响应（多为网络或上游不通）。".to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct RelayModelsReq {
+    base_url: String,
+    key: String,
+}
+
+/// 「获取中转站可用模型」：把面板填的 base_url / token 存进 relay 配置（token 为空=沿用已存）、
+/// 切到 relay，起 relay 代理，再经**本地回环代理**回源拉中转站 `/v1/models`
+/// （回源的 TLS 由代理的 urllib 完成，Rust 侧只打回环明文，无需引 TLS）。
+/// 返回 `{models:[id,...]}`——会平铺进 Science 选择器主列表的 id 排前。
+#[tauri::command]
+fn fetch_relay_models(
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    req: RelayModelsReq,
+) -> Result<serde_json::Value, String> {
+    let dir = config::default_dir();
+    let base_url = req.base_url.trim().to_string();
+    let key = req.key.trim().to_string();
+    // 落盘 relay 配置并切到 relay（供 ensure_proxy 起 relay 代理）。token 为空表示沿用已存的。
+    let (bu, k) = (base_url.clone(), key.clone());
+    config::update(&dir, move |c| {
+        c.provider = "relay".into();
+        let e = c.providers.entry("relay".into()).or_default();
+        if !bu.is_empty() {
+            e.base_url = bu;
+        }
+        if !k.is_empty() {
+            e.key = k;
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    // 用落盘后的最终值校验。
+    let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+    let bu = cfg.base_url_for("relay").unwrap_or_default();
+    if bu.is_empty() || !(bu.starts_with("http://") || bu.starts_with("https://")) {
+        return Err("请先填写中转站 base_url（http:// 或 https:// 开头）。".into());
+    }
+    if cfg.key_for("relay").is_none() {
+        return Err("请先填写中转站 API Key / Token。".into());
+    }
+    // 起 relay 代理（内部已校验 key/base_url、探活），经回环代理回源拉 /v1/models。
+    let (port, secret, _action) = ensure_proxy(&app, &state)?;
+    match proc::http_get_body(port, Some(&secret), "/v1/models", 20000) {
+        Some((200, body)) => {
+            let v: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| format!("解析模型列表失败：{e}"))?;
+            let mut ids: Vec<String> = v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Err("中转站没有返回可用模型（/v1/models 为空）。".into());
+            }
+            // 稳定排序：主列表项（会平铺进选择器）排前，其余保持上游顺序。
+            ids.sort_by_key(|id| if is_main_list_model(id) { 0u8 } else { 1u8 });
+            Ok(json!({ "models": ids }))
+        }
+        Some((code @ (401 | 403), _)) => {
+            Err(format!("中转站拒绝（{code}），key 或权限可能有误。"))
+        }
+        Some((code, _)) => Err(format!("中转站返回 {code}，无法获取模型列表。")),
+        None => Err("获取模型无响应（多为网络或中转站不通）。".into()),
     }
 }
 
@@ -733,7 +865,7 @@ fn sandbox_running_ours(port: u16) -> bool {
 #[tauri::command]
 fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
     // 只在锁内取值，锁外做阻塞探活。
-    let (pport, secret, sport, provider) = {
+    let (pport, secret, sport, provider, base_url) = {
         let st = lock(&state);
         let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
         let pport = if st.proxy_port != 0 {
@@ -746,7 +878,8 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
         } else {
             cfg.sandbox_port
         };
-        (pport, st.secret.clone(), sport, cfg.provider)
+        let base_url = cfg.base_url_for(&cfg.provider).unwrap_or_default();
+        (pport, st.secret.clone(), sport, cfg.provider, base_url)
     };
     let proxy = if !secret.is_empty() && proc::http_health(pport, Some(&secret), 300) {
         "green"
@@ -760,7 +893,8 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
     } else {
         "amber"
     };
-    let upstream = if proc::tcp_reachable(upstream_host(&provider), 443, 500) {
+    let uhost = upstream_host(&provider, &base_url);
+    let upstream = if !uhost.is_empty() && proc::tcp_reachable(&uhost, 443, 500) {
         "green"
     } else {
         "amber"
@@ -855,6 +989,7 @@ pub fn run() {
             save_provider_key,
             start_proxy,
             verify_key,
+            fetch_relay_models,
             stop_all,
             one_click_login,
             status,
@@ -894,7 +1029,38 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{key_fingerprint, redact, sandbox_home};
+    use super::{is_main_list_model, key_fingerprint, parse_host, redact, sandbox_home};
+
+    #[test]
+    fn parse_host_extracts_host_from_relay_base_url() {
+        assert_eq!(
+            parse_host("https://byteswarm.ai/claude").as_deref(),
+            Some("byteswarm.ai")
+        );
+        assert_eq!(
+            parse_host("http://127.0.0.1:8080/v1").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            parse_host("https://relay.example.com:8443").as_deref(),
+            Some("relay.example.com")
+        );
+        // 无 scheme / 空 → None（status 上游灯据此显黄，不误探）。
+        assert_eq!(parse_host("byteswarm.ai/claude"), None);
+        assert_eq!(parse_host(""), None);
+    }
+
+    #[test]
+    fn main_list_model_matches_family_plus_digit() {
+        // 会平铺进 Science 选择器主列表的。
+        assert!(is_main_list_model("claude-opus-4-8"));
+        assert!(is_main_list_model("claude-sonnet-5"));
+        assert!(is_main_list_model("claude-haiku-4-5-20251001"));
+        // 不会平铺（折叠进 More models）：老式命名 / family 后非数字。
+        assert!(!is_main_list_model("claude-3-5-sonnet-20241022"));
+        assert!(!is_main_list_model("claude-fable-5"));
+        assert!(!is_main_list_model("gpt-4o"));
+    }
 
     #[test]
     fn redact_scrubs_secret_and_is_noop_when_empty() {

@@ -25,6 +25,15 @@ body{
 .official-only{display:none}
 .panel.mode-official .tp-only{display:none}
 .panel.mode-official .official-only{display:block}
+/* 中转站(relay)专属区块：仅在「第三方模式 且 provider=relay」时显示（由 JS 加 show-relay 类，
+   已保证不与官方模式并存，故不必与 mode-official 抢 CSS 优先级） */
+.relay-only{display:none}
+.panel.show-relay .relay-only{display:block}
+.modellist{margin-top:8px;max-height:120px;overflow:auto;border:1px solid var(--line);
+  border-radius:9px;background:var(--field);padding:6px 9px;font-size:11.5px;line-height:1.75;
+  -webkit-user-select:text;user-select:text}
+.modellist .m{color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.modellist .m.main{color:var(--ink);font-weight:600}
 .brand{display:flex;align-items:center;gap:8px;font-weight:650;font-size:14px}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(47,191,113,.16)}
 .dot.amber{background:var(--amber);box-shadow:0 0 0 3px rgba(230,162,60,.16)}

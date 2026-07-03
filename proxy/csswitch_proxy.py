@@ -6,6 +6,9 @@ Providers:
                    代理只做「透传 + 改模型名 + 换鉴权头 + max_tokens 夹取 + 连接重试」，
                    thinking/tool_use 全部原生保真（不翻译协议）。
   qwen           ：DashScope compatible-mode —— Anthropic↔OpenAI 双向翻译（流式以 SSE 回放保真 tool_use）。
+  relay          ：任意「中转站」（Anthropic 兼容端点，base_url + token）。原生透传、【不重映射模型】，
+                   /v1/models 回源直拉让 Science 选择器自动铺满中转站真实模型。base_url 经
+                   CSSWITCH_RELAY_BASE_URL 提供、token 经 CSSWITCH_RELAY_KEY 提供。
 
 安全约束：
   - 入站 Authorization / x-api-key（Science 带来的 OAuth Bearer）一律剥离，不记录、不转发。
@@ -86,6 +89,23 @@ PROVIDERS = {
         "default_cap": 8192,
         "default_model": "qwen-plus",
     },
+    "relay": {
+        # 「中转站」：任意 Anthropic 兼容端点（base_url + token）。原生透传、【不重映射模型】
+        # ——中转站原生认 claude-* 名。上游 url / models_url 在 __main__ 里按 CSSWITCH_RELAY_BASE_URL
+        # 装配（base + /v1/messages、base + /v1/models）。
+        "mode": "anthropic",       # 复用原生透传 handler（流式/非流式/重试都现成）
+        "url": None,               # __main__ 装配
+        "models_url": None,        # __main__ 装配；存在即 /v1/models 回源直拉
+        "key_env": "CSSWITCH_RELAY_KEY",
+        "passthrough": True,       # resolve_model 原样透传模型名（不映射）
+        "auth_style": "both",      # 同时带 x-api-key + Authorization: Bearer（最大兼容各家中转站）
+        "models": [],              # 回源拉取，静态为空
+        "model_map": {},
+        "model_caps": {},
+        "default_cap": None,       # 不夹 max_tokens：尊重中转站真实（claude 原生）上限
+        # 空名兜底：Science 硬编码的默认推理模型 id（中转站基本都提供）。
+        "default_model": "claude-opus-4-8",
+    },
 }
 
 PROV = None      # 当前 provider 配置（dict），运行时设定
@@ -94,6 +114,13 @@ LOG = None
 PROV_NAME = None  # 运行时设定；模块被 import 做测试时也要有定义，避免 handler NameError
 AUTH_SECRET = None  # 未设则不启用鉴权（保持旧行为）
 _DATE_SUFFIX = re.compile(r"-\d{8}$")
+# relay 模式：最近一次 /v1/models 回源拉到的上游模型 id 列表。resolve_model 用它把
+# Science 发来的裸 id（如标题 agent 的 claude-haiku-4-5）贴合到中转站真实 id
+# （如 claude-haiku-4-5-20251001）。首拉前为空 → 纯透传。
+RELAY_MODELS = []
+# 出站 User-Agent：部分中转站的 WAF 把默认的 "Python-urllib/x.y" 判为 bot 直接 403
+# （byteswarm 实测），故所有上游请求统一带一个非 bot 的 UA。
+UPSTREAM_UA = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSswitch)"
 
 # ---------- #3: targeted fast-fail（沙箱「Switching organization」卡死修复） ----------
 # 沙箱 Science 启动时会对 claude.ai/api/oauth/profile 发【阻塞式】请求解析组织；
@@ -139,11 +166,25 @@ def load_key(prov, args):
     return None
 
 
+def _snap_relay_model(name):
+    """relay 透传：把请求模型贴合到中转站真实 id。精确命中优先；否则找一个以
+    请求名为前缀的上游 id（裸 claude-haiku-4-5 → claude-haiku-4-5-20251001）；
+    都不中就原样返回（中转站自行处理别名 / 报错）。"""
+    if not RELAY_MODELS or name in RELAY_MODELS:
+        return name
+    for mid in RELAY_MODELS:
+        if mid.startswith(name + "-") or mid == name:
+            return mid
+    return name
+
+
 def resolve_model(name):
     """把 Science 传来的模型名解析成当前 provider 的目标模型。
     优先：选择器里选中的 provider 原生名 > 显式映射 > 去日期后缀 > 前缀匹配 > 默认。"""
     if not name:
         return PROV["default_model"]
+    if PROV.get("passthrough"):   # relay：中转站原生认 claude-*，透传（仅贴合到真实 id）
+        return _snap_relay_model(name)
     mm = PROV["model_map"]
     if name in mm:          # 先查映射（覆盖伪 claude- 前缀的选择器 id 和 Science 硬编码 claude-*）
         return mm[name]
@@ -172,6 +213,7 @@ def clamp_max_tokens(v, model=None):
 def http_post(url, data, headers, attempts=4, timeout=300):
     """POST 上游；重试覆盖【连接 + 完整读体】（含 SSL EOF、握手超时、对端断开、IncompleteRead），
     对服务端明确响应（HTTPError，如 400）不重试。返回 (body_bytes, content_type)。"""
+    headers = {"User-Agent": UPSTREAM_UA, **headers}
     for i in range(attempts):
         req = urllib.request.Request(url, data=data, headers=headers)
         try:
@@ -190,6 +232,7 @@ def http_post(url, data, headers, attempts=4, timeout=300):
 def open_stream(url, data, headers, attempts=4, timeout=300):
     """打开上游流式连接并预读首块（把「200 但立刻空体」这种抖动也纳入重试）。
     返回 (resp, first_chunk, content_type)；首字节到手后不再重试。"""
+    headers = {"User-Agent": UPSTREAM_UA, **headers}
     for i in range(attempts):
         req = urllib.request.Request(url, data=data, headers=headers)
         try:
@@ -207,6 +250,61 @@ def open_stream(url, data, headers, attempts=4, timeout=300):
                 time.sleep(0.8 * (i + 1))
                 continue
             raise
+
+
+def http_get_json(url, headers, attempts=3, timeout=30):
+    """GET 上游并解析 JSON（relay 回源拉 /v1/models 用）。连接抖动重试，服务端明确响应不重试。"""
+    headers = {"User-Agent": UPSTREAM_UA, **headers}
+    for i in range(attempts):
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError:
+            raise
+        except Exception as e:
+            if i < attempts - 1:
+                log(f"  ~ 上游连接抖动，重试 {i + 1}/{attempts - 1}: {e}")
+                time.sleep(0.6 * (i + 1))
+                continue
+            raise
+
+
+def _upstream_auth_headers():
+    """上游鉴权头：按当前 provider 的 auth_style 装 x-api-key / bearer / both。
+    deepseek 未设 → 默认 x-api-key（保持原状）；relay = both。"""
+    style = PROV.get("auth_style", "x-api-key")
+    h = {}
+    if style in ("x-api-key", "both"):
+        h["x-api-key"] = KEY
+    if style in ("bearer", "both"):
+        h["Authorization"] = f"Bearer {KEY}"
+    return h
+
+
+def fetch_relay_models():
+    """回源拉中转站 /v1/models，归一化成 Science 认的 Anthropic 模型列表，并刷新
+    RELAY_MODELS 缓存（供 resolve_model 贴合）。返回归一化后的 list（可空）。"""
+    global RELAY_MODELS
+    murl = PROV.get("models_url")
+    if not murl:
+        return []
+    headers = dict(_upstream_auth_headers())
+    headers["anthropic-version"] = "2023-06-01"
+    raw = http_get_json(murl, headers)
+    data = raw.get("data") if isinstance(raw, dict) else raw
+    out, ids = [], []
+    for m in data or []:
+        mid = m.get("id") if isinstance(m, dict) else None
+        if not mid:
+            continue
+        ids.append(mid)
+        out.append({"type": "model", "id": mid,
+                    "display_name": (m.get("display_name") if isinstance(m, dict) else None) or mid,
+                    "created_at": "2026-01-01T00:00:00Z"})
+    if ids:
+        RELAY_MODELS = ids
+    return out
 
 
 # ---------- Anthropic -> OpenAI 翻译（qwen 路径） ----------
@@ -363,11 +461,21 @@ class H(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return
         if self.path.startswith("/v1/models"):
-            data = [{"type": "model", "id": mid, "display_name": disp,
-                     "created_at": "2026-01-01T00:00:00Z"} for mid, disp in PROV["models"]]
-            log(f"GET /v1/models -> {PROV_NAME}: {', '.join(m[0] for m in PROV['models'])}")
+            # relay：回源直拉中转站真实模型（拉不到退回静态 PROV["models"]，relay 为空则空列表）。
+            data = None
+            if PROV.get("models_url"):
+                try:
+                    data = fetch_relay_models()
+                    log(f"GET /v1/models -> {PROV_NAME}(回源): {len(data)} 个模型")
+                except Exception as e:
+                    log(f"GET /v1/models -> {PROV_NAME} 回源失败，退回静态: {e}")
+            if data is None:
+                data = [{"type": "model", "id": mid, "display_name": disp,
+                         "created_at": "2026-01-01T00:00:00Z"} for mid, disp in PROV["models"]]
+                log(f"GET /v1/models -> {PROV_NAME}: {', '.join(m[0] for m in PROV['models'])}")
             self._send_json(200, {"data": data, "has_more": False,
-                                  "first_id": data[0]["id"], "last_id": data[-1]["id"]})
+                                  "first_id": data[0]["id"] if data else None,
+                                  "last_id": data[-1]["id"] if data else None})
         elif self.path.startswith("/health"):
             self._send_json(200, {"status": "ok", "provider": PROV_NAME})
         else:
@@ -517,7 +625,10 @@ class H(BaseHTTPRequestHandler):
         n_tools = len(body.get("tools") or [])
         log(f"POST /v1/messages  {src}->{target} stream={stream} tools={n_tools} "
             f"msgs={len(body.get('messages') or [])}  (入站鉴权已剥离, 直连 {PROV_NAME})")
-        headers = {"x-api-key": KEY, "content-type": "application/json", "anthropic-version": "2023-06-01"}
+        # 鉴权头按 provider 的 auth_style：deepseek 默认 x-api-key；relay 用 both（同时带
+        # x-api-key + Authorization: Bearer，兼容各家中转站）。KEY 只驻内存、不入日志。
+        headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
+        headers.update(_upstream_auth_headers())
         data = json.dumps(body).encode()
         headers_sent = False
         try:
@@ -644,12 +755,24 @@ if __name__ == "__main__":
     ap.add_argument("--env-file", default=None)
     ap.add_argument("--log", default=None)
     ap.add_argument("--auth-token", default=None)
+    ap.add_argument("--relay-base", default=None,
+                    help="relay provider 的中转站 base_url（也可用环境变量 CSSWITCH_RELAY_BASE_URL）")
     args = ap.parse_args()
     PROV_NAME = args.provider
     PROV = PROVIDERS[PROV_NAME]
     LOG = args.log
     KEY = load_key(PROV, args)
     AUTH_SECRET = os.environ.get("CSSWITCH_AUTH_TOKEN") or args.auth_token
+    # relay：按中转站 base_url 装配上游端点（base + /v1/messages、base + /v1/models）。
+    if PROV_NAME == "relay":
+        base = (os.environ.get("CSSWITCH_RELAY_BASE_URL") or args.relay_base or "").strip().rstrip("/")
+        if not base or not re.match(r"^https?://", base):
+            print("relay 需要中转站 base_url（http(s)://…）。用 --relay-base 或环境变量 "
+                  "CSSWITCH_RELAY_BASE_URL 提供。", file=sys.stderr)
+            sys.exit(1)
+        PROV = dict(PROV)
+        PROV["url"] = base + "/v1/messages"
+        PROV["models_url"] = base + "/v1/models"
     _up = os.environ.get("CSSWITCH_UPSTREAM_URL")
     if _up:
         PROV = dict(PROV)

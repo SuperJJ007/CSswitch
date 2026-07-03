@@ -66,5 +66,69 @@ class MaxTokensPerModel(unittest.TestCase):
         self.assertEqual(cs.clamp_max_tokens(100000, "qwen-max"), 8192)
 
 
+class RelayProvider(unittest.TestCase):
+    """中转站 provider：透传（不重映射）+ 贴合 + 双鉴权头 + 不夹 max_tokens + /v1/models 归一化。"""
+
+    def setUp(self):
+        cs.PROV = dict(cs.PROVIDERS["relay"])
+        cs.PROV["url"] = "https://relay.test/claude/v1/messages"
+        cs.PROV["models_url"] = "https://relay.test/claude/v1/models"
+        cs.KEY = "cr_testkey"
+        cs.RELAY_MODELS = []
+
+    def test_passthrough_keeps_model_name(self):
+        # 中转站原生认 claude-*，模型名原样透传（不走 model_map）。
+        self.assertEqual(cs.resolve_model("claude-opus-4-8"), "claude-opus-4-8")
+        self.assertEqual(cs.resolve_model("claude-sonnet-4-6"), "claude-sonnet-4-6")
+        self.assertEqual(cs.resolve_model("some-other-model"), "some-other-model")
+
+    def test_empty_model_falls_back_to_default(self):
+        self.assertEqual(cs.resolve_model(""), "claude-opus-4-8")
+
+    def test_snaps_bare_id_to_upstream_dated_id(self):
+        cs.RELAY_MODELS = ["claude-haiku-4-5-20251001", "claude-opus-4-8"]
+        # 裸 id（如标题 agent 的）贴合到中转站带日期的真实 id。
+        self.assertEqual(cs.resolve_model("claude-haiku-4-5"), "claude-haiku-4-5-20251001")
+        # 精确命中不改。
+        self.assertEqual(cs.resolve_model("claude-opus-4-8"), "claude-opus-4-8")
+        # 缓存里没有的原样透传（交中转站处理别名/报错）。
+        self.assertEqual(cs.resolve_model("claude-sonnet-5"), "claude-sonnet-5")
+
+    def test_auth_headers_both(self):
+        h = cs._upstream_auth_headers()
+        self.assertEqual(h.get("x-api-key"), "cr_testkey")
+        self.assertEqual(h.get("Authorization"), "Bearer cr_testkey")
+
+    def test_deepseek_auth_headers_default_xapikey(self):
+        # 回归：deepseek 未设 auth_style → 仍只带 x-api-key（不误引入 Bearer）。
+        cs.PROV = cs.PROVIDERS["deepseek"]
+        cs.KEY = "sk-ds"
+        self.assertEqual(cs._upstream_auth_headers(), {"x-api-key": "sk-ds"})
+
+    def test_no_max_tokens_clamp(self):
+        # relay default_cap=None、model_caps 空 → 尊重中转站真实上限，不夹取。
+        self.assertEqual(cs.clamp_max_tokens(1000000, "claude-opus-4-8"), 1000000)
+
+    def test_models_normalized_and_cache_refreshed(self):
+        # 用假 http_get_json 复刻中转站 OpenAI 风格返回，验证归一化成 Anthropic 格式
+        # + RELAY_MODELS 缓存刷新（离线，不触网）。
+        orig = cs.http_get_json
+        cs.http_get_json = lambda url, headers: {
+            "data": [
+                {"id": "claude-opus-4-8", "object": "model"},
+                {"id": "claude-3-5-sonnet-20241022", "object": "model"},
+                {"no_id": True},  # 缺 id 的条目应被跳过
+            ]
+        }
+        try:
+            out = cs.fetch_relay_models()
+        finally:
+            cs.http_get_json = orig
+        self.assertEqual([m["id"] for m in out], ["claude-opus-4-8", "claude-3-5-sonnet-20241022"])
+        self.assertTrue(all(m["type"] == "model" for m in out))
+        self.assertEqual(out[0]["display_name"], "claude-opus-4-8")
+        self.assertEqual(cs.RELAY_MODELS, ["claude-opus-4-8", "claude-3-5-sonnet-20241022"])
+
+
 if __name__ == "__main__":
     unittest.main()

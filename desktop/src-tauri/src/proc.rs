@@ -100,6 +100,54 @@ pub fn http_post_status(
         .and_then(|s| s.parse::<u16>().ok())
 }
 
+/// 向本地回环代理 GET 一段路径（`GET /<secret><path>`），返回 (状态码, 响应体)。
+/// 连不上 / 无响应返回 None。用于经代理回源拉中转站 `/v1/models`——代理有 TLS（urllib），
+/// 这里只打回环明文，无需在 Rust 侧引 TLS。timeout_ms 要给足（代理要转发上游），建议 ~15000。
+pub fn http_get_body(
+    port: u16,
+    secret: Option<&str>,
+    path_suffix: &str,
+    timeout_ms: u64,
+) -> Option<(u16, String)> {
+    let addr = ("127.0.0.1", port).to_socket_addrs().ok()?.next()?;
+    let dur = Duration::from_millis(timeout_ms);
+    let mut stream = TcpStream::connect_timeout(&addr, dur).ok()?;
+    let _ = stream.set_read_timeout(Some(dur));
+    let _ = stream.set_write_timeout(Some(dur));
+    let path = match secret {
+        Some(s) if !s.is_empty() => format!("/{s}{path_suffix}"),
+        _ => path_suffix.to_string(),
+    };
+    let req =
+        format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    // 读完整响应（状态行 + 头 + 体）。上限防呆：模型列表通常 < 数十 KB，给 1 MiB。
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if buf.len() > 1_048_576 {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())?;
+    // 分割头与体：首个空行之后即响应体。
+    let body = match text.split_once("\r\n\r\n") {
+        Some((_, b)) => b.to_string(),
+        None => String::new(),
+    };
+    Some((status, body))
+}
+
 /// 上游主机可达性（仅 TCP 连通，不校验 key）。绿灯=可达，黄灯=不可达。
 pub fn tcp_reachable(host: &str, port: u16, timeout_ms: u64) -> bool {
     let dur = Duration::from_millis(timeout_ms);
@@ -273,6 +321,12 @@ mod tests {
     fn health_false_when_nothing_listening() {
         // 一个几乎肯定没人监听的高端口。
         assert!(!http_health(59999, None, 300));
+    }
+
+    #[test]
+    fn get_body_none_when_nothing_listening() {
+        // 没人监听 → 连不上 → None（与 http_health 一致的失败关闭语义）。
+        assert!(http_get_body(59998, Some("secret"), "/v1/models", 300).is_none());
     }
 
     #[test]

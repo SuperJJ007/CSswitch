@@ -11,7 +11,7 @@ const invoke = PREVIEW
 function mockInvoke(cmd, args) {
   switch (cmd) {
     case "get_config":
-      return Promise.resolve({ provider: "deepseek", proxy_port: 18991, sandbox_port: 8990, mode: "proxy", keys: { deepseek: "", qwen: "" } });
+      return Promise.resolve({ provider: "deepseek", proxy_port: 18991, sandbox_port: 8990, mode: "proxy", keys: { deepseek: "", qwen: "", relay: "" }, relay_base_url: "" });
     case "set_mode":
     case "open_official":
       return Promise.resolve(null);
@@ -23,6 +23,8 @@ function mockInvoke(cmd, args) {
       return Promise.resolve({ port: 18991 });
     case "verify_key":
       return Promise.resolve({ ok: true, hint: "（预览模式：假装 key 有效）" });
+    case "fetch_relay_models":
+      return Promise.resolve({ models: ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-3-5-sonnet-20241022"] });
     case "one_click_login":
       return Promise.resolve({ url: "http://127.0.0.1:8990" });
     case "run_doctor":
@@ -44,7 +46,7 @@ let statusTimer = null;
 let busy = false;
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
 
-const KEY_LABELS = { deepseek: "DeepSeek API Key", qwen: "DashScope (通义千问) API Key" };
+const KEY_LABELS = { deepseek: "DeepSeek API Key", qwen: "DashScope (通义千问) API Key", relay: "中转站 API Key / Token" };
 
 function setMsg(text, kind) {
   els.msg.textContent = text;
@@ -59,7 +61,9 @@ function setLight(el, state) {
 
 function setBusy(on) {
   busy = on;
-  [els.oneClickBtn, els.stopBtn, els.saveKeyBtn].forEach((b) => (b.disabled = on));
+  [els.oneClickBtn, els.stopBtn, els.saveKeyBtn, els.fetchModelsBtn].forEach(
+    (b) => b && (b.disabled = on)
+  );
 }
 
 async function call(cmd, args) {
@@ -72,9 +76,10 @@ async function loadConfig() {
     els.provider.value = cfg.provider || "deepseek";
     els.proxyPort.value = cfg.proxy_port ?? 18991;
     els.sandboxPort.value = cfg.sandbox_port ?? 8990;
+    els.relayBase.value = cfg.relay_base_url || "";
     window._keys = cfg.keys || {};
-    reflectProvider();
     applyMode(cfg.mode === "official" ? "official" : "proxy");
+    reflectProvider();
   } catch (e) {
     setMsg("读取配置失败：" + e, "err");
   }
@@ -89,6 +94,14 @@ function applyMode(m) {
   );
   els.oneClickBtn.textContent =
     mode === "official" ? "打开官方 Claude Science ↗" : "⚡ 一键开始";
+  updateRelayUI();
+}
+
+// 中转站区块可见性：仅「第三方模式 且 provider=relay」时显示。用 JS 计算而非纯 CSS，
+// 保证它绝不与官方模式并存（也就不必和 mode-official 抢 CSS 优先级）。
+function updateRelayUI() {
+  const show = mode !== "official" && els.provider.value === "relay";
+  els.panel.classList.toggle("show-relay", show);
 }
 
 // 点分段切换：先落盘（切官方时后端会顺带停第三方链路），成功再翻 UI；失败保持旧模式、如实报错。
@@ -141,15 +154,25 @@ function reflectProvider() {
   els.keyLabel.textContent = KEY_LABELS[p] || "API Key";
   const masked = (window._keys && window._keys[p]) || "";
   els.keyInput.value = "";
-  els.keyInput.placeholder = masked ? "已存：" + masked : "粘贴第三方 key（只存本地）";
+  els.keyInput.placeholder = masked
+    ? "已存：" + masked
+    : p === "relay"
+    ? "粘贴中转站 key / token（只存本地）"
+    : "粘贴第三方 key（只存本地）";
+  updateRelayUI();
 }
 
 function currentSettings() {
-  return {
+  const s = {
     provider: els.provider.value,
     proxy_port: parseInt(els.proxyPort.value, 10) || 18991,
     sandbox_port: parseInt(els.sandboxPort.value, 10) || 8990,
   };
+  // 只在中转站模式带 base_url（后端据「有无该字段」决定是否改动已存值）。
+  if (els.provider.value === "relay") {
+    s.base_url = els.relayBase.value.trim();
+  }
+  return s;
 }
 
 // 保存设置：失败会【抛出】，让调用方（起代理 / 一键登录）中止，
@@ -197,6 +220,65 @@ async function saveKey() {
   } finally {
     setBusy(false);
     await refreshStatus();
+  }
+}
+
+// 与后端 is_main_list_model 对齐：会平铺进 Science 选择器主列表的 id。
+function isMainListModel(id) {
+  for (const fam of ["claude-opus-", "claude-sonnet-", "claude-haiku-"]) {
+    if (id.startsWith(fam)) {
+      const c = id.charAt(fam.length);
+      return c >= "0" && c <= "9";
+    }
+  }
+  return false;
+}
+
+function renderModels(models) {
+  const box = els.modelList;
+  box.innerHTML = "";
+  if (!models || !models.length) {
+    box.hidden = true;
+    return;
+  }
+  for (const id of models) {
+    const d = document.createElement("div");
+    d.className = "m" + (isMainListModel(id) ? " main" : "");
+    d.textContent = id;
+    box.appendChild(d);
+  }
+  box.hidden = false;
+}
+
+// 「获取模型」：把 base_url（+可能的新 key）交后端，起 relay 代理并回源拉中转站可用模型。
+async function fetchModels() {
+  const base = els.relayBase.value.trim();
+  if (!base) {
+    setMsg("请先填写中转站地址 base_url。", "err");
+    return;
+  }
+  setBusy(true);
+  setMsg("获取模型中：起代理 → 回源拉 /v1/models…");
+  try {
+    const key = els.keyInput.value.trim(); // 有新 key 就带上；为空则后端沿用已存
+    const r = await call("fetch_relay_models", { req: { base_url: base, key } });
+    const models = (r && r.models) || [];
+    renderModels(models);
+    if (key) {
+      // 后端已把新 key 落盘；刷新掩码占位、清空输入框。
+      window._keys.relay = "•".repeat(Math.max(0, key.length - 4)) + key.slice(-4);
+      els.keyInput.value = "";
+      reflectProvider();
+    }
+    setMsg(
+      "已获取 " + models.length + " 个模型（加粗的会平铺进选择器，其余在「More models」）。点「一键开始」即可在 Science 里选用。",
+      "ok"
+    );
+    await refreshStatus();
+  } catch (e) {
+    setMsg("获取模型失败：" + e, "err");
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -315,6 +397,7 @@ function wire() {
     "oneClickBtn", "stopBtn", "ltProxy", "ltSandbox", "ltUpstream",
     "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
     "reportBtn", "logsBtn", "quitBtn", "modeSeg",
+    "relayBase", "fetchModelsBtn", "modelList",
   ].forEach((id) => (els[id] = $(id)));
   els.panel = document.querySelector(".panel");
 
@@ -328,6 +411,8 @@ function wire() {
   });
   els.proxyPort.addEventListener("change", persistSettingsSafe);
   els.sandboxPort.addEventListener("change", persistSettingsSafe);
+  els.relayBase.addEventListener("change", persistSettingsSafe);
+  els.fetchModelsBtn.addEventListener("click", fetchModels);
   els.saveKeyBtn.addEventListener("click", saveKey);
   els.stopBtn.addEventListener("click", stopAll);
   els.oneClickBtn.addEventListener("click", heroClick);

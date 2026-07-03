@@ -30,11 +30,14 @@ fn default_mode() -> String {
     "proxy".to_string()
 }
 
-/// 单个 provider 的配置。目前只有 key（明文存盘）。
+/// 单个 provider 的配置。key 明文存盘；base_url 仅「中转站」(relay) 用——
+/// 中转站的 Anthropic 兼容端点根地址（如 https://byteswarm.ai/claude）。base_url 不是密钥，可回显。
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 pub struct ProviderCfg {
     #[serde(default)]
     pub key: String,
+    #[serde(default)]
+    pub base_url: String,
 }
 
 /// 顶层配置。字段都有默认值，缺字段的旧文件也能读。
@@ -79,6 +82,14 @@ impl Config {
             .get(provider)
             .map(|p| p.key.clone())
             .filter(|k| !k.is_empty())
+    }
+
+    /// 取某 provider 的 base_url（仅 relay 用；空串视为未设）。base_url 不是密钥，可回显。
+    pub fn base_url_for(&self, provider: &str) -> Option<String> {
+        self.providers
+            .get(provider)
+            .map(|p| p.base_url.clone())
+            .filter(|u| !u.is_empty())
     }
 }
 
@@ -255,12 +266,39 @@ mod tests {
             "deepseek".into(),
             ProviderCfg {
                 key: "sk-abcdef1234".into(),
+                ..Default::default()
             },
         );
         save_to(&d, &cfg).unwrap();
         let got = load_from(&d).unwrap();
         assert_eq!(got, cfg);
         assert_eq!(got.key_for("deepseek").as_deref(), Some("sk-abcdef1234"));
+    }
+
+    #[test]
+    fn relay_base_url_roundtrips_and_helper_reads_it() {
+        // 中转站 base_url 存/读 roundtrip；空串视为未设。
+        let d = tmpdir().join(".csswitch");
+        let mut cfg = Config {
+            provider: "relay".into(),
+            ..Default::default()
+        };
+        cfg.providers.insert(
+            "relay".into(),
+            ProviderCfg {
+                key: "cr_secret".into(),
+                base_url: "https://byteswarm.ai/claude".into(),
+            },
+        );
+        save_to(&d, &cfg).unwrap();
+        let got = load_from(&d).unwrap();
+        assert_eq!(
+            got.base_url_for("relay").as_deref(),
+            Some("https://byteswarm.ai/claude")
+        );
+        assert_eq!(got.key_for("relay").as_deref(), Some("cr_secret"));
+        // 未设 base_url 的 provider（缺字段的旧文件也走这条）→ None。
+        assert_eq!(got.base_url_for("deepseek"), None);
     }
 
     #[test]
@@ -358,6 +396,7 @@ mod tests {
                 "qwen".into(),
                 ProviderCfg {
                     key: "k-xyz".into(),
+                    ..Default::default()
                 },
             );
         })
