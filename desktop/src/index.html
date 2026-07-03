@@ -25,42 +25,76 @@
         <div class="hint">官方模式：用你自己真实的 Claude Science 与订阅。CSSwitch 不插手你的官方登录、也不起代理/沙箱，只把你交回官方客户端。</div>
       </div>
 
-      <div class="sec tp-only">
-        <label>模型 / Provider</label>
-        <select id="provider">
-          <option value="deepseek">DeepSeek（原生 Anthropic 端点）</option>
-          <option value="qwen">通义千问 Qwen（DashScope 翻译）</option>
-          <option value="relay">中转站（预设 / 自定义 Anthropic 兼容端点）</option>
-        </select>
+      <!-- 配置列表：全部已存配置一屏可见（图标/名/类别/地址/模型/掩码 key/生效标记） -->
+      <div class="sec tp-only" id="listSec">
+        <div class="listhd">
+          <label>我的配置</label>
+          <button class="btn small" id="newBtn">＋ 新建</button>
+        </div>
+        <div id="profileList"></div>
+        <button class="btn small" id="skipActivateBtn" hidden style="margin-top:8px;width:100%">校验没过，仍要启用这条</button>
       </div>
 
-      <div class="sec tp-only">
-        <label id="keyLabel">DeepSeek API Key</label>
+      <!-- 新建向导：选模板 → 预填 → 填 key → 创建（不自动生效） -->
+      <div class="sec tp-only" id="wizSec" hidden>
+        <label>选择来源模板</label>
+        <select id="wizTemplate"></select>
+        <div class="hint" id="wizTplHint"></div>
+        <label style="margin-top:10px">名称</label>
+        <input id="wizName" type="text" placeholder="给这套配置起个名字" autocomplete="off" spellcheck="false" />
+        <label style="margin-top:10px">地址 base_url</label>
         <div class="row">
-          <input id="keyInput" type="password" placeholder="粘贴第三方 key（只存本地）" autocomplete="off" spellcheck="false" />
-          <button class="btn small" id="saveKeyBtn">保存</button>
+          <input id="wizBase" type="text" placeholder="https://your-relay/claude" autocomplete="off" spellcheck="false" />
+          <button class="btn small" id="wizFetchBtn">获取模型</button>
         </div>
-        <div class="hint">存本地 <code>~/.csswitch/config.json</code>（0600）；面板只回显末 4 位。</div>
-      </div>
-
-      <div class="sec relay-only">
-        <label>中转站</label>
-        <select id="relayPreset"></select>
-        <div class="row" style="margin-top:8px">
-          <input id="relayBase" type="text" placeholder="https://your-relay/claude" autocomplete="off" spellcheck="false" />
-          <button class="btn small" id="fetchModelsBtn">获取模型</button>
-        </div>
-        <div class="hint" id="relayBaseHint">预设地址已自动填好（只读）。填好上面的 Key 后点「获取模型」。</div>
+        <div class="hint" id="wizBaseHint"></div>
         <label style="margin-top:10px">模型</label>
-        <select id="relayModel"></select>
-        <div class="hint" id="relayModelHint"></div>
-        <div class="row" style="margin-top:8px">
-          <button class="btn small" id="saveRelayBtn">保存并验证</button>
-          <button class="btn small" id="skipVerifyBtn" hidden>跳过验证保存</button>
+        <select id="wizModel"></select>
+        <div class="hint" id="wizModelHint"></div>
+        <label style="margin-top:10px">API Key / Token</label>
+        <input id="wizKey" type="password" placeholder="粘贴 key（只存本地）" autocomplete="off" spellcheck="false" />
+        <div class="hint">存本地 <code>~/.csswitch/config.json</code>（0600）；面板只回显末 4 位。</div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn small" id="wizSaveBtn">创建</button>
+          <button class="btn small" id="wizCancelBtn">取消</button>
         </div>
       </div>
 
-      <details class="sec adv tp-only">
+      <!-- 连接编辑（base_url/model/key）：编辑生效条会走「校验→切换」事务 -->
+      <div class="sec tp-only" id="connSec" hidden>
+        <label id="connTitle">编辑连接</label>
+        <label style="margin-top:6px">地址 base_url</label>
+        <div class="row">
+          <input id="connBase" type="text" autocomplete="off" spellcheck="false" />
+          <button class="btn small" id="connFetchBtn">获取模型</button>
+        </div>
+        <div class="hint" id="connBaseHint"></div>
+        <label style="margin-top:10px">模型</label>
+        <select id="connModel"></select>
+        <div class="hint" id="connModelHint"></div>
+        <label style="margin-top:10px">API Key / Token</label>
+        <input id="connKey" type="password" autocomplete="off" spellcheck="false" />
+        <div class="hint">留空＝不改动已存 key。要彻底清除请点「清除 key」。</div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn small" id="connSaveBtn">保存连接</button>
+          <button class="btn small" id="connClearBtn">清除 key</button>
+          <button class="btn small" id="connCancelBtn">取消</button>
+        </div>
+      </div>
+
+      <!-- 改名 / 备注：就地改元数据，不触发代理 -->
+      <div class="sec tp-only" id="metaSec" hidden>
+        <label>名称</label>
+        <input id="metaName" type="text" autocomplete="off" spellcheck="false" />
+        <label style="margin-top:10px">备注（可选）</label>
+        <input id="metaNotes" type="text" autocomplete="off" spellcheck="false" />
+        <div class="row" style="margin-top:12px">
+          <button class="btn small" id="metaSaveBtn">保存</button>
+          <button class="btn small" id="metaCancelBtn">取消</button>
+        </div>
+      </div>
+
+      <details class="sec adv tp-only" id="advSec">
         <summary>高级设置</summary>
         <div class="ports">
           <div class="fld"><label>代理端口</label><input id="proxyPort" inputmode="numeric" value="18991" /></div>
@@ -93,6 +127,5 @@
         <span><span class="link" id="updateBtn">检查更新</span> · <span id="verLabel"></span></span>
       </div>
     </div>
-    <script type="module" src="/main.js"></script>
   </body>
 </html>

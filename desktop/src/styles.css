@@ -83,5 +83,27 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
 .adv summary::before{content:"▸";font-size:9px;margin-right:5px;display:inline-block}
 .adv[open] summary::before{content:"▾"}
 .adv .ports{margin-top:9px}
-/* 中转站模型来源提示（内置/未验证）用次要色，工具能力标注已在 option 文本里。 */
-#relayModelHint{color:var(--sub)}
+/* 模型来源提示（内置/未验证）用次要色，工具能力标注已在 option 文本里。 */
+#wizModelHint,#connModelHint{color:var(--sub)}
+/* profile 列表：每条已存配置一屏可见（图标/名/类别徽标/地址/模型/掩码 key/生效标记） */
+.listhd{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.listhd label{margin:0}
+#profileList{margin-top:8px;max-height:290px;overflow:auto;display:flex;flex-direction:column;gap:8px}
+.empty{font-size:12px;color:var(--sub);padding:16px 10px;text-align:center;
+  border:1px dashed var(--line);border-radius:10px;line-height:1.6}
+.prow{border:1px solid var(--line);border-radius:11px;padding:9px 10px;background:var(--field)}
+.prow.pactive{border-color:var(--accent);box-shadow:0 0 0 2px rgba(194,90,52,.12)}
+.prow-top{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.pico{width:9px;height:9px;border-radius:50%;background:var(--sub);flex:none}
+.pname{font-size:13px;font-weight:650;color:var(--ink)}
+.badge{font-size:10px;color:var(--sub);border:1px solid var(--line);border-radius:6px;
+  padding:1px 5px;background:var(--panel)}
+.badge.on{color:#fff;background:var(--accent);border-color:var(--accent)}
+.pmeta{font-size:10.5px;color:var(--sub);margin-top:4px;word-break:break-all;line-height:1.5}
+.prow-acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.abtn{height:26px;border-radius:7px;border:1px solid var(--line);background:var(--panel);
+  color:var(--ink);font-size:11px;font-weight:600;cursor:pointer;padding:0 9px;font-family:inherit}
+.abtn:hover{border-color:var(--accent)}
+.abtn:active{transform:translateY(1px)}
+.abtn.prim{background:var(--accent);color:#fff;border-color:var(--accent)}
+.abtn.danger:hover{border-color:var(--red);color:var(--red)}
