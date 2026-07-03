@@ -67,6 +67,32 @@ else
   warn "config 不存在（首次运行 GUI 会创建）：$CONFIG"
 fi
 
+echo "[容器 / WSL2]"
+# Docker CLI
+if command -v docker >/dev/null 2>&1; then
+  pass "docker $(docker --version 2>&1 | awk '{print $3}' | sed 's/,//')"
+  # docker compose 插件
+  if docker compose version >/dev/null 2>&1; then
+    pass "docker compose 插件可用"
+  else
+    warn "未检测到 docker compose 插件（容器编排需要）"
+  fi
+else
+  warn "未找到 docker（容器化部署需要）"
+fi
+# WSL2 检测（/proc/version 含 Microsoft 或 WSL_DISTRO_NAME 环境变量）
+if [ -f /proc/version ] && grep -qi microsoft /proc/version; then
+  pass "WSL2 环境（/proc/version 含 Microsoft）"
+elif [ -n "${WSL_DISTRO_NAME:-}" ]; then
+  pass "WSL2 环境（WSL_DISTRO_NAME=$WSL_DISTRO_NAME）"
+fi
+# csswitch-proxy 镜像检测（只读，不构建）
+if docker image inspect csswitch-proxy:latest >/dev/null 2>&1; then
+  pass "csswitch-proxy:latest 镜像存在"
+else
+  warn "csswitch-proxy:latest 镜像不存在（执行 bash scripts/docker-build.sh 构建）"
+fi
+
 echo "[铁律]"
 if [ -d "$REAL_DIR" ]; then pass "真实目录存在（本工具只读诊断，绝不写/删）：$REAL_DIR"; else warn "未见真实 Science 目录：$REAL_DIR"; fi
 
