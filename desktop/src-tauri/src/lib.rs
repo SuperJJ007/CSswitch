@@ -12,6 +12,7 @@ mod config;
 mod oauth_forge;
 mod proc;
 mod relay_presets;
+mod scratch;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
