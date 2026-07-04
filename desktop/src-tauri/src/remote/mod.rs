@@ -13,4 +13,5 @@ pub mod store;
 pub mod types;
 
 // 重新导出常用类型和函数，方便外部模块使用。
-pub use store::{delete_profile, load_profiles, upsert_profile, validate_profile};
+pub use store::*;
+pub use types::*;

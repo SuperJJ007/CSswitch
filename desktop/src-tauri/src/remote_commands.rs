@@ -13,8 +13,7 @@
 //! 4. 便利操作 — 一键开始、日志查看、诊断
 
 use crate::remote::{
-    self,
-    types::{RemoteHealth, RemoteHostProfile, REQUIRED_CAPABILITIES},
+    self, RemoteHealth, RemoteHostProfile, REQUIRED_CAPABILITIES,
 };
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -130,12 +129,21 @@ pub fn remote_check_health(profile: RemoteHostProfile) -> Result<RemoteHealth, S
 }
 
 /// 安装/升级远程 Helper。
-/// 包含慢速 SSH 操作（下载+安装），Tauri 自动在后台线程执行。
+/// 通过 SSH 执行安装脚本：从 GitHub Releases 下载 helper 二进制到远程服务器。
 #[tauri::command]
 pub fn remote_install_helper(profile: RemoteHostProfile) -> Result<RemoteHealth, String> {
-    let _: Value =
-        remote::ssh::run_helper_json_slow::<Value>(&profile, &[]).map_err(|e| e.message)?;
-    // 安装后重新检查健康
+    // 直接执行 SSH 安装命令（安装脚本为 shell 脚本，不符合 helper JSON 协议格式，
+    // 因此不走 run_helper_json，而是直接执行 ssh 命令并验证退出码和 status 输出）。
+    let args = remote::ssh::build_helper_install_args(&profile);
+    let output = std::process::Command::new("ssh")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("无法启动 SSH：{e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("Helper 安装失败。请确认远程服务器可访问 GitHub：{stderr}"));
+    }
+    // 安装成功后重新检查健康
     remote_check_health(profile)
 }
 

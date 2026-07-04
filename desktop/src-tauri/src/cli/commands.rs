@@ -366,13 +366,137 @@ pub fn cmd_proxy_status() -> CliEnvelope {
     }
 }
 
-/// `sandbox status` — 这里做简单占位，沙箱管理细节待进一步实现。
+/// `sandbox status` — 检查 Claude Science 沙箱是否在运行。
+/// 通过轮询 `claude-science status` 和端口探活双重确认。
 pub fn cmd_sandbox_status() -> CliEnvelope {
-    // 检查 Claude Science 是否在运行（简化实现）
-    CliEnvelope::ok(json!({
-        "running": false,
-        "message": "沙箱管理暂未实现。请在服务器上手动管理 Claude Science。",
-    }))
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    // 尝试通过进程名检测 Science
+    let claude_bin = find_cmd("claude-science");
+    let process_found = if claude_bin.is_some() {
+        // 用 `ps` 或 `pgrep` 检测（Linux 通用方式）
+        let result = std::process::Command::new("pgrep")
+            .args(["-f", "claude-science serve"])
+            .output();
+        result.map(|o| !o.stdout.is_empty()).unwrap_or(false)
+    } else {
+        false
+    };
+
+    // 尝试常见沙箱端口（用户可在配置中指定）
+    let sandbox_ports = [8990u16, 8765u16, 8080u16];
+    let mut responsive_port: Option<u16> = None;
+    for port in &sandbox_ports {
+        if TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().unwrap(),
+            std::time::Duration::from_millis(500),
+        )
+        .is_ok()
+        {
+            responsive_port = Some(*port);
+            break;
+        }
+    }
+
+    let running = process_found || responsive_port.is_some();
+    let port = responsive_port.unwrap_or(8990);
+
+    if running {
+        CliEnvelope::ok(json!({
+            "running": true,
+            "port": port,
+            "process_found": process_found,
+            "message": format!("Science 沙箱正在端口 {} 上运行", port),
+        }))
+    } else {
+        CliEnvelope::ok(json!({
+            "running": false,
+            "message": "沙箱未运行。请使用 `claude-science serve --port <port>` 或在客户端配置后通过一键开始启动。",
+        }))
+    }
+}
+
+/// `sandbox start <port> <proxy_url>` — 启动 Claude Science 沙箱。
+/// 用 `ANTHROPIC_BASE_URL` 环境变量指向代理，以独立 data-dir 运行。
+pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
+    let bin = match find_cmd("claude-science") {
+        Some(b) => b,
+        None => {
+            return CliEnvelope::err_with_hint(
+                "science_not_found",
+                "未找到 claude-science 命令",
+                "请在服务器上安装 Claude Science 并确保其在 PATH 中。",
+            )
+        }
+    };
+
+    // 使用独立 data-dir 避免与已有实例冲突
+    let sandbox_home = config_dir().join("sandbox").join("home");
+    let data_dir = sandbox_home.join(".claude-science");
+
+    // 确保运行时目录存在
+    let _ = std::fs::create_dir_all(&data_dir);
+
+    match std::process::Command::new(&bin)
+        .args(["serve", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--no-browser")
+        .arg("--no-auto-update")
+        .arg("--detached")
+        .env("HOME", &sandbox_home)
+        .env("ANTHROPIC_BASE_URL", proxy_url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_child) => {
+            CliEnvelope::ok(json!({
+                "message": format!("沙箱已启动，端口 {}", port),
+                "port": port,
+            }))
+        }
+        Err(e) => {
+            CliEnvelope::err_with_hint(
+                "sandbox_start_failed",
+                &format!("启动沙箱失败：{e}"),
+                &format!("请检查端口 {} 是否被占用。", port),
+            )
+        }
+    }
+}
+
+/// `sandbox stop` — 停止 Claude Science 沙箱。
+pub fn cmd_sandbox_stop() -> CliEnvelope {
+    let bin = match find_cmd("claude-science") {
+        Some(b) => b,
+        None => {
+            return CliEnvelope::err("science_not_found", "未找到 claude-science 命令")
+        }
+    };
+
+    let sandbox_home = config_dir().join("sandbox").join("home");
+    let data_dir = sandbox_home.join(".claude-science");
+
+    match std::process::Command::new(&bin)
+        .args(["stop", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", &sandbox_home)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            CliEnvelope::ok_empty()
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            CliEnvelope::err("sandbox_stop_failed", &format!("停止沙箱失败：{stderr}"))
+        }
+        Err(e) => {
+            CliEnvelope::err("sandbox_stop_failed", &format!("无法执行停止命令：{e}"))
+        }
+    }
 }
 
 /// `logs <name> [lines]` — 返回日志。

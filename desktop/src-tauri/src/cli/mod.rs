@@ -58,12 +58,23 @@ pub fn dispatch(args: &[String]) -> CliEnvelope {
         ("proxy", "status") => commands::cmd_proxy_status(),
 
         // ---- 沙箱 ----
+        // ---- 沙箱 ----
         ("sandbox", "status") => commands::cmd_sandbox_status(),
-        ("sandbox", _) => CliEnvelope::err_with_hint(
-            "unsupported",
-            "沙箱管理暂未实现",
-            "请在服务器上手动管理 Claude Science（claude-science start/stop）。",
-        ),
+        ("sandbox", "start") => {
+            if rest.len() >= 2 {
+                let port: u16 = match rest[0].parse() {
+                    Ok(p) => p,
+                    Err(_) => return CliEnvelope::err("invalid_port", "端口号无效"),
+                };
+                commands::cmd_sandbox_start(port, &rest[1])
+            } else {
+                CliEnvelope::err(
+                    "missing_argument",
+                    "sandbox start 需要 <port> <proxy_url> 参数",
+                )
+            }
+        }
+        ("sandbox", "stop") => commands::cmd_sandbox_stop(),
 
         // ---- 日志 ----
         ("logs", name) => {

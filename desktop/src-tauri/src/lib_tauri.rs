@@ -319,7 +319,7 @@ fn ensure_proxy(
 /// 停沙箱。返回 Err 表示 stop 脚本非零退出（Science 可能没停干净），
 /// 调用方据此如实报告，不再无条件报「已停止」（修 P1 停止虚假成功）。
 /// 仅 macOS 有效；非 macOS 上本地沙箱不存在，直接清 state 返回 Ok。
-fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
+fn stop_sandbox_inner(_app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
     // 沙箱由脚本以 --detached 起 Science，本进程持有的是脚本 child（已退出）。
     // 真正停 Science 要调 stop 脚本（按 data-dir，绝不碰真实 8765）。
     // 修 P1（GPT 复审）：定位不到资源根 / 停止脚本时，绝不静默返回成功——detached 沙箱
@@ -564,8 +564,8 @@ fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<
 /// 仅 macOS 本地模式有效。Windows/其他平台应使用远程模式 (`remote_*` 命令)。
 #[tauri::command]
 fn one_click_login(
-    app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
+    _app: tauri::AppHandle,
+    _state: State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -856,7 +856,7 @@ fn open_url(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
 /// 运行诊断脚本 `scripts/doctor.sh`。仅 macOS 本地模式有效。
 /// Windows/其他平台上返回明确提示，引导使用远程模式诊断。
 #[tauri::command]
-fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
+fn run_doctor(_app: tauri::AppHandle) -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     {
         return Err("本地模式「自检」仅支持 macOS。请切换到「远程服务器」模式使用远程诊断功能。".into());
