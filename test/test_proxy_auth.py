@@ -61,9 +61,10 @@ class ProxyAuth(unittest.TestCase):
         s, _b = _req(f"{self.base}/{SEC}/health")
         self.assertEqual(s, 200)
 
-    def test_health_without_secret_forbidden(self):
+    def test_health_without_secret_ok(self):
+        # /health 免鉴权（自 #12 起），便于监控探活不依赖 secret 一致性
         s, _b = _req(f"{self.base}/health")
-        self.assertEqual(s, 403)
+        self.assertEqual(s, 200)
 
     def test_messages_without_secret_forbidden_and_upstream_untouched(self):
         before = len(self.hits)
