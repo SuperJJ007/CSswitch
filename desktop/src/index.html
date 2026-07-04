@@ -21,6 +21,80 @@
         </div>
       </div>
 
+      <!-- 本地/远程模式切换（跨平台功能） -->
+      <div class="sec targets">
+        <div class="seg" id="targetSeg">
+          <button type="button" class="seg-btn active" data-target="local">本地模式</button>
+          <button type="button" class="seg-btn" data-target="remote">远程服务器</button>
+        </div>
+      </div>
+
+      <!-- 远程服务器管理面板（仅远程模式显示） -->
+      <div class="sec remote-only" style="display:none">
+        <div class="row">
+          <select id="profileSelect" style="flex:1">
+            <option value="">-- 选择服务器 --</option>
+          </select>
+          <button class="btn small" id="manageProfilesBtn" title="管理服务器">管理</button>
+        </div>
+        <div class="remote-health" id="remoteHealth" style="margin-top:6px">
+          <span id="remoteHealthDot" class="lt a"></span>
+          <span id="remoteHealthText" style="font-size:11px;color:var(--sub)">未连接</span>
+        </div>
+      </div>
+
+      <!-- Profile 管理弹窗（隐藏） -->
+      <div class="modal-overlay" id="profileModal" style="display:none">
+        <div class="modal-box">
+          <h3 style="margin:0 0 12px">远程服务器管理</h3>
+          <div id="profileList" style="max-height:200px;overflow:auto;margin-bottom:10px"></div>
+          <div class="row" style="gap:6px">
+            <button class="btn small" id="addProfileBtn">+ 添加</button>
+            <button class="btn small" id="closeProfileModal" style="margin-left:auto">关闭</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Profile 编辑弹窗（隐藏） -->
+      <div class="modal-overlay" id="profileEditModal" style="display:none">
+        <div class="modal-box">
+          <h3 style="margin:0 0 12px" id="profileEditTitle">添加服务器</h3>
+          <div class="form-fields">
+            <label>名称 <span style="color:var(--red)">*</span></label>
+            <input type="text" id="editProfileName" placeholder="我的服务器" />
+
+            <label>服务器地址 <span style="color:var(--red)">*</span></label>
+            <input type="text" id="editProfileHost" placeholder="192.168.1.100 或 server.com" />
+
+            <label>SSH 端口</label>
+            <input type="number" id="editProfilePort" value="22" min="1" max="65535" />
+
+            <label>用户名 <span style="color:var(--red)">*</span></label>
+            <input type="text" id="editProfileUsername" placeholder="root" />
+
+            <label>认证方式</label>
+            <select id="editProfileAuth">
+              <option value="ssh_agent">SSH Agent（推荐）</option>
+              <option value="key_file">私钥文件</option>
+            </select>
+
+            <div id="keyFileGroup" style="display:none">
+              <label>私钥路径 <span style="color:var(--red)">*</span></label>
+              <input type="text" id="editProfileKeyPath" placeholder="~/.ssh/id_ed25519" />
+            </div>
+
+            <label>Helper 路径</label>
+            <input type="text" id="editProfileHelperPath" value="~/.csswitch/bin/csswitch-helper" />
+          </div>
+          <div class="row" style="gap:6px;margin-top:12px">
+            <button class="btn small" id="testProfileBtn">测试连接</button>
+            <button class="btn hero" id="saveProfileBtn" style="height:32px;font-size:12px;flex:1">保存</button>
+            <button class="btn small" id="cancelProfileEditBtn">取消</button>
+          </div>
+          <div id="profileEditMsg" style="font-size:11px;margin-top:8px"></div>
+        </div>
+      </div>
+
       <div class="sec official-only">
         <div class="hint">官方模式：用你自己真实的 Claude Science 与订阅。CSSwitch 不插手你的官方登录、也不起代理/沙箱，只把你交回官方客户端。</div>
       </div>

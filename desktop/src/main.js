@@ -33,6 +33,17 @@ function mockInvoke(cmd, args) {
     case "report_bug":
     case "open_logs":
       return Promise.resolve(null);
+    // 远程命令 mock
+    case "remote_list_profiles":
+      return Promise.resolve([]);
+    case "remote_check_health":
+      return Promise.resolve({ reachable: true, helperInstalled: false, compatible: false, desktopVersion: "0.0.0", platform: null, arch: null, capabilities: [], proxyRunning: false, sandboxRunning: false, lastError: "预览模式", lastCheck: 0 });
+    case "remote_status":
+      return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber", remote: true });
+    case "remote_doctor":
+      return Promise.resolve({ checks: [{ name: "预览模式", ok: false, detail: "后端未运行" }] });
+    case "remote_logs":
+      return Promise.resolve({ content: "(预览模式)", exists: false });
     default:
       return Promise.resolve(null);
   }
@@ -43,6 +54,11 @@ const els = {};
 let statusTimer = null;
 let busy = false;
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
+
+// ---- 远程服务器管理状态 ----
+let target = "local";    // "local" | "remote"
+let currentProfile = null; // RemoteHostProfile | null
+let remoteProfiles = [];   // 缓存的 Profile 列表
 
 const KEY_LABELS = { deepseek: "DeepSeek API Key", qwen: "DashScope (通义千问) API Key" };
 
@@ -315,12 +331,39 @@ function wire() {
     "oneClickBtn", "stopBtn", "ltProxy", "ltSandbox", "ltUpstream",
     "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
     "reportBtn", "logsBtn", "quitBtn", "modeSeg",
+    // 远程模式元素
+    "targetSeg", "profileSelect", "manageProfilesBtn", "remoteHealthDot",
+    "remoteHealthText", "profileModal", "profileList", "addProfileBtn",
+    "closeProfileModal", "profileEditModal", "profileEditTitle",
+    "editProfileName", "editProfileHost", "editProfilePort", "editProfileUsername",
+    "editProfileAuth", "editProfileKeyPath", "editProfileHelperPath",
+    "keyFileGroup", "testProfileBtn", "saveProfileBtn", "cancelProfileEditBtn",
+    "profileEditMsg",
   ].forEach((id) => (els[id] = $(id)));
   els.panel = document.querySelector(".panel");
 
+  // 已有的事件
   els.modeSeg.querySelectorAll(".seg-btn").forEach((b) =>
     b.addEventListener("click", () => switchMode(b.dataset.mode))
   );
+
+  // 远程模式事件
+  els.targetSeg.querySelectorAll(".seg-btn").forEach((b) =>
+    b.addEventListener("click", () => switchTarget(b.dataset.target))
+  );
+  els.profileSelect.addEventListener("change", onProfileChange);
+  els.manageProfilesBtn.addEventListener("click", openProfileModal);
+  els.addProfileBtn.addEventListener("click", () => { closeProfileModal(); openProfileEdit(null); });
+  els.closeProfileModal.addEventListener("click", closeProfileModal);
+  els.saveProfileBtn.addEventListener("click", saveProfile);
+  els.cancelProfileEditBtn.addEventListener("click", closeProfileEdit);
+  els.testProfileBtn.addEventListener("click", testProfileConnection);
+  els.editProfileAuth.addEventListener("change", toggleKeyFileGroup);
+
+  // 点击弹窗遮罩关闭
+  document.querySelectorAll('.modal-overlay').forEach(ov => {
+    ov.addEventListener('click', (e) => { if (e.target === ov) { ov.style.display = 'none'; } });
+  });
 
   els.provider.addEventListener("change", async () => {
     reflectProvider();
@@ -332,16 +375,407 @@ function wire() {
   els.stopBtn.addEventListener("click", stopAll);
   els.oneClickBtn.addEventListener("click", heroClick);
   els.openBrowserBtn.addEventListener("click", openBrowser);
-  els.doctorBtn.addEventListener("click", runDoctor);
+  els.doctorBtn.addEventListener("click", () => {
+    if (target === 'remote' && currentProfile) {
+      setBusy(true); setMsg("远程诊断中…");
+      call("remote_doctor", { profile: currentProfile })
+        .then(out => { setMsg(typeof out === 'string' ? out : JSON.stringify(out.checks || out, null, 2)); setBusy(false); })
+        .catch(e => { setMsg("诊断失败：" + e, "err"); setBusy(false); });
+    } else {
+      runDoctor();
+    }
+  });
   els.updateBtn.addEventListener("click", checkUpdate);
   els.reportBtn.addEventListener("click", () =>
     call("report_bug").catch((e) => setMsg("打开反馈页失败：" + e, "err"))
   );
-  els.logsBtn.addEventListener("click", () =>
-    call("open_logs").catch((e) => setMsg("打开日志失败：" + e, "err"))
-  );
+  els.logsBtn.addEventListener("click", () => {
+    if (target === 'remote' && currentProfile) {
+      call("remote_logs", { profile: currentProfile, name: "proxy", lines: 50 })
+        .then(out => setMsg(out && out.content ? out.content : '(日志为空)', 'ok'))
+        .catch(e => setMsg("获取日志失败：" + e, "err"));
+    } else {
+      call("open_logs").catch((e) => setMsg("打开日志失败：" + e, "err"));
+    }
+  });
   els.quitBtn.addEventListener("click", () => call("quit_app").catch(() => {}));
 }
+
+// =========================================================================
+// 远程服务器管理
+// =========================================================================
+
+/// 切换本地/远程模式。
+async function switchTarget(t) {
+  if (t === target) return;
+  target = t;
+  // 更新 UI 类
+  const panel = document.querySelector('.panel');
+  if (t === 'remote') {
+    panel.classList.add('target-remote');
+  } else {
+    panel.classList.remove('target-remote');
+  }
+  // 更新分段按钮
+  document.querySelectorAll('#targetSeg .seg-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.target === t)
+  );
+  if (t === 'remote') {
+    await loadRemoteProfiles();
+    setMsg('已切换到远程模式。请选择服务器。');
+  } else {
+    setMsg('已切换到本地模式。');
+  }
+  await refreshStatus();
+}
+
+/// 加载远程 Profile 列表。
+async function loadRemoteProfiles() {
+  try {
+    remoteProfiles = await call("remote_list_profiles");
+    const sel = $('#profileSelect');
+    sel.innerHTML = '<option value="">-- 选择服务器 --</option>' +
+      remoteProfiles.map(p =>
+        `<option value="${p.id}">${p.name} (${p.username}@${p.host}:${p.port})</option>`
+      ).join('');
+    // 恢复之前选择的
+    if (currentProfile && remoteProfiles.find(p => p.id === currentProfile.id)) {
+      sel.value = currentProfile.id;
+    }
+    updateRemoteHealthUI();
+  } catch (e) {
+    setMsg("加载服务器列表失败：" + e, "err");
+  }
+}
+
+/// Profile 变更时。
+async function onProfileChange() {
+  const id = $('#profileSelect').value;
+  currentProfile = remoteProfiles.find(p => p.id === id) || null;
+  if (currentProfile) {
+    setMsg(`已选择 ${currentProfile.name}，正在检查连接…`, null);
+    await checkRemoteHealth();
+  } else {
+    updateRemoteHealthUI();
+    setMsg('请选择远程服务器。');
+  }
+}
+
+/// 检查远程健康状态。
+async function checkRemoteHealth() {
+  if (!currentProfile) return;
+  const dot = $('#remoteHealthDot');
+  const txt = $('#remoteHealthText');
+  dot.className = 'lt a pulsing';
+  txt.textContent = '连接中…';
+  try {
+    const health = await call("remote_check_health", { profile: currentProfile });
+    if (health.reachable && health.helperInstalled && health.compatible) {
+      dot.className = 'lt g';
+      txt.textContent = `已连接 | ${health.platform || '?'} ${health.arch || '?'} | Helper ${health.helperVersion || '?'}`;
+    } else if (health.reachable && !health.helperInstalled) {
+      dot.className = 'lt a';
+      txt.textContent = '已连接，Helper 未安装。点击下方「安装 Helper」。';
+    } else if (health.reachable && !health.compatible) {
+      dot.className = 'lt a';
+      txt.textContent = `Helper 版本不兼容：${health.lastError || '请升级'}`;
+    } else {
+      dot.className = 'lt r';
+      txt.textContent = health.lastError || '连接失败';
+    }
+    // 如果远程代理/沙箱在运行，更新状态灯
+    if (health.proxyRunning || health.sandboxRunning) {
+      setLight(els.ltProxy, health.proxyRunning ? 'green' : 'amber');
+      setLight(els.ltSandbox, health.sandboxRunning ? 'green' : 'amber');
+      setLight(els.ltUpstream, 'green');
+    }
+  } catch (e) {
+    dot.className = 'lt r';
+    txt.textContent = '检查失败：' + e;
+  }
+}
+
+/// 更新远程健康 UI（初始/断开状态）。
+function updateRemoteHealthUI() {
+  const dot = $('#remoteHealthDot');
+  const txt = $('#remoteHealthText');
+  if (currentProfile) {
+    dot.className = 'lt a';
+    txt.textContent = `已选：${currentProfile.name}`;
+  } else {
+    dot.className = 'lt a';
+    txt.textContent = '未连接';
+  }
+}
+
+/// 安装远程 Helper。
+async function installRemoteHelper() {
+  if (!currentProfile) { setMsg('请先选择服务器', 'err'); return; }
+  setBusy(true); setMsg('正在安装 Helper，可能需要 1-2 分钟…');
+  try {
+    const health = await call("remote_install_helper", { profile: currentProfile });
+    if (health.helperInstalled) {
+      setMsg(`Helper ${health.helperVersion} 安装成功！`, 'ok');
+      await checkRemoteHealth();
+    } else {
+      setMsg('安装失败：' + (health.lastError || '未知错误'), 'err');
+    }
+  } catch (e) { setMsg('安装失败：' + e, 'err'); }
+  finally { setBusy(false); }
+}
+
+// =========================================================================
+// Profile 管理弹窗
+// =========================================================================
+
+/// 打开 Profile 管理弹窗。
+async function openProfileModal() {
+  const modal = $('#profileModal');
+  const list = $('#profileList');
+  // 渲染列表
+  list.innerHTML = remoteProfiles.length === 0
+    ? '<div class="hint">暂无服务器。点击「+ 添加」。</div>'
+    : remoteProfiles.map(p => `
+      <div class="profile-item">
+        <div>
+          <div class="pi-name">${escHtml(p.name)}</div>
+          <div class="pi-detail">${escHtml(p.username)}@${escHtml(p.host)}:${p.port} · ${p.authMethod.type === 'SshAgent' ? 'SSH Agent' : 'KeyFile'}</div>
+        </div>
+        <div class="pi-actions">
+          <span class="pi-act" data-action="edit" data-id="${p.id}">编辑</span>
+          <span class="pi-act del" data-action="delete" data-id="${p.id}">删除</span>
+        </div>
+      </div>
+    `).join('');
+  // 绑定事件
+  list.querySelectorAll('.pi-act').forEach(el => {
+    el.addEventListener('click', async () => {
+      const id = el.dataset.id;
+      if (el.dataset.action === 'edit') {
+        openProfileEdit(id);
+      } else if (el.dataset.action === 'delete') {
+        if (confirm('确定删除此服务器配置？')) {
+          await call("remote_delete_profile", { id });
+          await loadRemoteProfiles();
+          if (currentProfile && currentProfile.id === id) currentProfile = null;
+          openProfileModal(); // 刷新列表
+        }
+      }
+    });
+  });
+  modal.style.display = 'flex';
+}
+
+/// 关闭 Profile 管理弹窗。
+function closeProfileModal() {
+  $('#profileModal').style.display = 'none';
+}
+
+/// 打开 Profile 编辑弹窗（新增或编辑）。
+function openProfileEdit(id) {
+  const modal = $('#profileEditModal');
+  const profile = id ? remoteProfiles.find(p => p.id === id) : null;
+  $('#profileEditTitle').textContent = profile ? '编辑服务器' : '添加服务器';
+  $('#editProfileName').value = profile ? profile.name : '';
+  $('#editProfileHost').value = profile ? profile.host : '';
+  $('#editProfilePort').value = profile ? profile.port : 22;
+  $('#editProfileUsername').value = profile ? profile.username : '';
+  $('#editProfileAuth').value = profile
+    ? (profile.authMethod.type === 'SshAgent' ? 'ssh_agent' : 'key_file')
+    : 'ssh_agent';
+  $('#editProfileKeyPath').value = (profile && profile.authMethod.path) ? profile.authMethod.path : '~/.ssh/id_ed25519';
+  $('#editProfileHelperPath').value = profile ? profile.helperPath : '~/.csswitch/bin/csswitch-helper';
+  $('#profileEditMsg').textContent = '';
+  // 切换认证方式显示
+  toggleKeyFileGroup();
+  // 存储当前编辑的 ID
+  modal.dataset.editId = id || '';
+  modal.style.display = 'flex';
+}
+
+/// 关闭编辑弹窗。
+function closeProfileEdit() {
+  $('#profileEditModal').style.display = 'none';
+}
+
+/// 认证方式切换时显示/隐藏密钥路径。
+function toggleKeyFileGroup() {
+  $('#keyFileGroup').style.display = $('#editProfileAuth').value === 'key_file' ? '' : 'none';
+}
+
+/// 保存 Profile。
+async function saveProfile() {
+  const id = $('#profileEditModal').dataset.editId || crypto.randomUUID ? crypto.randomUUID() : 'p_' + Date.now();
+  const authType = $('#editProfileAuth').value;
+  const profile = {
+    id: id,
+    name: $('#editProfileName').value.trim() || '未命名',
+    host: $('#editProfileHost').value.trim(),
+    port: parseInt($('#editProfilePort').value) || 22,
+    username: $('#editProfileUsername').value.trim(),
+    authMethod: authType === 'key_file'
+      ? { type: 'KeyFile', path: $('#editProfileKeyPath').value.trim() }
+      : { type: 'SshAgent' },
+    helperPath: $('#editProfileHelperPath').value.trim() || '~/.csswitch/bin/csswitch-helper',
+  };
+  if (!profile.host || !profile.username) {
+    $('#profileEditMsg').textContent = '服务器地址和用户名不能为空。';
+    $('#profileEditMsg').className = 'msg err';
+    return;
+  }
+  try {
+    await call("remote_save_profile", { profile });
+    await loadRemoteProfiles();
+    closeProfileEdit();
+    openProfileModal(); // 刷新管理列表
+  } catch (e) {
+    $('#profileEditMsg').textContent = '保存失败：' + e;
+    $('#profileEditMsg').className = 'msg err';
+  }
+}
+
+/// 测试连接。
+async function testProfileConnection() {
+  const btn = $('#testProfileBtn');
+  btn.disabled = true;
+  $('#profileEditMsg').textContent = '正在测试连接…';
+  $('#profileEditMsg').className = 'msg';
+  try {
+    // 构建临时 Profile 用于测试
+    const authType = $('#editProfileAuth').value;
+    const tmpProfile = {
+      id: '_test_',
+      name: 'test',
+      host: $('#editProfileHost').value.trim(),
+      port: parseInt($('#editProfilePort').value) || 22,
+      username: $('#editProfileUsername').value.trim(),
+      authMethod: authType === 'key_file'
+        ? { type: 'KeyFile', path: $('#editProfileKeyPath').value.trim() }
+        : { type: 'SshAgent' },
+      helperPath: $('#editProfileHelperPath').value.trim() || '~/.csswitch/bin/csswitch-helper',
+    };
+    const health = await call("remote_check_health", { profile: tmpProfile });
+    if (health.reachable) {
+      let msg = `✅ 连接成功！平台：${health.platform || '?'} ${health.arch || '?'}`;
+      if (health.helperInstalled) {
+        msg += ` | Helper：${health.helperVersion || '?'}`;
+      } else {
+        msg += ' | Helper 未安装（保存后可在主面板安装）';
+      }
+      $('#profileEditMsg').textContent = msg;
+      $('#profileEditMsg').className = 'msg ok';
+    } else {
+      $('#profileEditMsg').textContent = `❌ ${health.lastError || '连接失败'}`;
+      $('#profileEditMsg').className = 'msg err';
+    }
+  } catch (e) {
+    $('#profileEditMsg').textContent = '❌ ' + e;
+    $('#profileEditMsg').className = 'msg err';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/// HTML 转义。
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// =========================================================================
+// 重写关键操作以支持远程模式分派
+// =========================================================================
+
+/// 保存 Key（本地或远程）。
+const _saveKeyOrig = saveKey;
+saveKey = async function() {
+  if (target === 'remote' && currentProfile) {
+    const key = els.keyInput.value.trim();
+    if (!key) { setMsg("请先粘贴 key。", "err"); return; }
+    setBusy(true);
+    try {
+      const masked = await call("remote_save_provider_key", { profile: currentProfile, provider: els.provider.value, key });
+      if (!window._keys) window._keys = {};
+      window._keys[els.provider.value] = masked;
+      reflectProvider();
+      setMsg("已保存到远程服务器。", "ok");
+    } catch (e) { setMsg("保存失败：" + e, "err"); }
+    finally { setBusy(false); await refreshStatus(); }
+    return;
+  }
+  return _saveKeyOrig();
+};
+
+/// 一键开始（本地或远程）。
+const _oneClickOrig = oneClick;
+oneClick = async function() {
+  if (target === 'remote' && currentProfile) {
+    setBusy(true); setMsg('远程一键开始：保存 Key → 起代理…');
+    try {
+      const key = els.keyInput.value.trim();
+      const r = await call("remote_one_click", {
+        profile: currentProfile,
+        provider: els.provider.value,
+        key: key,
+        proxyPort: parseInt(els.proxyPort.value) || 18991,
+        sandboxPort: parseInt(els.sandboxPort.value) || 8990,
+      });
+      setMsg("远程代理已启动！端口：" + (r && r.port) + "。请在浏览器中访问 Science。", "ok");
+      await refreshStatus();
+    } catch (e) { setMsg("远程一键开始失败：" + e, "err"); }
+    finally { setBusy(false); }
+    return;
+  }
+  return _oneClickOrig();
+};
+
+/// 全部停止（本地或远程）。
+const _stopAllOrig = stopAll;
+stopAll = async function() {
+  if (target === 'remote' && currentProfile) {
+    setBusy(true); setMsg('停止远程服务…');
+    try {
+      await call("remote_stop_proxy", { profile: currentProfile });
+      setMsg("远程代理已停止。", "ok");
+      await refreshStatus();
+    } catch (e) { setMsg("停止失败：" + e, "err"); }
+    finally { setBusy(false); }
+    return;
+  }
+  return _stopAllOrig();
+};
+
+/// 刷新状态（本地或远程）。
+const _refreshStatusOrig = refreshStatus;
+refreshStatus = async function() {
+  if (target === 'remote' && currentProfile) {
+    try {
+      const s = await call("remote_status", { profile: currentProfile });
+      setLight(els.ltProxy, s.proxy);
+      setLight(els.ltSandbox, s.sandbox);
+      setLight(els.ltUpstream, s.upstream);
+      const anyGreen = s.proxy === "green" || s.sandbox === "green";
+      els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
+    } catch (e) {
+      [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "amber"));
+    }
+    return;
+  }
+  return _refreshStatusOrig();
+};
+
+/// Hero 按钮（官方/本地/远程分派）。
+const _heroClickOrig = heroClick;
+heroClick = async function() {
+  if (target === 'remote') {
+    if (mode === 'official') {
+      setMsg('远程模式不支持官方 Claude。请用第三方模型。', 'err');
+    } else {
+      await oneClick();
+    }
+    return;
+  }
+  return _heroClickOrig();
+};
 
 window.addEventListener("DOMContentLoaded", async () => {
   wire();

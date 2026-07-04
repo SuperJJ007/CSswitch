@@ -1,26 +1,39 @@
-//! CSSwitch 菜单栏 app 后端（进程管家）。
+//! CSSwitch 桌面 app 后端（进程管家 + 远程服务器管理）。
 //!
-//! 职责：管理「翻译代理」与「沙箱 Science」两个子进程的生命周期；读写
+//! 职责：管理「翻译代理」与「沙箱 Science」两个子进程的生命周期（本地 macOS 模式），
+//! 或通过 SSH 管理远程 Linux 服务器上的同名服务（远程模式）；读写
 //! `~/.csswitch/config.json`；把第三方 key 以【环境变量】注入代理子进程（绝不进 argv）；
-//! 探活；把沙箱 URL 交系统浏览器打开。已验证的越权/翻译逻辑仍留在 Python/Node/shell
-//! 里被当作子进程调用，以保住铁律护栏与已验证行为。
+//! 探活；把沙箱 URL 交系统浏览器打开。
+//!
+//! 跨平台适配：macOS 代码用 `#[cfg(target_os = "macos")]` 守卫；Windows 不支持本地模式
+//! （缺少 Claude Science.app / zsh / pkill 等），本地操作返回明确错误。
 //!
 //! 铁律相关：key 只在内存与 0600 的 config.json；回显前端只给掩码；沙箱端口/目录护栏
 //! 由被调脚本负责（对 8765 与真实目录失败关闭）；退 app 默认停代理、保留沙箱。
 
 mod config;
+// 虚拟 OAuth 伪造器仅 macOS 本地需要（Windows 远程模式不使用虚拟登录）。
+#[cfg(target_os = "macos")]
 mod oauth_forge;
 mod proc;
+// 跨平台文件权限抽象：Unix 下提供真实的 0600/0700 权限，Windows 下为 no-op。
+mod fs_ext;
+// 远程服务器管理：SSH 连接、Profile 存储、远程命令。
+mod remote;
+mod remote_commands;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::fs_ext::{open_log_file, set_file_permissions, PermissionsExt};
 use serde::Deserialize;
 use serde_json::json;
 use tauri::{Manager, State};
 
+/// Claude Science 二进制路径，仅 macOS 本地模式有效。
+#[cfg(target_os = "macos")]
 const SCIENCE_BIN: &str = "/Applications/Claude Science.app/Contents/Resources/bin/claude-science";
 
 #[derive(Default)]
@@ -113,36 +126,22 @@ fn log_path(name: &str) -> PathBuf {
     config::default_dir().join("logs").join(name)
 }
 
-/// `O_NOFOLLOW` 的平台常量（本项目不引 libc）。macOS/BSD=0x0100，Linux=0x20000。
-const fn libc_o_nofollow() -> i32 {
-    if cfg!(target_os = "linux") {
-        0x2_0000
-    } else {
-        0x0100
-    }
-}
-
 /// 打开（truncate）一个子进程日志文件，父目录 0700、文件 0600（防同机其它用户读到 secret 尾巴）。
+/// 跨平台：Unix 用 `O_NOFOLLOW` 防符号链接跟随；Windows 无此概念，仅做普通 open。
+/// 注意：symlink 检查 `config::assert_not_symlink` 本身在所有平台可用
+/// （`std::fs::symlink_metadata` + `is_symlink()` 是跨平台的）。
 fn open_log(name: &str) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let p = log_path(name);
     if let Some(parent) = p.parent() {
         config::assert_not_symlink(parent)?;
         std::fs::create_dir_all(parent)?;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        let _ = set_file_permissions(parent, 0o700);
     }
     // 日志路径不许是符号链接：否则 truncate+写会覆盖链接目标文件（修 P2-1）。
     config::assert_not_symlink(&p)?;
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        // O_NOFOLLOW：即便在 lstat 与 open 之间被换成软链，也拒绝跟随。
-        .custom_flags(libc_o_nofollow())
-        .open(&p)?;
-    // 文件已存在时 mode() 不复位，显式再夹一次。
-    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    let f = open_log_file(&p)?;
+    // 文件已存在时 mode 不复位，显式再夹一次。
+    let _ = set_file_permissions(&p, 0o600);
     Ok(f)
 }
 
@@ -177,14 +176,40 @@ fn lock(m: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 用系统浏览器打开 URL（macOS `open`）。校验退出码：非零视为失败（P2c）。
+/// 用系统浏览器打开 URL。
+/// 跨平台：macOS 用 `open` 命令，Windows 用 `cmd /c start`（或 Tauri opener 插件）。
+/// 校验退出码：非零视为失败（P2c）。
 fn open_in_browser(url: &str) -> Result<(), String> {
-    let st = Command::new("open")
-        .arg(url)
-        .status()
-        .map_err(|e| format!("打开浏览器失败：{e}"))?;
-    if !st.success() {
-        return Err(format!("open 非零退出（{:?}）", st.code()));
+    #[cfg(target_os = "macos")]
+    {
+        let st = Command::new("open")
+            .arg(url)
+            .status()
+            .map_err(|e| format!("打开浏览器失败：{e}"))?;
+        if !st.success() {
+            return Err(format!("open 非零退出（{:?}）", st.code()));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let st = Command::new("cmd")
+            .args(["/c", "start", url])
+            .status()
+            .map_err(|e| format!("打开浏览器失败：{e}"))?;
+        if !st.success() {
+            return Err(format!("start 非零退出（{:?}）", st.code()));
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Linux 等其他平台：尝试 xdg-open
+        let st = Command::new("xdg-open")
+            .arg(url)
+            .status()
+            .map_err(|e| format!("打开浏览器失败：{e}"))?;
+        if !st.success() {
+            return Err(format!("xdg-open 非零退出（{:?}）", st.code()));
+        }
     }
     Ok(())
 }
@@ -262,8 +287,12 @@ fn ensure_proxy(
         // 孤儿仍占着端口 → 新代理绑不上（Errno 48）→ 探活超时。
         // 收紧（P2 GPT 复审）：匹配【本安装的绝对脚本路径】+ 端口，而非仅「脚本名+端口」，
         // 避免误杀另一个 checkout / 用户手启的同名代理。路径里的正则元字符转义按字面匹配。
-        let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
-        let _ = Command::new("pkill").arg("-f").arg(&pat).status();
+        // 跨平台：`pkill` 仅 Unix 可用；Windows 上孤儿进程由系统自动回收，且远程模式为主要场景。
+        #[cfg(unix)]
+        {
+            let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
+            let _ = Command::new("pkill").arg("-f").arg(&pat).status();
+        }
 
         let logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
@@ -313,11 +342,20 @@ fn ensure_proxy(
 
 /// 停沙箱。返回 Err 表示 stop 脚本非零退出（Science 可能没停干净），
 /// 调用方据此如实报告，不再无条件报「已停止」（修 P1 停止虚假成功）。
+/// 仅 macOS 有效；非 macOS 上本地沙箱不存在，直接清 state 返回 Ok。
 fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
     // 沙箱由脚本以 --detached 起 Science，本进程持有的是脚本 child（已退出）。
     // 真正停 Science 要调 stop 脚本（按 data-dir，绝不碰真实 8765）。
     // 修 P1（GPT 复审）：定位不到资源根 / 停止脚本时，绝不静默返回成功——detached 沙箱
     // 可能仍在跑，谎报「已停止」会让「切官方模式」误以为第三方链路已拆。此时如实报错。
+    #[cfg(not(target_os = "macos"))]
+    {
+        kill_child(&mut st.sandbox);
+        st.sandbox_url = None;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
     let mut err = None;
     match asset_root(app) {
         Some(root) => {
@@ -355,6 +393,7 @@ fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
         Some(e) => Err(e),
         None => Ok(()),
     }
+    } // #[cfg(target_os = "macos")]
 }
 
 // ---------- Tauri commands ----------
@@ -418,28 +457,37 @@ fn set_mode(
 }
 
 /// 官方模式：干净地打开用户【真实】的 Claude Science（用户自己的官方登录与订阅）。
+/// 仅 macOS 有效（需本地安装 Claude Science.app）；在 Windows / 其他平台上返回明确提示，
+/// 引导用户使用远程模式管理服务器上的 Science。
 ///
 /// 铁律：绝不碰/复制真实凭证；用 `open`（系统 LaunchServices 正常启动）而非注入环境变量，
 /// 并显式抹掉任何 `ANTHROPIC_*`，确保**不用改过的环境变量启动真实实例**（真实实例走它自己的
 /// 官方端点，不经本代理）。CSSwitch 只把用户交回官方客户端，不托管其登录。
 #[tauri::command]
 fn open_official() -> Result<(), String> {
-    let app_path = "/Applications/Claude Science.app";
-    let mut cmd = Command::new("open");
-    if Path::new(app_path).is_dir() {
-        cmd.arg(app_path);
-    } else {
-        cmd.arg("-a").arg("Claude Science");
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("本地模式「打开官方 Claude Science」仅支持 macOS。请使用远程模式连接到运行 Science 的 Linux 服务器。".into());
     }
-    // 防御性：即便 `open` 通常不向被启动 app 传本进程环境，也显式抹掉，杜绝把改过的
-    // ANTHROPIC_* 带进真实实例（铁律 3）。
-    cmd.env_remove("ANTHROPIC_BASE_URL")
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN");
-    match cmd.status() {
-        Ok(s) if s.success() => Ok(()),
-        Ok(_) => Err("未能打开 Claude Science。请确认已安装官方 Claude Science。".into()),
-        Err(e) => Err(format!("打开官方 Claude Science 失败：{e}")),
+    #[cfg(target_os = "macos")]
+    {
+        let app_path = "/Applications/Claude Science.app";
+        let mut cmd = Command::new("open");
+        if Path::new(app_path).is_dir() {
+            cmd.arg(app_path);
+        } else {
+            cmd.arg("-a").arg("Claude Science");
+        }
+        // 防御性：即便 `open` 通常不向被启动 app 传本进程环境，也显式抹掉，杜绝把改过的
+        // ANTHROPIC_* 带进真实实例（铁律 3）。
+        cmd.env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN");
+        match cmd.status() {
+            Ok(s) if s.success() => Ok(()),
+            Ok(_) => Err("未能打开 Claude Science。请确认已安装官方 Claude Science。".into()),
+            Err(e) => Err(format!("打开官方 Claude Science 失败：{e}")),
+        }
     }
 }
 
@@ -536,11 +584,19 @@ fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<
     sandbox_res.map_err(|e| format!("代理已停；但{e}真实实例 8765 未受影响。"))
 }
 
+/// 「一键开始」：起代理 → 写虚拟 OAuth → 起沙箱 Science → 探活 → 开浏览器。
+/// 仅 macOS 本地模式有效。Windows/其他平台应使用远程模式 (`remote_*` 命令)。
 #[tauri::command]
 fn one_click_login(
     app: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("本地模式「一键开始」仅支持 macOS。请切换到「远程服务器」模式管理 Linux 服务器上的 Science。".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
     // 1~3. 确保代理在跑且健康（内部已查 key、探活）。带回本次是复用还是重启。
     let (pport, secret, proxy_action) = ensure_proxy(&app, &state)?;
 
@@ -690,6 +746,7 @@ fn one_click_login(
         Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
     };
     Ok(json!({ "url": url, "msg": msg, "action": "started" }))
+    } // #[cfg(target_os = "macos")]
 }
 
 /// 从 `claude-science url` 的 stdout 里取**第一条**合法 http(s) URL。
@@ -710,7 +767,14 @@ fn first_http_url(stdout: &str) -> Option<String> {
 
 /// 取沙箱 UI 链接：`<bin> url --data-dir <home>/.claude-science`，HOME 指向沙箱 HOME。
 /// 失败退回 http://127.0.0.1:<port>。沙箱 HOME 用 [`sandbox_home`]（与 launch 时一致）。
+/// 仅 macOS 有效（依赖 Claude Science.app 二进制）；其他平台直接返回端口 URL。
 fn sandbox_url(port: u16) -> String {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return format!("http://127.0.0.1:{port}");
+    }
+    #[cfg(target_os = "macos")]
+    {
     let home = sandbox_home();
     let data_dir = home.join(".claude-science");
     if Path::new(SCIENCE_BIN).is_file() {
@@ -729,13 +793,21 @@ fn sandbox_url(port: u16) -> String {
         }
     }
     format!("http://127.0.0.1:{port}")
+    } // #[cfg(target_os = "macos")]
 }
 
 /// 判断「我们自己的」沙箱 Science 是否在跑（供一键健康分派）。收紧（P2 GPT 复审）：优先用
 /// Science 二进制按【我们的 data-dir】查 `{"running":true}`，这是强身份——不会被恰好占用
 /// `port` 且返回 200 的冒名服务骗过；再叠加端口 /health 确认确实在服务。二进制不在（纯 dev /
 /// 研究者机器）时退化为仅端口探活（原行为）。
+/// 仅 macOS 有效；非 macOS 退化为纯端口探活（无本地 SCIENCE_BIN）。
 fn sandbox_running_ours(port: u16) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return proc::http_health(port, None, 400);
+    }
+    #[cfg(target_os = "macos")]
+    {
     let home = sandbox_home();
     let data_dir = home.join(".claude-science");
     if Path::new(SCIENCE_BIN).is_file() {
@@ -757,6 +829,7 @@ fn sandbox_running_ours(port: u16) -> bool {
         }
     }
     proc::http_health(port, None, 400)
+    } // #[cfg(target_os = "macos")]
 }
 
 #[tauri::command]
@@ -804,8 +877,16 @@ fn open_url(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
     open_in_browser(&url)
 }
 
+/// 运行诊断脚本 `scripts/doctor.sh`。仅 macOS 本地模式有效。
+/// Windows/其他平台上返回明确提示，引导使用远程模式诊断。
 #[tauri::command]
 fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("本地模式「自检」仅支持 macOS。请切换到「远程服务器」模式使用远程诊断功能。".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
     let root = asset_root(&app).ok_or("找不到 scripts/doctor.sh（打包资源或仓库根均未命中）。")?;
     let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
     let doctor = root.join("scripts/doctor.sh");
@@ -826,6 +907,7 @@ fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
         text.push_str(err.trim());
     }
     Ok(text)
+    } // #[cfg(target_os = "macos")]
 }
 
 /// 当前 app 版本（供前端「检查更新」与页脚版本号用）。
@@ -846,15 +928,33 @@ fn report_bug() -> Result<(), String> {
     open_in_browser("https://github.com/SuperJJ007/CSswitch/issues/new?template=bug_report.yml")
 }
 
-/// 在访达里打开日志目录 `~/.csswitch/logs`，方便用户附到 bug 反馈里（先自查有无密钥）。
+/// 在文件管理器中打开日志目录 `~/.csswitch/logs`（跨平台）。
+/// macOS 用 `open`，Windows 用 `explorer`，Linux 用 `xdg-open`。
 #[tauri::command]
 fn open_logs() -> Result<(), String> {
     let dir = config::default_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
-    Command::new("open")
-        .arg(&dir)
-        .status()
-        .map_err(|e| format!("打开日志目录失败：{e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&dir)
+            .status()
+            .map_err(|e| format!("打开日志目录失败：{e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(&dir)
+            .status()
+            .map_err(|e| format!("打开日志目录失败：{e}"))?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Command::new("xdg-open")
+            .arg(&dir)
+            .status()
+            .map_err(|e| format!("打开日志目录失败：{e}"))?;
+    }
     Ok(())
 }
 
@@ -877,6 +977,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(Mutex::new(AppState::default()))
         .invoke_handler(tauri::generate_handler![
+            // 本地命令（macOS 本地模式）
             get_config,
             set_config,
             set_mode,
@@ -893,7 +994,25 @@ pub fn run() {
             open_release_page,
             report_bug,
             open_logs,
-            quit_app
+            quit_app,
+            // 远程命令（跨平台）
+            remote_commands::remote_list_profiles,
+            remote_commands::remote_save_profile,
+            remote_commands::remote_delete_profile,
+            remote_commands::remote_validate_profile,
+            remote_commands::remote_check_health,
+            remote_commands::remote_install_helper,
+            remote_commands::remote_get_config,
+            remote_commands::remote_set_config,
+            remote_commands::remote_save_provider_key,
+            remote_commands::remote_start_proxy,
+            remote_commands::remote_stop_proxy,
+            remote_commands::remote_proxy_status,
+            remote_commands::remote_verify_key,
+            remote_commands::remote_status,
+            remote_commands::remote_logs,
+            remote_commands::remote_doctor,
+            remote_commands::remote_one_click,
         ])
         .setup(|app| {
             // 正常桌面应用：进 Dock、走常规应用生命周期（默认 Regular 策略，

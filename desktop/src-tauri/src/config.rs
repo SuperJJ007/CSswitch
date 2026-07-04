@@ -12,8 +12,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use crate::fs_ext::{set_file_permissions, OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Serialize};
 
@@ -82,12 +83,11 @@ impl Config {
     }
 }
 
-/// 生产环境配置目录：`$HOME/.csswitch`。
+/// 生产环境配置目录：通过 `dirs` crate 跨平台获取 home 目录下 `.csswitch`。
 pub fn default_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".csswitch")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".csswitch")
 }
 
 fn config_path(dir: &Path) -> PathBuf {
@@ -120,7 +120,7 @@ fn ensure_dir(dir: &Path) -> io::Result<()> {
             format!("配置目录不是目录：{}", dir.display()),
         ));
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    set_file_permissions(dir, 0o700)?;
     Ok(())
 }
 
@@ -138,7 +138,7 @@ pub fn load_from(dir: &Path) -> io::Result<Config> {
         Err(e) => return Err(e),
     };
     // 存在即复位权限，抵御外部把它改宽。
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    let _ = set_file_permissions(&path, 0o600);
     let cfg: Config = serde_json::from_slice(&data).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -169,11 +169,14 @@ pub fn save_to(dir: &Path, cfg: &Config) -> io::Result<()> {
     ));
     // O_CREAT|O_EXCL + 0600：拒绝复用已有临时文件，创建即定权限。
     let write_res = (|| -> io::Result<()> {
-        let mut f = fs::OpenOptions::new()
+        let mut f = {
+        use crate::fs_ext::OpenOptionsExt;
+        fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp)?;
+            .open(&tmp)?
+    };
         f.write_all(&json)?;
         f.sync_all()?;
         Ok(())
@@ -187,7 +190,7 @@ pub fn save_to(dir: &Path, cfg: &Config) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    set_file_permissions(&path, 0o600)?;
     Ok(())
 }
 
@@ -219,7 +222,11 @@ pub fn mask(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 符号链接创建仅 Unix 平台可用；使用 #[cfg(unix)] 守卫相关测试函数。
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    // 引入跨平台 PermissionsExt trait 以使用 .mode() 方法。
+    use crate::fs_ext::PermissionsExt;
 
     fn tmpdir() -> PathBuf {
         // 每个测试用「进程 id + 线程 id」独立子目录，避免并行测试相互踩。
@@ -230,6 +237,7 @@ mod tests {
         d
     }
 
+    /// 读取文件权限的 Unix mode 位（仅 Unix 平台有意义，Windows 返回 0）。
     fn mode_of(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
@@ -263,6 +271,8 @@ mod tests {
         assert_eq!(got.key_for("deepseek").as_deref(), Some("sk-abcdef1234"));
     }
 
+    /// 测试 save_to 后目录和文件权限正确（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn save_sets_dir_0700_and_file_0600() {
         let d = tmpdir().join(".csswitch");
@@ -271,16 +281,21 @@ mod tests {
         assert_eq!(mode_of(&config_path(&d)), 0o600, "file must be 0600");
     }
 
+    /// load 时把被放宽的权限重新夹回 0600（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn load_resets_widened_perms_to_0600() {
         let d = tmpdir().join(".csswitch");
         save_to(&d, &Config::default()).unwrap();
         let p = config_path(&d);
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        // 先用 set_file_permissions 放宽权限模拟被外部修改的场景。
+        set_file_permissions(&p, 0o644).unwrap();
         load_from(&d).unwrap();
         assert_eq!(mode_of(&p), 0o600, "load must reset perms to 0600");
     }
 
+    /// 保存到符号链接目标应被拒绝且目标文件零改动（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn save_rejects_symlinked_file_and_leaves_target_untouched() {
         let base = tmpdir();
@@ -296,6 +311,8 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"ORIGINAL");
     }
 
+    /// 从符号链接文件读取应被拒绝（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn load_rejects_symlinked_file() {
         let base = tmpdir();
@@ -308,6 +325,8 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
+    /// ~/.csswitch 目录本身是符号链接时 load 应拒绝（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn load_rejects_symlinked_dir() {
         // ~/.csswitch 本身被换成软链时，load 也必须拒绝（不跟随读到别处）——修 P1-3。
@@ -321,6 +340,8 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
+    /// 确保目录函数应拒绝符号链接目录（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn ensure_dir_rejects_symlinked_dir() {
         let base = tmpdir();
