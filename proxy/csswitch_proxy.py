@@ -360,6 +360,12 @@ class H(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self):
+        # /health 免鉴权（健康检查不含敏感信息）
+        # 注意：path 可能尚未经 _auth_ok 剥离前缀，故同时匹配裸路径和带 secret 前缀的路径。
+        if self.path == "/health" or self.path.startswith("/health?") \
+           or self.path.endswith("/health") or "/health?" in self.path:
+            self._send_json(200, {"status": "ok", "provider": PROV_NAME})
+            return
         if not self._auth_ok():
             return
         if self.path.startswith("/v1/models"):
@@ -368,8 +374,6 @@ class H(BaseHTTPRequestHandler):
             log(f"GET /v1/models -> {PROV_NAME}: {', '.join(m[0] for m in PROV['models'])}")
             self._send_json(200, {"data": data, "has_more": False,
                                   "first_id": data[0]["id"], "last_id": data[-1]["id"]})
-        elif self.path.startswith("/health"):
-            self._send_json(200, {"status": "ok", "provider": PROV_NAME})
         else:
             self._send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": self.path}})
 
