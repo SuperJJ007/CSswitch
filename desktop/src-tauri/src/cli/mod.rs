@@ -4,6 +4,8 @@
 //! 模式匹配风格参考 cc-switch-remote 的 `cli/mod.rs`。
 
 pub mod commands;
+pub mod logger;
+pub mod proc_manager;
 pub mod serve;
 pub mod types;
 

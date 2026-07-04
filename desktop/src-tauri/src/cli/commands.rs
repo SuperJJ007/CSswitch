@@ -16,8 +16,11 @@ use super::types::CliEnvelope;
 // 路径工具
 // ============================================================================
 
-/// 获取 `~/.csswitch` 目录路径。
-fn config_dir() -> PathBuf {
+/// Helper 操作日志。
+use super::logger;
+
+/// 获取 `~/.csswitch` 目录路径（供 proc_manager 等外部模块使用，故 pub）。
+pub fn config_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".csswitch")
@@ -29,7 +32,7 @@ fn config_path() -> PathBuf {
 }
 
 /// 获取 `~/.csswitch/logs/` 目录路径。
-fn logs_dir() -> PathBuf {
+pub fn logs_dir() -> PathBuf {
     config_dir().join("logs")
 }
 
@@ -288,10 +291,10 @@ pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
     {
         Ok(child) => {
             let pid = child.id();
-            // 将 secret 持久化，供后续 `proxy status` 读取进行准确的健康检查。
-            // 审核 P0-1 修复：不再硬编码弱 secret。
+            // 将 secret 持久化，并记录 PID 到文件供后续查找。
             let _ = save_proxy_secret(secret);
-            // 子进程继续独立运行。
+            super::proc_manager::record_proxy_start(pid, port, secret);
+            super::logger::info(&format!("proxy started pid={pid} port={port}"));
             CliEnvelope::ok(json!({
                 "port": port,
                 "pid": pid,
@@ -367,6 +370,10 @@ pub fn cmd_proxy_stop() -> CliEnvelope {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     let stopped = !is_port_open(port);
+    if stopped {
+        super::proc_manager::record_proxy_stop();
+        super::logger::info(&format!("proxy stopped on port {port}"));
+    }
     CliEnvelope::ok(json!({
         "message": if stopped { format!("端口 {port} 上的代理已停止") } else { format!("端口 {port} 可能未被完全停止，请手动检查") },
         "port": port,

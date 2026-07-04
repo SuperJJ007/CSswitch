@@ -16,6 +16,8 @@
 mod cli;
 
 fn main() {
+    // 初始化操作日志（Plan V2 §3.7）。
+    let _ = cli::logger::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // --json 标志：控制输出格式（JSON 信封 vs 人类可读文本）
