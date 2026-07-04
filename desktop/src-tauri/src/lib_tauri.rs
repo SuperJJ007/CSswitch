@@ -806,8 +806,10 @@ fn sandbox_running_ours(port: u16) -> bool {
         {
             Ok(out) => {
                 let s = String::from_utf8_lossy(&out.stdout);
-                // 形如 {"running":true,...}：只认我们这个 data-dir 的 daemon 在跑。
-                let running = s.contains("\"running\":true") || s.contains("\"running\": true");
+                // 审核 P2-8 修复：用 serde_json 解析而非 contains 字符串匹配（避免嵌套误判）。
+                let running = serde_json::from_str::<serde_json::Value>(&s)
+                    .map(|v| v.get("running").and_then(|r| r.as_bool()).unwrap_or(false))
+                    .unwrap_or(false);
                 return running && proc::http_health(port, None, 400);
             }
             // 二进制在但调用失败 → 保守退化到端口探活，别因探测本身出错就误判没起。

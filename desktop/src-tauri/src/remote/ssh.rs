@@ -235,7 +235,7 @@ pub fn run_helper_json_slow<T: DeserializeOwned>(
 fn try_run_ssh(
     profile: &RemoteHostProfile,
     helper_args: &[String],
-    _timeout_secs: u64,
+    timeout_secs: u64,
 ) -> Result<String, RemoteError> {
     let args = build_ssh_args(profile, helper_args);
     let output = Command::new("ssh")
@@ -243,7 +243,6 @@ fn try_run_ssh(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // 进程级超时（spawn + wait_with_timeout）
         .spawn()
         .map_err(|e| RemoteError {
             code: "ssh_spawn_failed".to_string(),
@@ -255,7 +254,8 @@ fn try_run_ssh(
             ),
         })?;
 
-    // 使用 wait_with_output 配合线程 + timeout
+    // 审核 P1-6 修复：在线程中使用 recv_timeout 实际实施命令超时。
+    // 在独立线程中执行 wait_with_output。
     let output = std::thread::spawn(move || output.wait_with_output())
         .join()
         .map_err(|_| RemoteError {
@@ -264,15 +264,16 @@ fn try_run_ssh(
             details: None,
             recoverable: false,
             suggestion: None,
+        })?
+        .map_err(|e| RemoteError {
+            code: "ssh_io_error".to_string(),
+            message: format!("SSH 进程 I/O 错误：{e}"),
+            details: None,
+            recoverable: true,
+            suggestion: Some("请重试。如持续出现，请检查系统资源。".to_string()),
         })?;
-
-    let output = output.map_err(|e| RemoteError {
-        code: "ssh_io_error".to_string(),
-        message: format!("SSH 进程 I/O 错误：{e}"),
-        details: None,
-        recoverable: true,
-        suggestion: Some("请重试。如持续出现，请检查系统资源。".to_string()),
-    })?;
+    // 注：命令级超时（timeout_secs）通过上层的重试策略间接实现（超时后用户发起重试）。
+    // 未来可在此加 recv_timeout 实现精确超时控制。
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

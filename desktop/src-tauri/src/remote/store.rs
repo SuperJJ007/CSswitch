@@ -40,21 +40,31 @@ pub fn load_profiles() -> Result<Vec<RemoteHostProfile>, String> {
     Ok(profiles)
 }
 
-/// 将 Profile 列表写入 `remote-hosts.json`（原子写入：先写临时文件，再 rename）。
+/// 将 Profile 列表写入 `remote-hosts.json`（安全写入：symlink 防护 + 原子 rename）。
 /// 父目录不存在时自动创建。
+/// 审核 P1-5 修复：增加 symlink 防护，对齐 `config.rs` 的安全标准。
 pub fn save_profiles(profiles: &[RemoteHostProfile]) -> Result<(), String> {
     for profile in profiles {
         validate_profile(profile)?;
     }
     let path = profiles_path();
+    // 拒绝符号链接目标（防止写入重定向到非预期文件）。
+    crate::config::assert_not_symlink(&path)
+        .map_err(|e| format!("远程配置路径安全拒绝：{e}"))?;
     if let Some(parent) = path.parent() {
+        crate::config::assert_not_symlink(parent)
+            .map_err(|e| format!("远程配置父目录安全拒绝：{e}"))?;
         fs::create_dir_all(parent)
             .map_err(|e| format!("无法创建远程配置目录 {}：{e}", parent.display()))?;
     }
     let json = serde_json::to_vec_pretty(profiles)
         .map_err(|e| format!("序列化远程配置失败：{e}"))?;
-    // 原子写入：临时文件 + rename。
-    let tmp = path.with_extension(".json.tmp");
+    // 原子写入：pid+thread 随机化临时文件名（避免并发冲突）
+    let tmp = path.with_file_name(format!(
+        ".remote-hosts.json.tmp.{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     fs::write(&tmp, &json)
         .map_err(|e| format!("写入远程配置临时文件失败：{e}"))?;
     fs::rename(&tmp, &path)

@@ -103,7 +103,8 @@ fn proxy_health(port: u16, secret: &str) -> bool {
         return false;
     };
     let head = String::from_utf8_lossy(&buf[..n]);
-    head.lines().next().map_or(false, |line| line.contains("200"))
+    // 严格解析 HTTP 状态码（审核 P2-7）：精确匹配第二段 "200"，避免 reason phrase 中的误判。
+    head.lines().next().map_or(false, |line| line.split_whitespace().nth(1) == Some("200"))
 }
 
 // ============================================================================
@@ -287,8 +288,10 @@ pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
     {
         Ok(child) => {
             let pid = child.id();
-            // 代理进程以 spawn + forget 方式启动（无状态 CLI，下次调用时通过端口探活检测）。
-            // 进程句柄在此释放，但子进程继续独立运行。
+            // 将 secret 持久化，供后续 `proxy status` 读取进行准确的健康检查。
+            // 审核 P0-1 修复：不再硬编码弱 secret。
+            let _ = save_proxy_secret(secret);
+            // 子进程继续独立运行。
             CliEnvelope::ok(json!({
                 "port": port,
                 "pid": pid,
@@ -314,8 +317,10 @@ pub fn cmd_proxy_status() -> CliEnvelope {
     let running = is_port_open(port);
 
     if running {
-        // 通过 /health 端点进一步确认是代理服务
-        let healthy = proxy_health(port, "csswitch");
+        // 通过 /health 端点进一步确认是代理服务（使用持久化的随机 secret）
+        let healthy = load_proxy_secret()
+            .map(|s| proxy_health(port, &s))
+            .unwrap_or(false);
         CliEnvelope::ok(json!({
             "running": true,
             "port": port,
@@ -342,41 +347,59 @@ pub fn cmd_proxy_stop() -> CliEnvelope {
         return CliEnvelope::ok(json!({ "message": "端口上没有运行中的代理。", "port": port }));
     }
 
-    // 尝试 fuser -k（Linux），失败则尝试 lsof（macOS）
-    let fuser_result = Command::new("fuser")
+    // 审核 P3 修复：先 SIGTERM 优雅退出（给 Python 清理的机会），1s 后 SIGKILL 强杀。
+    let _term = Command::new("fuser")
+        .args(["-TERM", &format!("{port}/tcp")])
+        .output();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let _kill = Command::new("fuser")
         .args(["-k", &format!("{port}/tcp")])
         .output();
 
-    match fuser_result {
-        Ok(_) => {
-            // 等待端口释放
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if is_port_open(port) {
-                // fuser 失败，尝试 lsof + kill
-                let lsof = Command::new("sh")
-                    .arg("-c")
-                    .arg(format!(
-                        "lsof -ti:{port} | xargs -r kill 2>/dev/null; true"
-                    ))
-                    .output();
-                let _ = lsof;
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            CliEnvelope::ok(json!({
-                "message": format!("端口 {port} 上的代理已停止"),
-                "port": port,
-            }))
-        }
-        Err(_) => CliEnvelope::ok(json!({
-            "message": format!("端口 {port} 上无代理进程。"),
-            "port": port,
-        })),
+    // 等待端口释放
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    if is_port_open(port) {
+        // fuser 也失败了，尝试 lsof + kill
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("lsof -ti:{port} | xargs -r kill 2>/dev/null; true"))
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    let stopped = !is_port_open(port);
+    CliEnvelope::ok(json!({
+        "message": if stopped { format!("端口 {port} 上的代理已停止") } else { format!("端口 {port} 可能未被完全停止，请手动检查") },
+        "port": port,
+        "stopped": stopped,
+    }))
 }
 
 // ============================================================================
 // 内部工具函数
 // ============================================================================
+
+/// 获取持久化 proxy secret 的文件路径。
+fn secret_file() -> PathBuf { config_dir().join("proxy.secret") }
+
+/// 从 `~/.csswitch/proxy.secret` 加载上次代理启动时保存的 secret。
+fn load_proxy_secret() -> Result<String, String> {
+    let p = secret_file();
+    if p.exists() {
+        std::fs::read_to_string(&p)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| format!("读 secret 文件失败：{e}"))
+    } else {
+        Err("secret 文件不存在".to_string())
+    }
+}
+
+/// 将代理 secret 持久化到文件以便后续 `proxy status` 检测健康状态。
+/// 审核 P0-1 修复：不再硬编码弱 secret，每次启动由调用方传入随机生成的 secret。
+fn save_proxy_secret(secret: &str) -> Result<(), String> {
+    let _ = std::fs::create_dir_all(&config_dir());
+    std::fs::write(secret_file(), secret)
+        .map_err(|e| format!("写 secret 文件失败：{e}"))
+}
 
 /// 从配置文件读取代理端口，无配置时返回默认值 18991。
 fn get_configured_port() -> u16 {

@@ -340,7 +340,13 @@ pub fn remote_one_click(
             "start".to_string(),
             provider,
             proxy_port.to_string(),
-            "csswitch".to_string(), // 简化 secret
+            // 审核 P0-1 修复：使用加密随机 32 字符 hex secret 替代硬编码弱 secret。
+            {
+                use rand::RngCore;
+                let mut b = [0u8; 16];
+                rand::rngs::OsRng.fill_bytes(&mut b);
+                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+            },
         ],
     )
     .map_err(|e| remote::types::RemoteError {
