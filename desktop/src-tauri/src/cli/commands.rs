@@ -6,28 +6,11 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
 use super::types::CliEnvelope;
-
-// ============================================================================
-// 全局状态（进程句柄，仅在 serve 模式下跨请求复用）
-// ============================================================================
-
-/// 代理子进程句柄（用于 serve 模式跨请求管理代理生命周期）。
-static PROXY_CHILD: Mutex<Option<Child>> = Mutex::new(None);
-
-/// 代理运行时信息（PID、端口）。
-static PROXY_INFO: Mutex<Option<ProxyInfo>> = Mutex::new(None);
-
-struct ProxyInfo {
-    pid: u32,
-    port: u16,
-    secret: String,
-}
 
 // ============================================================================
 // 路径工具
@@ -128,9 +111,12 @@ fn proxy_health(port: u16, secret: &str) -> bool {
 // ============================================================================
 
 /// `status` — 返回 Helper 版本、能力列表、代理/沙箱运行状态。
+/// 无状态实现：通过 TCP 端口探活检测实际运行状态。
 pub fn cmd_status() -> CliEnvelope {
     let capabilities: Vec<&str> = vec!["proxy", "sandbox", "config", "logs", "doctor", "verify"];
-    let proxy_running = PROXY_INFO.lock().unwrap().is_some();
+    // 从配置读端口然后 TCP 探活，不依赖内存中的 PID
+    let port = get_configured_port();
+    let proxy_running = is_port_open(port);
     CliEnvelope::ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
@@ -243,14 +229,9 @@ pub fn cmd_config_save_key(provider: &str, key: &str) -> CliEnvelope {
 
 /// `proxy start <provider> <port> <secret>` — 启动代理进程。
 pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
-    // 检查是否已在运行
-    {
-        let info = PROXY_INFO.lock().unwrap();
-        if let Some(ref pi) = *info {
-            if proxy_health(pi.port, &pi.secret) {
-                return CliEnvelope::err("proxy_already_running", &format!("代理已在端口 {} 上运行", pi.port));
-            }
-        }
+    // 检查是否已在运行（通过 TCP 端口探活）
+    if is_port_open(port) && proxy_health(port, secret) {
+        return CliEnvelope::err("proxy_already_running", &format!("代理已在端口 {} 上运行", port));
     }
 
     // 获取需要注入的 key
@@ -306,14 +287,8 @@ pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
     {
         Ok(child) => {
             let pid = child.id();
-            let mut pi = PROXY_CHILD.lock().unwrap();
-            *pi = Some(child);
-            let mut info = PROXY_INFO.lock().unwrap();
-            *info = Some(ProxyInfo {
-                pid,
-                port,
-                secret: secret.to_string(),
-            });
+            // 代理进程以 spawn + forget 方式启动（无状态 CLI，下次调用时通过端口探活检测）。
+            // 进程句柄在此释放，但子进程继续独立运行。
             CliEnvelope::ok(json!({
                 "port": port,
                 "pid": pid,
@@ -331,39 +306,101 @@ pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
     }
 }
 
-/// `proxy stop` — 停止代理进程。
-pub fn cmd_proxy_stop() -> CliEnvelope {
-    let mut child = PROXY_CHILD.lock().unwrap();
-    if let Some(mut c) = child.take() {
-        // SIGTERM → 等待 3s → SIGKILL
-        let _ = c.kill();
-        let _ = c.wait();
+/// `proxy status` — 返回代理运行状态。
+/// 无状态实现：通过 TCP 端口探活检测代理是否在运行（不依赖内存中的 PID）。
+pub fn cmd_proxy_status() -> CliEnvelope {
+    // 从配置读取端口（默认 18991），然后 TCP 探活。
+    let port = get_configured_port();
+    let running = is_port_open(port);
+
+    if running {
+        // 通过 /health 端点进一步确认是代理服务
+        let healthy = proxy_health(port, "csswitch");
+        CliEnvelope::ok(json!({
+            "running": true,
+            "port": port,
+            "healthy": healthy,
+        }))
+    } else {
+        CliEnvelope::ok(json!({
+            "running": false,
+            "healthy": false,
+            "message": "代理未在运行。请使用 `proxy start` 启动。",
+        }))
     }
-    let mut info = PROXY_INFO.lock().unwrap();
-    *info = None;
-    CliEnvelope::ok_empty()
 }
 
-/// `proxy status` — 返回代理运行状态。
-pub fn cmd_proxy_status() -> CliEnvelope {
-    let info = PROXY_INFO.lock().unwrap();
-    match info.as_ref() {
-        Some(pi) => {
-            let healthy = proxy_health(pi.port, &pi.secret);
+/// `proxy stop` — 停止代理进程。
+/// 无状态实现：通过 `fuser` / `lsof` 找到占用端口的进程并 kill。
+pub fn cmd_proxy_stop() -> CliEnvelope {
+    use std::process::Command;
+
+    let port = get_configured_port();
+
+    // 先检查端口是否有进程
+    if !is_port_open(port) {
+        return CliEnvelope::ok(json!({ "message": "端口上没有运行中的代理。", "port": port }));
+    }
+
+    // 尝试 fuser -k（Linux），失败则尝试 lsof（macOS）
+    let fuser_result = Command::new("fuser")
+        .args(["-k", &format!("{port}/tcp")])
+        .output();
+
+    match fuser_result {
+        Ok(_) => {
+            // 等待端口释放
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if is_port_open(port) {
+                // fuser 失败，尝试 lsof + kill
+                let lsof = Command::new("sh")
+                    .arg("-c")
+                    .arg(format!(
+                        "lsof -ti:{port} | xargs -r kill 2>/dev/null; true"
+                    ))
+                    .output();
+                let _ = lsof;
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
             CliEnvelope::ok(json!({
-                "running": true,
-                "pid": pi.pid,
-                "port": pi.port,
-                "healthy": healthy,
+                "message": format!("端口 {port} 上的代理已停止"),
+                "port": port,
             }))
         }
-        None => {
-            CliEnvelope::ok(json!({
-                "running": false,
-                "healthy": false,
-            }))
+        Err(_) => CliEnvelope::ok(json!({
+            "message": format!("端口 {port} 上无代理进程。"),
+            "port": port,
+        })),
+    }
+}
+
+// ============================================================================
+// 内部工具函数
+// ============================================================================
+
+/// 从配置文件读取代理端口，无配置时返回默认值 18991。
+fn get_configured_port() -> u16 {
+    let cfg = config_path();
+    if cfg.exists() {
+        if let Ok(raw) = std::fs::read_to_string(&cfg) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(port) = v["proxy_port"].as_u64() {
+                    return port as u16;
+                }
+            }
         }
     }
+    18991
+}
+
+/// 检查 TCP 端口是否有进程在监听。
+fn is_port_open(port: u16) -> bool {
+    use std::net::TcpStream;
+    TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok()
 }
 
 /// `sandbox status` — 检查 Claude Science 沙箱是否在运行。
@@ -551,13 +588,13 @@ pub fn cmd_doctor() -> CliEnvelope {
         "detail": cfg.display().to_string(),
     }));
 
-    // 检查代理运行状态
-    let info = PROXY_INFO.lock().unwrap();
-    let proxy_running = info.is_some();
+    // 检查代理运行状态（通过端口探活）
+    let port = get_configured_port();
+    let proxy_running = is_port_open(port);
     checks.push(json!({
         "name": "代理运行状态",
         "ok": proxy_running,
-        "detail": if proxy_running { format!("端口 {}", info.as_ref().unwrap().port) } else { "未运行".to_string() },
+        "detail": if proxy_running { format!("端口 {}", port) } else { "未运行".to_string() },
     }));
 
     CliEnvelope::ok(json!({"checks": checks}))
