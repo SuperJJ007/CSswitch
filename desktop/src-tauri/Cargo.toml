@@ -4,7 +4,7 @@ version = "0.2.1"
 description = "CSSwitch 桌面 app（进程管家 + 配置面板 + 远程服务器管理）"
 authors = ["CSSwitch"]
 edition = "2021"
-autobins = false
+default-run = "csswitch"
 
 [lib]
 name = "desktop_lib"

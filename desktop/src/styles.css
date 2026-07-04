@@ -81,9 +81,13 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
 .adv .ports{margin-top:9px}
 
 /* ---- 远程服务器管理 ---- */
-.remote-only{display:none}
-.panel.target-remote .remote-only{display:block}
-.panel.target-remote .local-only{display:none}
+.remote-only{display:none !important}
+.panel.target-remote .remote-only{
+  display:block !important;
+  width:100%;
+  box-sizing:border-box;
+}
+.panel.target-remote .local-only{display:none !important}
 
 /* Profile 列表项 */
 .profile-item{display:flex;align-items:center;justify-content:space-between;

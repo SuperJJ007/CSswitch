@@ -530,8 +530,11 @@ async function installRemoteHelper() {
 
 /// 打开 Profile 管理弹窗。
 async function openProfileModal() {
+  // 确保 profiles 已加载
+  try { await loadRemoteProfiles(); } catch(e) { /* 忽略加载错误 */ }
   const modal = $('#profileModal');
   const list = $('#profileList');
+  if (!modal || !list) { console.error('profileModal/profileList not found'); return; }
   // 渲染列表
   list.innerHTML = remoteProfiles.length === 0
     ? '<div class="hint">暂无服务器。点击「+ 添加」。</div>'
