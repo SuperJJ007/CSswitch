@@ -49,6 +49,29 @@ const DEFAULT_RETRIES: u32 = 3;
 const HELPER_RELEASE_REPO: &str = "SuperJJ007/CSswitch";
 const HELPER_RELEASE_REPO_ENV: &str = "CSSWITCH_HELPER_RELEASE_REPO";
 
+/// 校验 GitHub owner/repo 格式，防止命令注入。
+/// 只允许字母、数字、连字符、下划线、点。
+fn validate_repo_format(repo: &str) -> Option<&str> {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return None;
+    }
+    // 格式: owner/name，两部分都是 [a-zA-Z0-9._-]+
+    let (owner, name) = repo.split_once('/')?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    let valid = |s: &str| -> bool {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    };
+    if valid(owner) && valid(name) {
+        Some(repo)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SshCommandSpec {
     pub args: Vec<String>,
@@ -139,8 +162,10 @@ pub fn build_helper_install_command_spec(
     let auth_plan = SshAuthPlan::from_profile(profile, runtime);
     let mut args = build_ssh_base_args_with_plan(profile, &auth_plan);
     let helper_path = shell_quote(&profile.helper_path);
-    let repo =
-        std::env::var(HELPER_RELEASE_REPO_ENV).unwrap_or_else(|_| HELPER_RELEASE_REPO.to_string());
+    let repo = std::env::var(HELPER_RELEASE_REPO_ENV)
+        .ok()
+        .and_then(|v| validate_repo_format(&v).map(String::from))
+        .unwrap_or_else(|| HELPER_RELEASE_REPO.to_string());
 
     // P0-2: 安装脚本中加入架构白名单校验，防止注入
     // 即使攻击者控制了 uname 输出，也只能匹配预定义的安全值
@@ -872,8 +897,9 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
     let stderr_lower = stderr.to_lowercase();
 
     // 认证失败（不可重试）
-    if stderr_lower.contains("permission denied")
-        || stderr_lower.contains("publickey")
+    // 注意：只包含 "permission denied" 但没有 "publickey"/"authentication failed"
+    // 的是文件权限错误，由后面 permission_denied 分支处理。
+    if stderr_lower.contains("publickey")
         || stderr_lower.contains("authentication failed")
     {
         return RemoteError {
@@ -957,8 +983,8 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
         };
     }
 
-    // 权限不足（写入/执行权限）
-    if stderr_lower.contains("permission denied") && !stderr_lower.contains("publickey") {
+    // 权限不足（写入/执行权限）—— 非认证类的 permission denied
+    if stderr_lower.contains("permission denied") {
         return RemoteError {
             code: "permission_denied".to_string(),
             message: "远程服务器权限不足".to_string(),

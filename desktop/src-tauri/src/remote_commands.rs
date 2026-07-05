@@ -405,6 +405,13 @@ pub fn remote_start_proxy(
     port: u16,
     secret: String,
 ) -> Result<Value, String> {
+    if port == 8765 {
+        return Err("端口 8765 是真实 Science 实例保留端口，不能用。".into());
+    }
+    if port == 0 {
+        return Err("端口不能为 0。".into());
+    }
+
     let (remote_cfg, adapter) = remote_active_config_for_start(&provider, port, None, &secret)?;
     let config_json = serde_json::to_string(&remote_cfg).map_err(|e| e.to_string())?;
 
@@ -535,6 +542,17 @@ pub fn remote_one_click(
     proxy_port: u16,
     sandbox_port: u16,
 ) -> Result<Value, String> {
+    // 端口校验（与本地的 set_config 保持一致）
+    if proxy_port == 8765 || sandbox_port == 8765 {
+        return Err("端口 8765 是真实 Science 实例保留端口，不能用。".into());
+    }
+    if proxy_port == 0 || sandbox_port == 0 {
+        return Err("端口不能为 0。".into());
+    }
+    if proxy_port == sandbox_port {
+        return Err("代理端口与沙箱端口不能相同。".into());
+    }
+
     let secret = config::new_id();
     let (remote_cfg, adapter) =
         remote_active_config_for_start(&provider, proxy_port, Some(sandbox_port), &secret)?;

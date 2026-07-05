@@ -12,45 +12,14 @@ jobs:
   build-windows:
     needs: build-helper
     runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download Linux Helper Assets
-        uses: actions/download-artifact@v4
-        with:
-          pattern: csswitch-helper-linux-*
-          path: desktop/src-tauri/helper-assets
-          merge-multiple: true
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: Build Desktop App
-        run: |
-          cd desktop
-          npm install
-          npx tauri build --bundles nsis
-      - name: Upload NSIS Installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: CSSwitch-Windows-x64
-          path: desktop/src-tauri/target/release/bundle/nsis/*.exe
-
-  # ---- macOS 桌面 app ----
-  build-macos:
-    needs: build-helper
-    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact: CSSwitch-macOS-x64
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            artifact: CSSwitch-macOS-arm64
+          - target: x86_64-pc-windows-msvc
+            artifact: CSSwitch-Windows-x64
+          - target: aarch64-pc-windows-msvc
+            artifact: CSSwitch-Windows-arm64
     steps:
       - uses: actions/checkout@v4
       - name: Download Linux Helper Assets
@@ -69,12 +38,41 @@ jobs:
         run: |
           cd desktop
           npm install
-          npx tauri build --target ${{ matrix.target }} --bundles dmg
-      - name: Upload DMG Installer
+          npx tauri build --target ${{ matrix.target }} --bundles nsis
+      - name: Upload NSIS Installer
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          path: desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+
+  # ---- macOS 桌面 app ----
+  build-macos:
+    needs: build-helper
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Linux Helper Assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: csswitch-helper-linux-*
+          path: desktop/src-tauri/helper-assets
+          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build Desktop App
+        run: |
+          cd desktop
+          npm install
+          npx tauri build --target aarch64-apple-darwin --bundles dmg
+      - name: Upload DMG Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: CSSwitch-macOS-arm64
+          path: desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
 
   # ---- Linux Helper ----
   build-helper:
@@ -146,8 +144,8 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            CSSwitch-Windows-x64/*.exe
-            CSSwitch-macOS-*/*.dmg
+            CSSwitch-Windows-*/*.exe
+            CSSwitch-macOS-arm64/*.dmg
             csswitch-helper-*/*
           draft: false
           generate_release_notes: true

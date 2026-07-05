@@ -7,6 +7,7 @@ const main = readFileSync(new URL("../desktop/src/main.js", import.meta.url), "u
 const remoteCommands = readFileSync(new URL("../desktop/src-tauri/src/remote_commands.rs", import.meta.url), "utf8");
 const remoteSsh = readFileSync(new URL("../desktop/src-tauri/src/remote/ssh.rs", import.meta.url), "utf8");
 const helperCommands = readFileSync(new URL("../desktop/src-tauri/src/cli/commands.rs", import.meta.url), "utf8");
+const libTauri = readFileSync(new URL("../desktop/src-tauri/src/lib_tauri.rs", import.meta.url), "utf8");
 const tauriConf = readFileSync(new URL("../desktop/src-tauri/tauri.conf.json", import.meta.url), "utf8");
 const buildWorkflow = readFileSync(new URL("../.github/workflows/build.yml", import.meta.url), "utf8");
 const tauriBuildRs = readFileSync(new URL("../desktop/src-tauri/build.rs", import.meta.url), "utf8");
@@ -140,8 +141,38 @@ test("desktop bundle and release workflow provide linux helper assets for upload
 
 test("desktop release workflow uses the Tauri v2 bundles argument", () => {
   assert.doesNotMatch(buildWorkflow, /--bundler\b/);
-  assert.match(buildWorkflow, /npx tauri build --bundles nsis/);
-  assert.match(buildWorkflow, /npx tauri build --target \$\{\{ matrix\.target \}\} --bundles dmg/);
+  assert.match(buildWorkflow, /npx tauri build --target \$\{\{ matrix\.target \}\} --bundles nsis/);
+  assert.match(buildWorkflow, /npx tauri build --target aarch64-apple-darwin --bundles dmg/);
+});
+
+test("desktop workflow publishes Windows installers for x64 and arm64", () => {
+  const body = workflowJob("build-windows");
+  assert.match(body, /fail-fast: false/);
+  assert.match(body, /target: x86_64-pc-windows-msvc[\s\S]*artifact: CSSwitch-Windows-x64/);
+  assert.match(body, /target: aarch64-pc-windows-msvc[\s\S]*artifact: CSSwitch-Windows-arm64/);
+  assert.match(body, /targets: \$\{\{ matrix\.target \}\}/);
+  assert.match(body, /npx tauri build --target \$\{\{ matrix\.target \}\} --bundles nsis/);
+  assert.match(body, /name: \$\{\{ matrix\.artifact \}\}/);
+  assert.match(body, /target\/\$\{\{ matrix\.target \}\}\/release\/bundle\/nsis\/\*\.exe/);
+});
+
+test("desktop workflow keeps macOS packaging aligned with upstream arm64 DMG releases", () => {
+  const body = workflowJob("build-macos");
+  assert.match(body, /runs-on: macos-15/);
+  assert.match(body, /targets: aarch64-apple-darwin/);
+  assert.match(body, /npx tauri build --target aarch64-apple-darwin --bundles dmg/);
+  assert.match(body, /name: CSSwitch-macOS-arm64/);
+  assert.match(body, /target\/aarch64-apple-darwin\/release\/bundle\/dmg\/\*\.dmg/);
+  assert.doesNotMatch(body, /macos-15-intel/);
+  assert.doesNotMatch(body, /x86_64-apple-darwin/);
+  assert.doesNotMatch(body, /universal-apple-darwin/);
+});
+
+test("release job uploads all public release assets", () => {
+  const body = workflowJob("release");
+  assert.match(body, /CSSwitch-Windows-\*\/\*\.exe/);
+  assert.match(body, /CSSwitch-macOS-arm64\/\*\.dmg/);
+  assert.match(body, /csswitch-helper-\*\/\*/);
 });
 
 test("linux helper release workflow uses cross for musl target builds", () => {
@@ -198,8 +229,21 @@ test("macOS desktop builds bundle the linux helper assets too", () => {
   assert.match(body, /Download Linux Helper Assets/);
   assert.match(body, /pattern: csswitch-helper-linux-\*/);
   assert.match(body, /path: desktop\/src-tauri\/helper-assets/);
-  assert.match(body, /npx tauri build --target \$\{\{ matrix\.target \}\} --bundles dmg/);
-  assert.match(buildWorkflow, /CSSwitch-macOS-\*/);
+  assert.match(body, /npx tauri build --target aarch64-apple-darwin --bundles dmg/);
+  assert.match(buildWorkflow, /CSSwitch-macOS-arm64/);
+});
+
+test("macOS one-click command keeps app and state names available under cfg", () => {
+  const m = libTauri.match(/fn one_click_login\([\s\S]*?\n}\n\n\/\/\/ 从/);
+  assert.ok(m, "one_click_login body should be discoverable");
+  const body = m[0];
+  assert.match(body, /app: tauri::AppHandle/);
+  assert.match(body, /state: State<'_, Mutex<AppState>>/);
+  assert.doesNotMatch(body, /_app: tauri::AppHandle/);
+  assert.doesNotMatch(body, /_state: State<'_, Mutex<AppState>>/);
+  assert.match(body, /ensure_proxy\(&app, &state\)/);
+  assert.match(body, /stop_sandbox_inner\(&app, &mut st\)/);
+  assert.match(body, /asset_root\(&app\)/);
 });
 
 test("remote one-click backend starts proxy and sandbox and returns access info", () => {
@@ -257,6 +301,24 @@ test("remote helper sandbox start returns a fresh claude-science url", () => {
   assert.match(body, /sandbox_fresh_url/);
   assert.match(body, /\.args\(\["url", "--data-dir"\]\)/);
   assert.match(body, /"url": url/);
+});
+
+test("remote helper waits for the Science daemon before fetching a sandbox url", () => {
+  const m = helperCommands.match(/pub fn cmd_sandbox_start[\s\S]*?\n}\n\n\/\/\/ `sandbox stop/);
+  assert.ok(m, "cmd_sandbox_start body should be discoverable");
+  const body = m[0];
+  assert.match(helperCommands, /fn wait_for_sandbox_ready/);
+  assert.match(helperCommands, /fn sandbox_daemon_running/);
+  assert.ok(
+    body.indexOf("wait_for_sandbox_ready") < body.indexOf("sandbox_fresh_url"),
+    "sandbox start must wait for daemon readiness before running claude-science url",
+  );
+  assert.match(body, /sandbox\.log/);
+  assert.doesNotMatch(
+    body,
+    /stdout\(std::process::Stdio::null\(\)\)[\s\S]*stderr\(std::process::Stdio::null\(\)\)[\s\S]*\.spawn\(\)/,
+    "serve startup output should not be discarded while diagnosing daemon startup failures",
+  );
 });
 
 test("remote helper sandbox start binds Science to loopback for SSH tunnel access", () => {

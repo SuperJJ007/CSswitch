@@ -5,6 +5,7 @@
 //! Claude Science 沙箱和日志文件。
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -560,10 +561,7 @@ fn is_port_open(port: u16) -> bool {
 }
 
 fn sandbox_process_found() -> bool {
-    let data_dir = config_dir()
-        .join("sandbox")
-        .join("home")
-        .join(".claude-science");
+    let (_, data_dir) = sandbox_paths();
     let pattern = data_dir.to_string_lossy().to_string();
     Command::new("pgrep")
         .args(["-f", &pattern])
@@ -572,29 +570,135 @@ fn sandbox_process_found() -> bool {
         .unwrap_or(false)
 }
 
+fn sandbox_paths() -> (PathBuf, PathBuf) {
+    let sandbox_home = config_dir().join("sandbox").join("home");
+    let data_dir = sandbox_home.join(".claude-science");
+    (sandbox_home, data_dir)
+}
+
+fn command_output_error(command: &str, out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("{command} 退出码 {:?}", out.status.code())
+}
+
+fn tail_file(path: &Path, max_chars: usize) -> String {
+    let mut content = String::new();
+    if let Ok(mut file) = fs::File::open(path) {
+        let _ = file.read_to_string(&mut content);
+    }
+    if content.chars().count() <= max_chars {
+        return content.trim().to_string();
+    }
+    let mut tail = content.chars().rev().take(max_chars).collect::<Vec<_>>();
+    tail.reverse();
+    tail.into_iter().collect::<String>().trim().to_string()
+}
+
+fn sandbox_daemon_running(bin: &str, sandbox_home: &Path, data_dir: &Path) -> Result<bool, String> {
+    match Command::new(bin)
+        .args(["status", "--data-dir"])
+        .arg(data_dir)
+        .env("HOME", sandbox_home)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            serde_json::from_str::<Value>(&stdout)
+                .map(|v| v.get("running").and_then(|r| r.as_bool()).unwrap_or(false))
+                .map_err(|e| {
+                    let trimmed = stdout.trim();
+                    if trimmed.is_empty() {
+                        format!("claude-science status 返回空输出：{e}")
+                    } else {
+                        format!("claude-science status 返回无法解析的输出：{trimmed}")
+                    }
+                })
+        }
+        Ok(out) => Err(command_output_error("claude-science status", &out)),
+        Err(e) => Err(format!("无法执行 claude-science status：{e}")),
+    }
+}
+
+fn wait_for_sandbox_ready(
+    bin: &str,
+    sandbox_home: &Path,
+    data_dir: &Path,
+    port: u16,
+    log_path: &Path,
+) -> Result<(), String> {
+    let mut last_status = "尚未检查".to_string();
+    for _ in 0..40 {
+        match sandbox_daemon_running(bin, sandbox_home, data_dir) {
+            Ok(true) if crate::proc::http_health(port, None, 400) => return Ok(()),
+            Ok(true) => last_status = format!("daemon 已运行，但端口 {port} 还未健康"),
+            Ok(false) => last_status = "daemon 尚未运行".to_string(),
+            Err(e) => last_status = e,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    let tail = tail_file(log_path, 2000);
+    if tail.is_empty() {
+        Err(format!("等待 Science daemon 就绪超时：{last_status}"))
+    } else {
+        Err(format!(
+            "等待 Science daemon 就绪超时：{last_status}\n--- sandbox.log ---\n{tail}"
+        ))
+    }
+}
+
 fn sandbox_is_running() -> bool {
     let port = get_configured_sandbox_port();
-    is_port_open(port) || sandbox_process_found()
+    let (sandbox_home, data_dir) = sandbox_paths();
+    match find_cmd("claude-science")
+        .as_deref()
+        .map(|bin| sandbox_daemon_running(bin, &sandbox_home, &data_dir))
+    {
+        Some(Ok(true)) => crate::proc::http_health(port, None, 400),
+        _ => false,
+    }
 }
 
 /// `sandbox status` — 检查 Claude Science 沙箱是否在运行。
 /// 通过轮询 `claude-science status` 和端口探活双重确认。
 pub fn cmd_sandbox_status() -> CliEnvelope {
     let port = get_configured_sandbox_port();
-    let port_open = is_port_open(port);
+    let port_healthy = crate::proc::http_health(port, None, 400);
     let process_found = sandbox_process_found();
-    let running = port_open || process_found;
+    let (sandbox_home, data_dir) = sandbox_paths();
+    let (daemon_running, status_error) = match find_cmd("claude-science") {
+        Some(bin) => match sandbox_daemon_running(&bin, &sandbox_home, &data_dir) {
+            Ok(running) => (running, None),
+            Err(e) => (false, Some(e)),
+        },
+        None => (false, Some("未找到 claude-science 命令".to_string())),
+    };
+    let running = daemon_running && port_healthy;
 
     if running {
         CliEnvelope::ok(json!({
             "running": true,
             "port": port,
+            "daemon_running": daemon_running,
+            "port_healthy": port_healthy,
             "process_found": process_found,
             "message": format!("Science 沙箱正在端口 {} 上运行", port),
         }))
     } else {
         CliEnvelope::ok(json!({
             "running": false,
+            "port": port,
+            "daemon_running": daemon_running,
+            "port_healthy": port_healthy,
+            "process_found": process_found,
+            "status_error": status_error,
             "message": "沙箱未运行。请使用 `claude-science serve --port <port>` 或在客户端配置后通过一键开始启动。",
         }))
     }
@@ -616,8 +720,7 @@ pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
     };
 
     // 使用独立 data-dir 避免与已有实例冲突
-    let sandbox_home = config_dir().join("sandbox").join("home");
-    let data_dir = sandbox_home.join(".claude-science");
+    let (sandbox_home, data_dir) = sandbox_paths();
 
     // 确保运行时目录存在
     let _ = std::fs::create_dir_all(&data_dir);
@@ -645,6 +748,25 @@ pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
         None => proxy_url.to_string(),
     };
 
+    let sandbox_log = logs_dir().join("sandbox.log");
+    if let Some(parent) = sandbox_log.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return CliEnvelope::err("sandbox_log_error", &format!("创建沙箱日志目录失败：{e}"));
+        }
+    }
+    let log_file = match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&sandbox_log)
+    {
+        Ok(file) => file,
+        Err(e) => return CliEnvelope::err("sandbox_log_error", &format!("打开 sandbox.log 失败：{e}")),
+    };
+    let log_file_for_stderr = match log_file.try_clone() {
+        Ok(file) => file,
+        Err(e) => return CliEnvelope::err("sandbox_log_error", &format!("复制 sandbox.log 句柄失败：{e}")),
+    };
+
     match std::process::Command::new(&bin)
         .args(["serve", "--data-dir"])
         .arg(&data_dir)
@@ -661,11 +783,18 @@ pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
         .env("HTTPS_PROXY", &proxy_hostport)
         .env("no_proxy", "127.0.0.1,localhost,::1")
         .env("NO_PROXY", "127.0.0.1,localhost,::1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_for_stderr))
         .spawn()
     {
         Ok(_child) => {
+            if let Err(e) = wait_for_sandbox_ready(&bin, &sandbox_home, &data_dir, port, &sandbox_log) {
+                return CliEnvelope::err_with_hint(
+                    "sandbox_start_timeout",
+                    &format!("沙箱启动后未就绪：{e}"),
+                    "请查看 helper 的 sandbox.log，确认 claude-science 是否启动成功。",
+                );
+            }
             match sandbox_fresh_url(&bin, &sandbox_home, &data_dir) {
                 Ok(url) => CliEnvelope::ok(json!({
                     "message": format!("沙箱已启动，端口 {}", port),

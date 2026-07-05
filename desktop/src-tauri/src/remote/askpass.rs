@@ -394,7 +394,12 @@ fn cleanup_session_dir(session_dir: &Path) {
 
 fn write_json(path: PathBuf, value: &impl Serialize) -> Result<(), String> {
     let json = serde_json::to_vec(value).map_err(|e| format!("序列化登录验证数据失败：{e}"))?;
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    // 临时文件名包含 PID 和线程 ID，防止同进程多线程并发写入同一文件时冲突。
+    let tmp = path.with_extension(format!(
+        "json.tmp.{}.{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     fs::write(&tmp, json).map_err(|e| format!("写入登录验证数据失败：{e}"))?;
     fs::rename(&tmp, &path).map_err(|e| format!("保存登录验证数据失败：{e}"))
 }

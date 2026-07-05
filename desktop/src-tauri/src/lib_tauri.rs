@@ -27,12 +27,15 @@ struct AppState {
     sandbox_url: Option<String>,
 }
 
-/// key 的非加密指纹（SipHash），只用于判断「key 是否变了」。绝不打印、绝不落盘。
+/// key 的非加密指纹（FNV-1a 64-bit），只用于判断「key 是否变了」。绝不打印、绝不落盘。
+/// 使用 FNV-1a 而非 std DefaultHasher，确保跨 Rust 版本哈希值稳定，避免工具链升级后误判 key 变化。
 fn key_fingerprint(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 // ---------- profile / adapter 元信息 ----------
@@ -926,6 +929,8 @@ struct FetchModelsReq {
 fn fetch_models(req: FetchModelsReq) -> Result<serde_json::Value, String> {
     let tpl = templates::by_id(req.template_id.trim())
         .ok_or_else(|| format!("未知模板：{}", req.template_id))?;
+    // TODO: 未来实现根据 base_url/key/profile_id 向上游 API 实时拉取模型列表。
+    // 当前仅返回模板内置的模型名。
     let _ = (&req.base_url, &req.key, &req.profile_id);
     let models = tpl
         .builtin_models
@@ -988,11 +993,12 @@ fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<
 /// 仅 macOS 本地模式有效。Windows/其他平台应使用远程模式 (`remote_*` 命令)。
 #[tauri::command]
 fn one_click_login(
-    _app: tauri::AppHandle,
-    _state: State<'_, Mutex<AppState>>,
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = (&app, &state);
         return Err("本地模式「一键开始」仅支持 macOS。请切换到「远程服务器」模式管理 Linux 服务器上的 Science。".into());
     }
     #[cfg(target_os = "macos")]
@@ -1240,10 +1246,22 @@ fn sandbox_running_ours(port: u16) -> bool {
 
 #[tauri::command]
 fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
-    // 只在锁内取值，锁外做阻塞探活。
-    let (pport, secret, sport, adapter, base_url) = {
+    // 先在锁外加载配置（磁盘 I/O），避免阻塞其他需要锁的命令。
+    let cfg = match config::load_from(&config::default_dir()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("status: 读取配置失败，使用默认值: {e}");
+            config::Config::default()
+        }
+    };
+    let (adapter, base_url) = cfg
+        .active_profile()
+        .map(|p| (templates::adapter_for(&p.template_id).to_string(), p.base_url.clone()))
+        .unwrap_or_default();
+
+    // 只在锁内取 AppState 字段（无 I/O）。
+    let (pport, secret, sport) = {
         let st = lock(&state);
-        let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
         let pport = if st.proxy_port != 0 {
             st.proxy_port
         } else {
@@ -1254,11 +1272,7 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
         } else {
             cfg.sandbox_port
         };
-        let (adapter, base_url) = cfg
-            .active_profile()
-            .map(|p| (templates::adapter_for(&p.template_id).to_string(), p.base_url.clone()))
-            .unwrap_or_default();
-        (pport, st.secret.clone(), sport, adapter, base_url)
+        (pport, st.secret.clone(), sport)
     };
     let proxy = if !secret.is_empty() && proc::http_health(pport, Some(&secret), 300) {
         "green"
@@ -1272,7 +1286,10 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
     } else {
         "amber"
     };
-    let upstream = if proc::tcp_reachable(&upstream_host(&adapter, &base_url), 443, 500) {
+    // 无活跃 profile 时 adapter/base_url 为空，跳过上游探活避免空主机名连接。
+    let upstream = if adapter.is_empty() {
+        "amber"
+    } else if proc::tcp_reachable(&upstream_host(&adapter, &base_url), 443, 500) {
         "green"
     } else {
         "amber"
@@ -1545,4 +1562,3 @@ mod tests {
         );
     }
 }
-
