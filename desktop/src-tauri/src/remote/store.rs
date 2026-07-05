@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::types::{RemoteAuthMethod, RemoteHostProfile};
 
@@ -43,6 +44,8 @@ pub fn load_profiles() -> Result<Vec<RemoteHostProfile>, String> {
 /// 将 Profile 列表写入 `remote-hosts.json`（安全写入：symlink 防护 + 原子 rename）。
 /// 父目录不存在时自动创建。
 /// 审核 P1-5 修复：增加 symlink 防护，对齐 `config.rs` 的安全标准。
+/// P0-3 修复：保存后设置文件权限为 0600，防止其他用户读取 SSH 配置。
+/// P1-5 修复：使用文件锁防止并发写入时数据丢失。
 pub fn save_profiles(profiles: &[RemoteHostProfile]) -> Result<(), String> {
     for profile in profiles {
         validate_profile(profile)?;
@@ -57,24 +60,74 @@ pub fn save_profiles(profiles: &[RemoteHostProfile]) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("无法创建远程配置目录 {}：{e}", parent.display()))?;
     }
-    let json = serde_json::to_vec_pretty(profiles)
-        .map_err(|e| format!("序列化远程配置失败：{e}"))?;
-    // 原子写入：pid+thread 随机化临时文件名（避免并发冲突）
-    let tmp = path.with_file_name(format!(
-        ".remote-hosts.json.tmp.{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    fs::write(&tmp, &json)
-        .map_err(|e| format!("写入远程配置临时文件失败：{e}"))?;
-    // 设置 0600 权限，防止其他用户读取 SSH 配置
-    crate::fs_ext::set_file_permissions(&tmp, 0o600)
-        .map_err(|e| format!("设置权限失败：{e}"))?;
-    fs::rename(&tmp, &path)
-        .map_err(|e| format!("替换远程配置文件失败：{e}"))?;
-    crate::fs_ext::set_file_permissions(&path, 0o600)
-        .map_err(|e| format!("确认权限失败：{e}"))?;
-    Ok(())
+
+    // P1-5 修复：使用文件锁防止并发写入
+    // 锁文件放在与目标文件相同目录，使用 .lock 后缀
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("无法创建锁文件 {}：{e}", lock_path.display()))?;
+
+    // 尝试获取排他锁，超时 5 秒
+    let lock_acquired = {
+        use fs2::FileExt;
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+
+        loop {
+            match lock_file.try_lock_exclusive() {
+                Ok(_) => break true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() >= timeout {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(format!("文件锁操作失败：{e}"));
+                }
+            }
+        }
+    };
+
+    if !lock_acquired {
+        return Err("获取文件锁超时（5秒）。可能有其他操作正在保存配置，请稍后重试。".to_string());
+    }
+
+    // 在锁保护下执行写入操作
+    let result = (|| {
+        let json = serde_json::to_vec_pretty(profiles)
+            .map_err(|e| format!("序列化远程配置失败：{e}"))?;
+        // 原子写入：pid+thread 随机化临时文件名（避免并发冲突）
+        let tmp = path.with_file_name(format!(
+            ".remote-hosts.json.tmp.{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&tmp, &json)
+            .map_err(|e| format!("写入远程配置临时文件失败：{e}"))?;
+
+        // P0-3 修复：在 rename 前先设置临时文件权限为 0600
+        // 这样 rename 后目标文件继承正确的权限
+        crate::fs_ext::set_file_permissions(&tmp, 0o600)
+            .map_err(|e| format!("设置远程配置文件权限失败：{e}"))?;
+
+        fs::rename(&tmp, &path)
+            .map_err(|e| format!("替换远程配置文件失败：{e}"))?;
+
+        // 双重保险：rename 后再次确认权限（某些文件系统可能不保留权限）
+        crate::fs_ext::set_file_permissions(&path, 0o600)
+            .map_err(|e| format!("确认远程配置文件权限失败：{e}"))?;
+
+        Ok(())
+    })();
+
+    // 释放锁（文件关闭时自动释放，这里显式 unlock 以便错误处理）
+    drop(lock_file); // 显式关闭文件释放锁
+
+    result
 }
 
 /// 插入或更新一个 Profile（按 `id` 匹配）。

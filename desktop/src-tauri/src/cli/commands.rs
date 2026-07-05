@@ -39,28 +39,28 @@ pub fn logs_dir() -> PathBuf {
 /// 定位 `proxy/csswitch_proxy.py`：
 /// 1. `CSSWITCH_PROXY_DIR` 环境变量
 /// 2. Helper 二进制同级目录（部署态）
-/// 3. 相对路径（开发态）
+/// 3. `~/.csswitch/proxy/`（统一管理目录）
+/// 4. 相对路径（开发态）
 fn proxy_script_path() -> Result<PathBuf, String> {
     if let Ok(dir) = std::env::var("CSSWITCH_PROXY_DIR") {
         let p = PathBuf::from(&dir).join("csswitch_proxy.py");
-        if p.is_file() {
-            return Ok(p);
-        }
+        if p.is_file() { return Ok(p); }
     }
-    // Helper 二进制同级目录
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("proxy").join("csswitch_proxy.py");
-            if p.is_file() {
-                return Ok(p);
-            }
+            if p.is_file() { return Ok(p); }
             let p = dir.join("..").join("proxy").join("csswitch_proxy.py");
-            if p.is_file() {
-                return Ok(p.canonicalize().unwrap_or(p));
-            }
+            if p.is_file() { return Ok(p.canonicalize().unwrap_or(p)); }
         }
     }
-    Err("找不到 proxy/csswitch_proxy.py。请设置 CSSWITCH_PROXY_DIR 环境变量。".to_string())
+    // 统一管理目录 ~/.csswitch/proxy/
+    let default = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".csswitch").join("proxy").join("csswitch_proxy.py");
+    if default.is_file() { return Ok(default); }
+
+    Err("找不到 proxy/csswitch_proxy.py。请把它放到 ~/.csswitch/proxy/ 目录下。".to_string())
 }
 
 // ============================================================================

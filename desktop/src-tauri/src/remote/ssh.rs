@@ -23,8 +23,12 @@ use super::types::{RemoteAuthMethod, RemoteError, RemoteHostProfile};
 #[cfg(windows)]
 const NO_WINDOW: u32 = 0x08000000;
 
+/// 创建隐藏窗口的 Command（Windows 上不弹 cmd 窗口）
 fn hide_cmd(mut cmd: Command) -> Command {
-    #[cfg(windows)] { cmd.creation_flags(NO_WINDOW); }
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(NO_WINDOW);
+    }
     cmd
 }
 
@@ -104,14 +108,16 @@ pub fn build_ssh_args(profile: &RemoteHostProfile, helper_args: &[String]) -> Ve
 
 /// 构建安装 helper 的 SSH 命令。
 /// 在远程执行 shell 脚本：下载 release 资产 → 校验 → 安装。
+///
+/// P0-2 修复：对平台信息进行白名单校验，防止命令注入。
 pub fn build_helper_install_args(profile: &RemoteHostProfile) -> Vec<String> {
     let mut args = build_ssh_base_args(profile);
     let helper_path = shell_quote(&profile.helper_path);
     let repo = std::env::var(HELPER_RELEASE_REPO_ENV)
         .unwrap_or_else(|_| HELPER_RELEASE_REPO.to_string());
 
-    // 安装脚本：从 GitHub Releases 下载 helper 二进制。
-    // 使用 curl 或 wget 下载 → chmod +x → 验证。
+    // P0-2: 安装脚本中加入架构白名单校验，防止注入
+    // 即使攻击者控制了 uname 输出，也只能匹配预定义的安全值
     let script = format!(
         r#"set -e
 HELPER_PATH={helper_path}
@@ -129,16 +135,36 @@ download() {{
   fi
 }}
 
-ARCH=$(uname -m)
-case "$ARCH" in x86_64|amd64) ARCH=x86_64 ;; aarch64|arm64) ARCH=aarch64 ;; *) echo "不支持的架构: $ARCH" >&2; exit 1 ;; esac
-OS=$(uname -s)
+# P0-2 修复：对架构和 OS 进行严格白名单校验
+ARCH_RAW=$(uname -m)
+case "$ARCH_RAW" in
+  x86_64|amd64) ARCH=x86_64 ;;
+  aarch64|arm64) ARCH=aarch64 ;;
+  *)
+    echo "不支持的架构: $ARCH_RAW（仅支持 x86_64/aarch64）" >&2
+    exit 1
+    ;;
+esac
+
+OS_RAW=$(uname -s)
+case "$OS_RAW" in
+  Linux) OS=linux ;;
+  *)
+    echo "不支持的操作系统: $OS_RAW（仅支持 Linux）" >&2
+    exit 1
+    ;;
+esac
 
 # 尝试从 GitHub API 获取最新 release 的下载 URL
+# 使用硬编码的文件名模式，防止通配符注入
 API_URL="https://api.github.com/repos/{repo}/releases/latest"
-DOWNLOAD_URL=$(curl -sSL "$API_URL" 2>/dev/null | grep -o '"browser_download_url": *"[^"]*helper-linux-'"$ARCH"'"' | head -1 | grep -o 'https://[^"]*' || true)
+BINARY_NAME="csswitch-helper-${{OS}}-${{ARCH}}"
+
+# 从 API 响应中提取匹配的下载 URL（只匹配预期的文件名格式）
+DOWNLOAD_URL=$(curl -sSL "$API_URL" 2>/dev/null | grep -F "\"$BINARY_NAME\"" | grep -o 'https://[^"]*' | head -1 || true)
 
 if [ -z "$DOWNLOAD_URL" ]; then
-  echo "无法从 GitHub Releases 获取 helper 下载链接。请手动安装。" >&2
+  echo "无法从 GitHub Releases 获取 $BINARY_NAME 下载链接。" >&2
   echo "手动安装: wget <url> -O $HELPER_PATH && chmod +x $HELPER_PATH" >&2
   exit 1
 fi
@@ -266,14 +292,17 @@ fn try_run_ssh(
             ),
         })?;
 
-    // 使用 channel + recv_timeout 实现真正的命令超时
+    // P0-1 修复：实施真正的超时机制，防止 UI 永久卡死
+    // 使用 channel + recv_timeout 在指定时间内等待命令完成
     let (tx, rx) = std::sync::mpsc::channel();
+    let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+
     std::thread::spawn(move || {
         let result = output.wait_with_output();
-        let _ = tx.send(result);
+        let _ = tx.send(result); // 忽略发送失败（接收端可能已超时退出）
     });
 
-    let output = match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+    let output = match rx.recv_timeout(timeout_duration) {
         Ok(result) => result.map_err(|e| RemoteError {
             code: "ssh_io_error".to_string(),
             message: format!("SSH 进程 I/O 错误：{e}"),
@@ -282,12 +311,22 @@ fn try_run_ssh(
             suggestion: Some("请重试。如持续出现，请检查系统资源。".to_string()),
         })?,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // 超时：SSH 进程已经在后台线程中运行，无法直接杀死
+            // 注：SSH 客户端通常有自己的超时机制（ServerAliveInterval）
+            // 这里的超时是为了防止 UI 无限等待
             return Err(RemoteError {
                 code: "ssh_timeout".to_string(),
-                message: format!("SSH 命令执行超时（{timeout_secs}秒）"),
-                details: None,
+                message: format!("SSH 命令执行超时（{}秒）", timeout_secs),
+                details: Some(format!(
+                    "命令：{} {} {}",
+                    profile.host,
+                    profile.username,
+                    helper_args.join(" ")
+                )),
                 recoverable: true,
-                suggestion: Some("网络慢或远程命令卡住。请检查网络连接。".to_string()),
+                suggestion: Some(
+                    "网络慢或远程命令卡住。请检查网络连接，或在 SSH 配置中设置超时参数。".to_string(),
+                ),
             });
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -296,7 +335,7 @@ fn try_run_ssh(
                 message: "SSH 执行线程异常退出".to_string(),
                 details: None,
                 recoverable: false,
-                suggestion: Some("请报告此问题。".to_string()),
+                suggestion: Some("这可能是程序错误。请报告此问题。".to_string()),
             });
         }
     };
@@ -304,6 +343,24 @@ fn try_run_ssh(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(map_ssh_error(profile, &stderr, output.status.code()));
+    }
+
+    // P1-11 修复：限制 Helper 输出大小，防止 OOM
+    const MAX_OUTPUT_SIZE: usize = 1024 * 1024; // 1MB
+    if output.stdout.len() > MAX_OUTPUT_SIZE {
+        return Err(RemoteError {
+            code: "output_too_large".to_string(),
+            message: format!(
+                "Helper 输出过大（{} 字节，限制 {} 字节）",
+                output.stdout.len(),
+                MAX_OUTPUT_SIZE
+            ),
+            details: Some("输出被截断以防止内存溢出".to_string()),
+            recoverable: false,
+            suggestion: Some(
+                "请在远程服务器上查看 Helper 日志文件排查问题（csswitch-helper logs proxy）。".to_string()
+            ),
+        });
     }
 
     String::from_utf8(output.stdout).map_err(|_| RemoteError {
@@ -437,7 +494,84 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
         };
     }
 
-    // 未知错误
+    // P1-6 修复：增强 SSH 错误映射，覆盖更多常见错误场景
+
+    // 磁盘空间不足
+    if stderr_lower.contains("no space left")
+        || stderr_lower.contains("disk full")
+        || stderr_lower.contains("write failed")
+    {
+        return RemoteError {
+            code: "disk_full".to_string(),
+            message: "远程服务器磁盘空间不足".to_string(),
+            details: Some(stderr.to_string()),
+            recoverable: false,
+            suggestion: Some("请清理远程服务器磁盘空间，或使用 df -h 检查磁盘使用情况。".to_string()),
+        };
+    }
+
+    // 权限不足（写入/执行权限）
+    if stderr_lower.contains("permission denied") && !stderr_lower.contains("publickey") {
+        return RemoteError {
+            code: "permission_denied".to_string(),
+            message: "远程服务器权限不足".to_string(),
+            details: Some(stderr.to_string()),
+            recoverable: false,
+            suggestion: Some(
+                "请确认远程用户对 Helper 路径和日志目录有读写权限（chmod +x helper_path）。".to_string()
+            ),
+        };
+    }
+
+    // Shell 配置错误（bashrc/profile 报错）
+    if stderr_lower.contains("command not found")
+        || stderr_lower.contains("syntax error")
+        || stderr_lower.contains(".bashrc")
+        || stderr_lower.contains(".profile")
+    {
+        return RemoteError {
+            code: "shell_config_error".to_string(),
+            message: "远程 Shell 配置异常".to_string(),
+            details: Some(stderr.to_string()),
+            recoverable: false,
+            suggestion: Some(
+                "请检查远程用户的 .bashrc 或 .profile 文件是否有错误（临时解决：ssh -t user@host /bin/bash --noprofile）。".to_string()
+            ),
+        };
+    }
+
+    // 端口被占用
+    if stderr_lower.contains("address already in use")
+        || stderr_lower.contains("port is already allocated")
+        || stderr_lower.contains("bind: address already in use")
+    {
+        return RemoteError {
+            code: "port_in_use".to_string(),
+            message: "远程服务器端口已被占用".to_string(),
+            details: Some(stderr.to_string()),
+            recoverable: false,
+            suggestion: Some(
+                "请停止占用该端口的进程（lsof -i :端口 或 netstat -tulpn | grep 端口），或更换端口。".to_string()
+            ),
+        };
+    }
+
+    // 主机密钥变更（中间人攻击警告）
+    if stderr_lower.contains("remote host identification has changed")
+        || stderr_lower.contains("host key verification failed")
+    {
+        return RemoteError {
+            code: "host_key_changed".to_string(),
+            message: "远程服务器主机密钥已变更".to_string(),
+            details: Some(stderr.to_string()),
+            recoverable: false,
+            suggestion: Some(
+                "服务器可能被重装或存在安全风险。请确认服务器身份后，手动删除 ~/.ssh/known_hosts 中的旧密钥。".to_string()
+            ),
+        };
+    }
+
+    // 未知错误（兜底）
     RemoteError {
         code: format!("ssh_exit_{}", exit_code.unwrap_or(-1)),
         message: format!(
@@ -446,7 +580,9 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
         ),
         details: Some(stderr.to_string()),
         recoverable: exit_code.map_or(false, |c| c == 255), // 255 通常为连接错误，可重试
-        suggestion: Some("请查看错误详情，或尝试在终端手动执行 SSH 命令排查。".to_string()),
+        suggestion: Some(
+            "请在终端手动执行 SSH 命令排查问题：ssh -vvv user@host（-vvv 开启详细日志）。".to_string()
+        ),
     }
 }
 

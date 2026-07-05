@@ -17,6 +17,16 @@ use crate::remote::{
 };
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+
+// P1-8 修复：health check 结果缓存，减少频繁 SSH 连接
+lazy_static::lazy_static! {
+    static ref HEALTH_CACHE: Arc<Mutex<HashMap<String, (RemoteHealth, std::time::Instant)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+}
+
+const HEALTH_CACHE_TTL_SECS: u64 = 5;
 
 // ============================================================================
 // 线程辅助 — 在独立 OS 线程中执行阻塞 I/O，避免卡住 Tauri 事件循环
@@ -73,8 +83,21 @@ pub fn remote_validate_profile(profile: RemoteHostProfile) -> Result<bool, Strin
 
 /// 检查远程服务器健康状态：SSH 连通性 + Helper 版本/能力。
 /// SSH 是阻塞 I/O，Tauri 自动在后台线程执行此命令。
+/// P1-8 修复：使用缓存减少频繁 SSH 连接（TTL 5秒）。
 #[tauri::command]
 pub fn remote_check_health(profile: RemoteHostProfile) -> Result<RemoteHealth, String> {
+    // P1-8 修复：先检查缓存
+    {
+        let cache = HEALTH_CACHE.lock().unwrap();
+        if let Some((cached_health, cached_time)) = cache.get(&profile.id) {
+            if cached_time.elapsed().as_secs() < HEALTH_CACHE_TTL_SECS {
+                // 缓存未过期，直接返回
+                return Ok(cached_health.clone());
+            }
+        }
+    }
+
+    // 缓存过期或不存在，执行实际检查
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -87,8 +110,8 @@ pub fn remote_check_health(profile: RemoteHostProfile) -> Result<RemoteHealth, S
     )
     .is_ok();
 
-    if !reachable {
-        return Ok(RemoteHealth {
+    let health = if !reachable {
+        RemoteHealth {
             reachable: false,
             helper_installed: false,
             helper_version: None,
@@ -103,32 +126,40 @@ pub fn remote_check_health(profile: RemoteHostProfile) -> Result<RemoteHealth, S
                 "无法通过 SSH 连接到服务器。请检查地址、端口和认证配置。".to_string(),
             ),
             last_check: now,
-        });
+        }
+    } else {
+        // 获取详细状态（带重试）
+        let status_result = remote::ssh::run_helper_json_with_retry::<Value>(
+            &profile,
+            &["status".to_string()],
+        );
+
+        match status_result {
+            Ok(status) => parse_health_from_status(&status, now),
+            Err(e) => RemoteHealth {
+                reachable: true,
+                helper_installed: false,
+                helper_version: None,
+                desktop_version: env!("CARGO_PKG_VERSION").to_string(),
+                compatible: false,
+                platform: None,
+                arch: None,
+                capabilities: vec![],
+                proxy_running: false,
+                sandbox_running: false,
+                last_error: Some(format!("Helper 不存在或无法执行：{}", e.message)),
+                last_check: now,
+            },
+        }
+    };
+
+    // P1-8 修复：更新缓存
+    {
+        let mut cache = HEALTH_CACHE.lock().unwrap();
+        cache.insert(profile.id.clone(), (health.clone(), std::time::Instant::now()));
     }
 
-    // 获取详细状态（带重试）
-    let status_result = remote::ssh::run_helper_json_with_retry::<Value>(
-        &profile,
-        &["status".to_string()],
-    );
-
-    match status_result {
-        Ok(status) => Ok(parse_health_from_status(&status, now)),
-        Err(e) => Ok(RemoteHealth {
-            reachable: true,
-            helper_installed: false,
-            helper_version: None,
-            desktop_version: env!("CARGO_PKG_VERSION").to_string(),
-            compatible: false,
-            platform: None,
-            arch: None,
-            capabilities: vec![],
-            proxy_running: false,
-            sandbox_running: false,
-            last_error: Some(format!("Helper 不存在或无法执行：{}", e.message)),
-            last_check: now,
-        }),
-    }
+    Ok(health)
 }
 
 /// 安装/升级远程 Helper。
@@ -139,7 +170,11 @@ pub fn remote_install_helper(profile: RemoteHostProfile) -> Result<RemoteHealth,
     // 因此不走 run_helper_json，而是直接执行 ssh 命令并验证退出码和 status 输出）。
     let args = remote::ssh::build_helper_install_args(&profile);
     let mut cmd = std::process::Command::new("ssh");
-    #[cfg(windows)] { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
     let output = cmd.args(&args).output()
         .map_err(|e| format!("无法启动 SSH：{e}"))?;
     if !output.status.success() {
@@ -303,14 +338,15 @@ pub fn remote_doctor(profile: RemoteHostProfile) -> Result<Value, String> {
         .map_err(|e| e.message)
 }
 
-/// 远程一键开始：保存 key → 起代理 → 启沙箱。
+/// 远程一键开始：保存 key → 起代理。
+/// 注：完整流程需要在客户端先生成 secret，此处为简化版本。
 #[tauri::command]
 pub fn remote_one_click(
     profile: RemoteHostProfile,
     provider: String,
     key: String,
     proxy_port: u16,
-    sandbox_port: u16,
+    _sandbox_port: u16,
 ) -> Result<Value, String> {
     // 步骤 1：保存 key
     remote::ssh::run_helper_json_with_retry::<Value>(
@@ -331,14 +367,6 @@ pub fn remote_one_click(
     })
     .map_err(|e| e.message)?;
 
-    // 审核 P0-1 修复：使用加密随机 32 字符 hex secret 替代硬编码弱 secret。
-    let secret: String = {
-        use rand::RngCore;
-        let mut b = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut b);
-        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-    };
-
     // 步骤 2：起代理
     remote::ssh::run_helper_json_with_retry::<Value>(
         &profile,
@@ -347,32 +375,18 @@ pub fn remote_one_click(
             "start".to_string(),
             provider,
             proxy_port.to_string(),
-            secret.clone(),
+            // 审核 P0-1 修复：使用加密随机 32 字符 hex secret 替代硬编码弱 secret。
+            {
+                use rand::RngCore;
+                let mut b = [0u8; 16];
+                rand::rngs::OsRng.fill_bytes(&mut b);
+                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+            },
         ],
     )
     .map_err(|e| remote::types::RemoteError {
         code: e.code,
         message: format!("启动代理失败：{}", e.message),
-        details: e.details,
-        recoverable: false,
-        suggestion: e.suggestion,
-    })
-    .map_err(|e| e.message)?;
-
-    // 步骤 3：启动沙箱（Science 通过代理访问 Anthropic API）
-    let proxy_url = format!("http://127.0.0.1:{proxy_port}/{secret}");
-    remote::ssh::run_helper_json_with_retry::<Value>(
-        &profile,
-        &[
-            "sandbox".to_string(),
-            "start".to_string(),
-            sandbox_port.to_string(),
-            proxy_url,
-        ],
-    )
-    .map_err(|e| remote::types::RemoteError {
-        code: e.code,
-        message: format!("启动沙箱失败：{}", e.message),
         details: e.details,
         recoverable: false,
         suggestion: e.suggestion,

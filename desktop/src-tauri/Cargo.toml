@@ -33,6 +33,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"
 dirs = "5"
+# P1-5 修复：文件锁，防止并发写入 remote-hosts.json 时数据丢失
+fs2 = "0.4"
+# P1-8 修复：health check 缓存，减少频繁 SSH 连接
+lazy_static = "1.4"
 # 虚拟 OAuth 伪造器（Rust 原生，去 node 依赖 —— 见 src/oauth_forge.rs）。
 aes-gcm = "0.10"
 hkdf = "0.12"
