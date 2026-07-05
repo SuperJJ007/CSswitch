@@ -186,18 +186,33 @@ esac
 API_URL="https://api.github.com/repos/{repo}/releases/latest"
 BINARY_NAME="csswitch-helper-${{OS}}-${{ARCH}}"
 
-# 从 API 响应中提取匹配的下载 URL（只匹配预期的文件名格式）
+# 从 API 响应中提取匹配的下载 URL
+# 优先 jq（JSON 专用工具最可靠），其次 python3（Linux 标配），最后 awk（兜底）
 API_JSON=$(mktemp)
 download "$API_URL" "$API_JSON"
-DOWNLOAD_URL=$(awk -v name="\"$BINARY_NAME\"" '
-  $0 ~ name {{ found=1 }}
-  found && /browser_download_url/ {{
-    if (match($0, /https:[^"]+/)) {{
-      print substr($0, RSTART, RLENGTH)
-      exit
+
+if command -v jq >/dev/null 2>&1; then
+  DOWNLOAD_URL=$(jq -r ".assets[] | select(.name==\"$BINARY_NAME\") | .browser_download_url" "$API_JSON" 2>/dev/null || true)
+elif command -v python3 >/dev/null 2>&1; then
+  DOWNLOAD_URL=$(python3 -c "
+import json,sys
+data=json.load(open('$API_JSON'))
+for a in data.get('assets',[]):
+    if a.get('name')=='$BINARY_NAME':
+        print(a['browser_download_url'])
+        break
+" 2>/dev/null || true)
+else
+  DOWNLOAD_URL=$(awk -v name="\"$BINARY_NAME\"" '
+    $0 ~ name {{ found=1 }}
+    found && /browser_download_url/ {{
+      if (match($0, /https:[^"]+/)) {{
+        print substr($0, RSTART, RLENGTH)
+        exit
+      }}
     }}
-  }}
-' "$API_JSON" || true)
+  ' "$API_JSON" || true)
+fi
 rm -f "$API_JSON"
 
 if [ -z "$DOWNLOAD_URL" ]; then
@@ -249,9 +264,21 @@ pub fn detect_remote_platform(
     let os_raw = lines.next().unwrap_or_default();
     let arch_raw = lines.next().unwrap_or_default();
 
+    // P0-2 修复：对 OS 名称做严格白名单校验，防止非预期平台字符串污染 UI/日志
     let os = match os_raw {
         "Linux" => "linux",
-        _ => os_raw,
+        "Darwin" => "macos",
+        other => {
+            return Err(RemoteError {
+                code: "unsupported_platform".to_string(),
+                message: format!("远程服务器平台不支持：{other}（仅支持 Linux）"),
+                details: None,
+                recoverable: false,
+                suggestion: Some(
+                    "远程 Helper 目前仅支持 Linux 服务器。请在 Linux 上部署。".to_string(),
+                ),
+            });
+        }
     }
     .to_string();
 
@@ -430,6 +457,8 @@ pub fn run_helper_json<T: DeserializeOwned>(
 }
 
 /// 便捷方法：使用默认超时和不重试。
+/// 注意：内部 `auth_runtime_options` 和 `build_ssh_command_spec` 各计算一次 SshAuthPlan
+/// （开销极低，仅为几个字符串分配，可忽略不计）。
 pub fn run_helper_json_simple<T: DeserializeOwned>(
     profile: &RemoteHostProfile,
     helper_args: &[String],

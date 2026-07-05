@@ -1,0 +1,43 @@
+# 所有文本文件统一 LF，检出时不转换（Windows 开发机也保持 LF）
+* text=auto eol=lf
+
+# 二进制文件不碰
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.webp binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
+*.eot binary
+*.otf binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.7z binary
+
+# Shell 脚本必须 LF（否则 Linux 上直接废掉）
+*.sh text eol=lf
+
+# Rust / Tauri
+*.rs text eol=lf diff=rust
+Cargo.lock text eol=lf
+
+# Web 前端
+*.js text eol=lf
+*.ts text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+
+# 配置与数据
+*.json text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# 文档
+*.md text eol=lf

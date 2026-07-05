@@ -31,6 +31,8 @@ lazy_static::lazy_static! {
 }
 
 const HEALTH_CACHE_TTL_SECS: u64 = 5;
+/// 缓存最大条目数，防止管理大量远程服务器时内存泄漏。
+const HEALTH_CACHE_MAX_ENTRIES: usize = 32;
 
 // ============================================================================
 // 线程辅助 — 在独立 OS 线程中执行阻塞 I/O，避免卡住 Tauri 事件循环
@@ -69,9 +71,14 @@ pub fn remote_save_profile(profile: RemoteHostProfile) -> Result<RemoteHostProfi
     remote::upsert_profile(profile)
 }
 
-/// 删除指定 ID 的远程服务器 Profile。
+/// 删除指定 ID 的远程服务器 Profile。同时清理关联的健康检查缓存。
 #[tauri::command]
 pub fn remote_delete_profile(id: String) -> Result<bool, String> {
+    // P1-8 修复：删除 profile 时同步清理健康检查缓存
+    {
+        let mut cache = HEALTH_CACHE.lock().unwrap();
+        cache.remove(&id);
+    }
     remote::delete_profile(&id)
 }
 
@@ -153,14 +160,8 @@ pub fn remote_check_health(profile: RemoteHostProfile) -> Result<RemoteHealth, S
         remote::ssh::run_helper_json_with_retry::<Value>(&profile, &["status".to_string()]);
     let health = health_from_status_result(status_result, now);
 
-    // P1-8 修复：更新缓存
-    {
-        let mut cache = HEALTH_CACHE.lock().unwrap();
-        cache.insert(
-            profile.id.clone(),
-            (health.clone(), std::time::Instant::now()),
-        );
-    }
+    // P1-8 修复：更新缓存（带上限保护）
+    cache_health(&profile.id, &health);
 
     Ok(health)
 }
@@ -178,6 +179,16 @@ fn remote_check_health_uncached(profile: &RemoteHostProfile) -> RemoteHealth {
 
 fn cache_health(profile_id: &str, health: &RemoteHealth) {
     let mut cache = HEALTH_CACHE.lock().unwrap();
+    // 缓存已满时，移除最旧的条目（简单 FIFO 策略）
+    if cache.len() >= HEALTH_CACHE_MAX_ENTRIES && !cache.contains_key(profile_id) {
+        if let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, (_, t))| *t)
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest_key);
+        }
+    }
     cache.insert(
         profile_id.to_string(),
         (health.clone(), std::time::Instant::now()),

@@ -61,15 +61,6 @@ impl AskpassResponse {
             remember: false,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn cancelled() -> Self {
-        Self {
-            secret: None,
-            cancelled: true,
-            remember: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,7 +129,6 @@ pub fn run_cli() -> i32 {
 }
 
 impl AskpassBroker {
-    #[allow(dead_code)]
     pub fn start(app: tauri::AppHandle, session_dir: PathBuf) -> Result<Self, String> {
         ensure_dirs(&session_dir)?;
         let session_id = new_id();
@@ -158,10 +148,8 @@ impl AskpassBroker {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn session_id(&self) -> &str {
-        &self.session_id
-    }
+    // askpass broker 创建后启动后台线程轮询请求文件，
+    // 生命周期由调用方（auth_runtime_options）持有直到 SSH 命令结束。
 }
 
 impl Drop for AskpassBroker {
@@ -276,7 +264,7 @@ pub fn respond(
         remember,
     };
     if remember && !cancelled {
-        if let Some(secret) = secret.as_deref() {
+        if let Some(secret) = secret.as_deref().filter(|s| !s.is_empty()) {
             remember_secret(&request, secret)?;
         }
     }
