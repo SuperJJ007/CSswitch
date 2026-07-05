@@ -44,6 +44,30 @@ mod tests {
     }
 
     #[test]
+    fn transient_password_deserializes_but_is_never_serialized() {
+        let raw = r#"{
+            "id":"r1",
+            "name":"lab",
+            "host":"example.com",
+            "port":22,
+            "username":"ubuntu",
+            "authMethod":{"type":"password"},
+            "helperPath":"~/.csswitch/bin/csswitch-helper",
+            "transientPassword":"server-password"
+        }"#;
+
+        let profile: RemoteHostProfile = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            profile.transient_password.as_deref(),
+            Some("server-password")
+        );
+
+        let saved = serde_json::to_string(&profile).unwrap();
+        assert!(!saved.contains("transientPassword"));
+        assert!(!saved.contains("server-password"));
+    }
+
+    #[test]
     fn deserializes_recommended_auth_method() {
         let auth: RemoteAuthMethod = serde_json::from_str(
             r#"{
@@ -103,7 +127,7 @@ pub struct RemoteSshAdvancedOptions {
     pub extra_args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteHostProfile {
     /// 唯一标识符（UUID v4）。
@@ -125,6 +149,28 @@ pub struct RemoteHostProfile {
     pub last_connected: Option<i64>,
     #[serde(default)]
     pub ssh_options: RemoteSshAdvancedOptions,
+    #[serde(default, skip_serializing)]
+    pub transient_password: Option<String>,
+}
+
+impl std::fmt::Debug for RemoteHostProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteHostProfile")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("auth_method", &self.auth_method)
+            .field("helper_path", &self.helper_path)
+            .field("last_connected", &self.last_connected)
+            .field("ssh_options", &self.ssh_options)
+            .field(
+                "transient_password",
+                &self.transient_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// SSH 认证方式。

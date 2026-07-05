@@ -74,12 +74,29 @@ pub fn remote_save_profile(profile: RemoteHostProfile) -> Result<RemoteHostProfi
 /// 删除指定 ID 的远程服务器 Profile。同时清理关联的健康检查缓存。
 #[tauri::command]
 pub fn remote_delete_profile(id: String) -> Result<bool, String> {
+    let existing = remote::load_profiles()?
+        .into_iter()
+        .find(|profile| profile.id == id);
     // P1-8 修复：删除 profile 时同步清理健康检查缓存
     {
         let mut cache = HEALTH_CACHE.lock().unwrap();
         cache.remove(&id);
     }
-    remote::delete_profile(&id)
+    let deleted = remote::delete_profile(&id)?;
+    if deleted {
+        let _ = remote::credentials::delete_secret(&id, remote::credentials::CredentialKind::Password);
+        if let Some(RemoteHostProfile {
+            auth_method: RemoteAuthMethod::KeyFile { path, .. },
+            ..
+        }) = existing
+        {
+            let _ = remote::credentials::delete_secret(
+                &id,
+                remote::credentials::CredentialKind::KeyPassword(&path),
+            );
+        }
+    }
+    Ok(deleted)
 }
 
 /// 校验 Profile 字段但不保存。

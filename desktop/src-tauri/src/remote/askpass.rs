@@ -20,6 +20,8 @@ lazy_static::lazy_static! {
     static ref APP_HANDLE: Mutex<Option<tauri::AppHandle>> = Mutex::new(None);
 }
 
+const TRANSIENT_PASSWORD_FILE: &str = "transient-password";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskpassRequest {
@@ -129,8 +131,18 @@ pub fn run_cli() -> i32 {
 }
 
 impl AskpassBroker {
-    pub fn start(app: tauri::AppHandle, session_dir: PathBuf) -> Result<Self, String> {
+    pub fn start(
+        app: tauri::AppHandle,
+        session_dir: PathBuf,
+        transient_password: Option<String>,
+    ) -> Result<Self, String> {
         ensure_dirs(&session_dir)?;
+        if let Some(secret) = transient_password
+            .as_deref()
+            .filter(|secret| !secret.is_empty())
+        {
+            write_transient_password(&session_dir, secret)?;
+        }
         let session_id = new_id();
         register_session(&session_id, session_dir.clone());
         let stop = Arc::new(AtomicBool::new(false));
@@ -265,7 +277,7 @@ pub fn respond(
     };
     if remember && !cancelled {
         if let Some(secret) = secret.as_deref().filter(|s| !s.is_empty()) {
-            remember_secret(&request, secret)?;
+            let _ = remember_secret(&request, secret);
         }
     }
     write_response(session_dir, request_id, &response)
@@ -325,9 +337,8 @@ fn poll_requests(
 
 fn try_auto_response(session_dir: &Path, request: &AskpassRequest) -> Result<(), String> {
     let secret = match classify_prompt(&request.prompt) {
-        PromptKind::Password => {
-            credentials::read_secret(&request.profile_id, CredentialKind::Password)
-        }
+        PromptKind::Password => read_transient_password(session_dir)
+            .or_else(|| credentials::read_secret(&request.profile_id, CredentialKind::Password)),
         PromptKind::KeyPassword => {
             let key_path = request
                 .key_path
@@ -341,6 +352,22 @@ fn try_auto_response(session_dir: &Path, request: &AskpassRequest) -> Result<(),
         return Err("no saved secret".to_string());
     };
     write_response(session_dir, &request.id, &AskpassResponse::secret(&secret))
+}
+
+fn write_transient_password(session_dir: impl AsRef<Path>, secret: &str) -> Result<(), String> {
+    let session_dir = session_dir.as_ref();
+    ensure_dirs(session_dir)?;
+    fs::write(transient_password_path(session_dir), secret)
+        .map_err(|e| format!("写入临时登录密码失败：{e}"))
+}
+
+fn read_transient_password(session_dir: &Path) -> Option<String> {
+    let secret = fs::read_to_string(transient_password_path(session_dir)).ok()?;
+    if secret.is_empty() {
+        None
+    } else {
+        Some(secret)
+    }
 }
 
 fn prompt_payload(session_id: &str, request: &AskpassRequest) -> AskpassPromptPayload {
@@ -378,6 +405,10 @@ fn requests_dir(session_dir: &Path) -> PathBuf {
 
 fn responses_dir(session_dir: &Path) -> PathBuf {
     session_dir.join("responses")
+}
+
+fn transient_password_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(TRANSIENT_PASSWORD_FILE)
 }
 
 fn request_path(session_dir: &Path, request_id: &str) -> PathBuf {
@@ -449,6 +480,19 @@ mod tests {
         assert_eq!(resp.secret.as_deref(), Some("pw"));
         assert!(!resp.cancelled);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transient_password_auto_answers_password_prompt_without_keyring() {
+        let dir = temp_session_dir();
+        write_transient_password(&dir, "typed-password").unwrap();
+        let req = AskpassRequest::new("root@example.com's password:", "profile-1", None);
+
+        try_auto_response(&dir, &req).unwrap();
+
+        let resp = read_response(&dir, &req.id).unwrap();
+        assert_eq!(resp.secret.as_deref(), Some("typed-password"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -26,6 +26,23 @@ function workflowJob(name) {
   return m[0];
 }
 
+function frontendFunctionBody(name) {
+  const marker = `async function ${name}(`;
+  const start = main.indexOf(marker);
+  assert.notEqual(start, -1, `${name} should exist`);
+  const braceStart = main.indexOf("{", start);
+  assert.notEqual(braceStart, -1, `${name} should have a body`);
+  let depth = 0;
+  for (let i = braceStart; i < main.length; i += 1) {
+    if (main[i] === "{") depth += 1;
+    if (main[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return main.slice(start, i + 1);
+    }
+  }
+  assert.fail(`${name} body should close`);
+}
+
 test("desktop profile UI script matches the v2 profile HTML", () => {
   assert.match(html, /id="profileList"/);
   assert.match(html, /id="newBtn"/);
@@ -95,21 +112,44 @@ test("remote profile save prepares helper before saving the server", () => {
   );
 });
 
-test("remote password login has an explicit password field and stores it outside the profile", () => {
+test("remote password login uses a transient password instead of requiring system storage", () => {
   assert.match(html, /id="passwordGroup"/);
   assert.match(html, /<input(?=[^>]*id="editProfilePassword")(?=[^>]*type="password")[^>]*>/);
+  assert.match(html, /id="editProfileRememberPassword"/);
   assert.match(html, /id="keyFileGroup"/);
 
   assert.match(main, /"editProfilePassword"/);
+  assert.match(main, /"editProfileRememberPassword"/);
   assert.match(main, /"passwordGroup"/);
   assert.match(main, /function toggleAuthFields\(\)/);
   assert.match(main, /passwordGroup\.style\.display\s*=\s*method === "password"/);
   assert.match(main, /keyFileGroup\.style\.display\s*=\s*method === "key_file"/);
-  assert.match(main, /call\(["']remote_save_login_secret["']/);
-  assert.match(main, /call\(["']remote_delete_login_secret["']/);
+  assert.match(main, /function withTransientPassword\(/);
+  assert.match(main, /function stripTransientPassword\(/);
+  assert.match(main, /function rememberPasswordAfterConnection\(/);
   assert.match(main, /editProfilePassword\.value\s*=\s*""/);
   assert.doesNotMatch(main, /authMethod,\s*password/i);
   assert.doesNotMatch(main, /password:\s*els\.editProfilePassword/);
+
+  const saveBody = frontendFunctionBody("saveProfile");
+  const testBody = frontendFunctionBody("testProfileConnection");
+  const rememberBody = main.match(/async function rememberPasswordAfterConnection\([\s\S]*?\n\}/);
+  assert.ok(rememberBody, "rememberPasswordAfterConnection body should be discoverable");
+  assert.match(saveBody, /withTransientPassword\(profile,\s*loginSecret\)/);
+  assert.match(saveBody, /stripTransientPassword\(profileForConnection\)/);
+  assert.match(testBody, /withTransientPassword\(profile,\s*loginSecret\)/);
+  assert.match(saveBody, /rememberPasswordAfterConnection\(profile\.id,\s*authMethod,\s*loginSecret\)/);
+  assert.match(testBody, /rememberPasswordAfterConnection\(profile\.id,\s*authMethod,\s*loginSecret\)/);
+  assert.match(rememberBody[0], /saveRemoteLoginSecret/);
+  assert.match(rememberBody[0], /deleteRemoteLoginSecret/);
+  assert.ok(
+    saveBody.indexOf('call("remote_prepare_helper"') < saveBody.indexOf("rememberPasswordAfterConnection"),
+    "password should be remembered only after SSH connection succeeds",
+  );
+  assert.ok(
+    testBody.indexOf('call("remote_prepare_helper"') < testBody.indexOf("rememberPasswordAfterConnection"),
+    "test connection should remember the password only after SSH connection succeeds",
+  );
 });
 
 test("remote one-click does not repeat helper preparation", () => {

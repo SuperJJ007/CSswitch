@@ -234,6 +234,7 @@ mod tests {
             helper_path: "/usr/local/bin/csswitch-helper".to_string(),
             last_connected: None,
             ssh_options: RemoteSshAdvancedOptions::default(),
+            transient_password: None,
         }
     }
 

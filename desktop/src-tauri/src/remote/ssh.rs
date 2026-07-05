@@ -638,13 +638,14 @@ fn auth_runtime_options(
         recoverable: true,
         suggestion: Some("请稍后重试连接。".to_string()),
     })?;
-    let broker = AskpassBroker::start(app, session_dir).map_err(|e| RemoteError {
-        code: "ssh_auth_prompt_failed".to_string(),
-        message: "无法打开 SSH 登录输入窗口".to_string(),
-        details: Some(e),
-        recoverable: true,
-        suggestion: Some("请重试连接；如果仍失败，请检查应用日志。".to_string()),
-    })?;
+    let broker = AskpassBroker::start(app, session_dir, profile.transient_password.clone())
+        .map_err(|e| RemoteError {
+            code: "ssh_auth_prompt_failed".to_string(),
+            message: "无法打开 SSH 登录输入窗口".to_string(),
+            details: Some(e),
+            recoverable: true,
+            suggestion: Some("请重试连接；如果仍失败，请检查应用日志。".to_string()),
+        })?;
     Ok((runtime, Some(broker)))
 }
 
@@ -1110,6 +1111,7 @@ mod tests {
             helper_path: "/usr/local/bin/csswitch-helper".to_string(),
             last_connected: None,
             ssh_options: RemoteSshAdvancedOptions::default(),
+            transient_password: None,
         }
     }
 

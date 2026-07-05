@@ -4,7 +4,7 @@
 
 > **约定**：已修问题从 [`docs/known-issues.md`](docs/known-issues.md)「毕业」到这里（发布即定稿）；未修/进行中留在 known-issues；硬 bug 的根因证据链存在 [`findings/`](findings/)。
 
-## [0.3.3] — 2026-07-05
+## [0.3.3] — 2026-07-06
 
 > 主题：**跨平台桌面构建 + 远程 Linux Helper**。这一版把 CSSwitch 从 Apple Silicon 单平台包推进到 Windows x64 / Windows arm64 / macOS arm64 三类桌面安装包，并把远程 Linux helper 做成 x86_64 / aarch64 两个静态产物，方便在 Windows 桌面里一键准备远程服务器上的 Science 沙箱。版本同时补齐 GitHub Actions 发版矩阵和 macOS 编译回归，后续可以通过 `v*` tag 自动构建并发布。
 
@@ -24,12 +24,14 @@
 - **macOS CI 编译失败**：修复 Tauri 回调和停沙箱路径里的 `AppHandle` 作用域问题，并加 UI contract 回归测试覆盖 `_app` / `app` 这类跨平台编译差异。
 - **helper / 桌面构建参数不一致**：统一 helper 的无桌面特性构建、Tauri 桌面 target 和资源下载路径，避免某个平台构建成功但包内缺远程资产。
 - **远程沙箱进程管理健壮性**：加强端口避让、用户级路径兼容、状态识别和停止逻辑，减少远程一键启动后残留进程或误判。
+- **远程 SSH 密码登录不可用 / 不易用**：远程服务器表单新增密码输入与“记住密码”开关；首次连接使用临时密码完成 SSH 登录，连接成功后才按用户选择写入凭据存储。密码不会写进 `remote-hosts.json` 或日志；当系统凭据存储不可用时，回退到 `~/.csswitch` 下的本地加密文件，并带权限与软链护栏。
 
 ### 说明 Notes
 - 如果要让安装包内部版本号和 Release tag 完全一致，请使用 `v0.3.3` tag 触发 Actions 重新构建；不建议把 `0.3.2` 版本号的旧 artifacts 挂到 `v0.3.3`。
 - 与 CC Switch 的关系：CSSwitch 的命名和产品形态受 [CC Switch](https://github.com/farion1231/cc-switch) 启发，也借鉴了“provider/profile 切换工具”的思路；CC Switch 使用 MIT 许可。CSSwitch 是面向 Claude Science 的独立项目，不隶属、不同步发布、也不受 CC Switch 或 Anthropic 背书；当前代理、桌面、远程 helper 和沙箱登录实现均为本仓库实现，没有打包 CC Switch 二进制。
 - 发布产物说明：Windows 下载 `.exe` 安装器；macOS Apple Silicon 下载 `.dmg`；`csswitch-helper-linux-*` 是远程服务器用的 helper，不是普通用户桌面安装包。
 - 分发限制：当前 Windows 未做代码签名，可能触发 SmartScreen；macOS 为 ad-hoc 签名、未 Apple notarization，首次打开需右键“打开”或在隐私与安全性里放行。
+- 本次撤回后重发包含远程 SSH 密码登录修复：密码连接链路已补回归测试，并保持“profile 不落明文密码”的边界。
 - 安全边界仍不变：只操作 CSSwitch 的隔离沙箱和 `~/.csswitch` 配置，真实 Science 数据目录与 8765 端口仍按铁律保护。
 
 ## [0.3.2] — 2026-07-04

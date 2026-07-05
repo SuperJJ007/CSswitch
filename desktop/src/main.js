@@ -854,6 +854,7 @@ function openProfileEdit(id) {
   els.editProfileAuth.value = authSelectValue(auth);
   els.profileEditModal.dataset.passwordAuth = authSelectValue(auth) === "password" ? "1" : "0";
   els.editProfilePassword.value = "";
+  els.editProfileRememberPassword.checked = auth.type !== "password" || auth.savePassword !== false;
   els.editProfileKeyPath.value = auth.path || "~/.ssh/id_ed25519";
   els.editProfileHelperPath.value = p ? p.helperPath : "~/.csswitch/bin/csswitch-helper";
   els.profileEditMsg.textContent = "";
@@ -870,7 +871,7 @@ function toggleAuthFields() {
   els.passwordGroup.style.display = method === "password" ? "" : "none";
   els.keyFileGroup.style.display = method === "key_file" ? "" : "none";
   els.editProfilePassword.placeholder = els.profileEditModal.dataset.passwordAuth === "1"
-    ? "留空则不修改已保存密码"
+    ? "留空则连接时再输入"
     : "请输入服务器密码";
   if (method !== "password") {
     els.editProfilePassword.value = "";
@@ -893,7 +894,7 @@ function buildAuthMethodFromForm() {
   if (method === "password") {
     return {
       type: "password",
-      savePassword: true,
+      savePassword: !!els.editProfileRememberPassword.checked,
       allowVerificationCode: true,
       rememberConnection: true,
     };
@@ -941,6 +942,28 @@ function passwordSecretFromForm(requirePassword) {
 
 function passwordRequiredForCurrentProfile(authMethod) {
   return authMethod.type === "password" && els.profileEditModal.dataset.passwordAuth !== "1";
+}
+
+function withTransientPassword(profile, loginSecret) {
+  if (!loginSecret || loginSecret.kind !== "password" || !loginSecret.secret) return profile;
+  return { ...profile, transientPassword: loginSecret.secret };
+}
+
+function stripTransientPassword(profile) {
+  const { transientPassword, ...persistedProfile } = profile;
+  return persistedProfile;
+}
+
+async function rememberPasswordAfterConnection(profileId, authMethod, loginSecret) {
+  if (!authMethod || authMethod.type !== "password" || profileId === "_test_") return;
+  const passwordSecret = loginSecret || { kind: "password", keyPath: null, secret: "" };
+  if (authMethod.savePassword === false) {
+    await deleteRemoteLoginSecret(profileId, passwordSecret).catch(() => {});
+    return;
+  }
+  if (loginSecret) {
+    await saveRemoteLoginSecret(profileId, loginSecret);
+  }
 }
 
 async function saveRemoteLoginSecret(profileId, loginSecret) {
@@ -1083,24 +1106,18 @@ async function saveProfile() {
     els.profileEditMsg.className = "msg err";
     return;
   }
-  let savedLoginSecret = false;
   try {
     els.profileEditMsg.textContent = "正在准备远程 Helper…";
     els.profileEditMsg.className = "msg";
-    if (loginSecret) {
-      await saveRemoteLoginSecret(profile.id, loginSecret);
-      savedLoginSecret = true;
-    }
-    await call("remote_prepare_helper", { profile });
-    await call("remote_save_profile", { profile });
+    const profileForConnection = withTransientPassword(profile, loginSecret);
+    await call("remote_prepare_helper", { profile: profileForConnection });
+    await rememberPasswordAfterConnection(profile.id, authMethod, loginSecret);
+    await call("remote_save_profile", { profile: stripTransientPassword(profileForConnection) });
     els.editProfilePassword.value = "";
     closeProfileEdit();
     await openProfileModal();
     await loadRemoteProfiles();
   } catch (e) {
-    if (savedLoginSecret && !editId) {
-      await deleteRemoteLoginSecret(profile.id, loginSecret).catch(() => {});
-    }
     els.profileEditMsg.textContent = "保存失败：" + e;
     els.profileEditMsg.className = "msg err";
   }
@@ -1118,9 +1135,8 @@ async function testProfileConnection() {
     els.profileEditMsg.className = "msg err";
     return;
   }
-  const temporarySecret = !!loginSecret;
   const profile = {
-    id: temporarySecret ? "_test_" : (editId || "_test_"),
+    id: editId || "_test_",
     name: "test",
     host: els.editProfileHost.value.trim(),
     port: parseInt(els.editProfilePort.value, 10) || 22,
@@ -1131,10 +1147,9 @@ async function testProfileConnection() {
   els.testProfileBtn.disabled = true;
   els.profileEditMsg.textContent = "正在测试连接并准备远程 Helper…";
   try {
-    if (loginSecret) {
-      await saveRemoteLoginSecret(profile.id, loginSecret);
-    }
-    const h = await call("remote_prepare_helper", { profile });
+    const profileForConnection = withTransientPassword(profile, loginSecret);
+    const h = await call("remote_prepare_helper", { profile: profileForConnection });
+    await rememberPasswordAfterConnection(profile.id, authMethod, loginSecret);
     const ready = h.reachable && h.helperInstalled && h.compatible;
     els.profileEditMsg.textContent = ready ? "连接成功，Helper 已就绪。" : (h.lastError || "连接成功，但 Helper 未就绪");
     els.profileEditMsg.className = ready ? "msg ok" : "msg err";
@@ -1142,9 +1157,6 @@ async function testProfileConnection() {
     els.profileEditMsg.textContent = "连接失败：" + e;
     els.profileEditMsg.className = "msg err";
   } finally {
-    if (temporarySecret) {
-      await deleteRemoteLoginSecret(profile.id, loginSecret).catch(() => {});
-    }
     els.testProfileBtn.disabled = false;
   }
 }
@@ -1194,7 +1206,7 @@ function wire() {
     "manageProfilesBtn", "remoteHealthDot", "remoteHealthText", "profileModal", "addProfileBtn",
     "closeProfileModal", "profileEditModal", "profileEditTitle", "editProfileName",
     "editProfileHost", "editProfilePort", "editProfileUsername", "editProfileAuth",
-    "editProfilePassword", "editProfileKeyPath", "editProfileHelperPath", "passwordGroup",
+    "editProfilePassword", "editProfileRememberPassword", "editProfileKeyPath", "editProfileHelperPath", "passwordGroup",
     "keyFileGroup", "testProfileBtn", "saveProfileBtn", "cancelProfileEditBtn", "profileEditMsg", "authPromptModal",
     "authPromptTitle", "authPromptLabel", "authPromptInput", "authPromptRememberRow",
     "authPromptRemember", "authPromptSubmitBtn", "authPromptCancelBtn", "authPromptMsg",
