@@ -145,6 +145,9 @@ RELAY_MODELS = []
 # openai-custom 覆盖 Science 发来的 claude-* 壳）。由 CSSWITCH_RELAY_MODEL 或
 # CSSWITCH_OPENAI_MODEL 环境变量在 __main__ 里装配；留空 → None。
 RELAY_FORCE_MODEL = None
+# relay OpenAI-compatible fallback. For non-Claude model ids selected from a
+# relay's model list, route through base + /v1/chat/completions and translate.
+RELAY_OPENAI_URL = None
 # relay thinking 策略（来自模板 thinking_policy）：由 CSSWITCH_RELAY_THINKING 在 __main__ 装配。
 # None/"adaptive" → auto→adaptive（现状，如 MiniMax）；"enabled" → 强制 enabled（如 Kimi）。
 RELAY_THINKING = None
@@ -206,6 +209,13 @@ def _snap_relay_model(name):
         if mid.startswith(name + "-") or mid == name:
             return mid
     return name
+
+
+def _looks_like_anthropic_model(name):
+    if not name:
+        return True
+    n = str(name).lower()
+    return n.startswith(("claude-", "anthropic/claude-"))
 
 
 def resolve_model(name):
@@ -554,6 +564,10 @@ def openai_to_anthropic(resp, model_id):
     }
 
 
+def _openai_finish_to_anthropic(fr):
+    return {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}.get(fr, "end_turn")
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "csswitch-proxy"
@@ -582,6 +596,130 @@ class H(BaseHTTPRequestHandler):
             ensure_ascii=False) + "\n\n").encode()
         self.wfile.write(hex(len(frame))[2:].encode() + b"\r\n" + frame + b"\r\n")
         self.wfile.write(b"0\r\n\r\n")
+
+    def _openai_stream_to_anthropic(self, resp, model_id, label):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        msg_id = "msg_proxy"
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        blocks_started = False
+        text_index = None
+        tool_indices = {}
+        tool_names = {}
+        tool_args = {}
+        next_index = 0
+        stop_reason = "end_turn"
+
+        def start_message(mid=None):
+            nonlocal blocks_started, msg_id
+            if blocks_started:
+                return
+            if mid:
+                msg_id = mid
+            self._sse("message_start", {"type": "message_start", "message": {
+                "id": msg_id, "type": "message", "role": "assistant", "model": model_id,
+                "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage}})
+            self._sse("ping", {"type": "ping"})
+            blocks_started = True
+
+        def start_text_block():
+            nonlocal text_index, next_index
+            start_message()
+            if text_index is None:
+                text_index = next_index
+                next_index += 1
+                self._sse("content_block_start", {"type": "content_block_start", "index": text_index,
+                          "content_block": {"type": "text", "text": ""}})
+
+        def start_tool_block(pos, name=None, tcid=None):
+            nonlocal next_index
+            start_message()
+            if pos not in tool_indices:
+                idx = next_index
+                next_index += 1
+                tool_indices[pos] = idx
+                tool_names[pos] = name or "tool"
+                tool_args[pos] = ""
+                self._sse("content_block_start", {"type": "content_block_start", "index": idx,
+                          "content_block": {"type": "tool_use", "id": tcid or f"toolu_{pos}",
+                                            "name": tool_names[pos], "input": {}}})
+            elif name and tool_names.get(pos) == "tool":
+                tool_names[pos] = name
+
+        def close_blocks():
+            if text_index is not None:
+                self._sse("content_block_stop", {"type": "content_block_stop", "index": text_index})
+            for pos in sorted(tool_indices):
+                idx = tool_indices[pos]
+                raw_args = tool_args.get(pos, "")
+                try:
+                    parsed = json.loads(raw_args or "{}")
+                except Exception:
+                    parsed = {}
+                self._sse("content_block_delta", {"type": "content_block_delta", "index": idx,
+                          "delta": {"type": "input_json_delta",
+                                    "partial_json": json.dumps(parsed, ensure_ascii=False)}})
+                self._sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+
+        def handle_data(data):
+            nonlocal usage, stop_reason
+            if data == "[DONE]":
+                return False
+            try:
+                evt = json.loads(data)
+            except Exception:
+                return True
+            start_message(evt.get("id"))
+            if isinstance(evt.get("usage"), dict):
+                u = evt["usage"]
+                usage = {"input_tokens": u.get("prompt_tokens", 0),
+                         "output_tokens": u.get("completion_tokens", 0)}
+            choice = (evt.get("choices") or [{}])[0]
+            if choice.get("finish_reason"):
+                stop_reason = _openai_finish_to_anthropic(choice.get("finish_reason"))
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                start_text_block()
+                self._sse("content_block_delta", {"type": "content_block_delta", "index": text_index,
+                          "delta": {"type": "text_delta", "text": delta.get("content")}})
+            for tc in delta.get("tool_calls") or []:
+                pos = tc.get("index", 0)
+                fn = tc.get("function") or {}
+                start_tool_block(pos, fn.get("name"), tc.get("id"))
+                if fn.get("arguments"):
+                    tool_args[pos] = tool_args.get(pos, "") + fn.get("arguments")
+            return True
+
+        try:
+            buf = ""
+            done = False
+            for raw_chunk in resp:
+                buf += raw_chunk.decode("utf-8", "replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    if not handle_data(line[5:].strip()):
+                        done = True
+                        break
+                if done:
+                    break
+            if not done and buf.strip().startswith("data:"):
+                handle_data(buf.strip()[5:].strip())
+        finally:
+            if not blocks_started:
+                start_message()
+            close_blocks()
+            self._sse("message_delta", {"type": "message_delta",
+                      "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                      "usage": {"output_tokens": usage.get("output_tokens", 0)}})
+            self._sse("message_stop", {"type": "message_stop"})
+            self.wfile.write(b"0\r\n\r\n")
+            log(f"  <- {label} 流式转换 OK")
 
     def _auth_ok(self):
         if not AUTH_SECRET:
@@ -732,6 +870,9 @@ class H(BaseHTTPRequestHandler):
     def _handle_anthropic(self, areq):
         src = areq.get("model", "?")
         target = resolve_model(src)
+        if PROV_NAME == "relay" and RELAY_OPENAI_URL and not _looks_like_anthropic_model(target):
+            return self._handle_openai(areq, upstream_url=RELAY_OPENAI_URL,
+                                       route_label="relay/openai")
         body = dict(areq)
         body["model"] = target
         if body.get("max_tokens"):
@@ -846,24 +987,44 @@ class H(BaseHTTPRequestHandler):
                     "type": "api_error", "message": str(e)}})
 
     # ---- Qwen：翻译到 OpenAI，非流式取全再按需 SSE 回放 ----
-    def _handle_openai(self, areq):
+    def _handle_openai(self, areq, upstream_url=None, route_label=None):
         model_id = areq.get("model", "claude-sonnet-5")
         stream = bool(areq.get("stream"))
         oreq = anthropic_to_openai(areq)
         n_tools = len(oreq.get("tools", []))
+        label = route_label or PROV_NAME
         log(f"POST /v1/messages  {model_id}->{oreq['model']} stream={stream} tools={n_tools} "
-            f"msgs={len(oreq['messages'])}  (入站鉴权已剥离, {PROV_NAME})")
-        headers = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
+            f"msgs={len(oreq['messages'])}  (入站鉴权已剥离, {label})")
+        headers = {"Content-Type": "application/json"}
+        if route_label == "relay/openai":
+            headers.update(_upstream_auth_headers())
+        else:
+            headers["Authorization"] = f"Bearer {KEY}"
         data = json.dumps(oreq).encode()
         try:
-            raw, _ct = http_post(PROV["url"], data, headers)
+            if stream and route_label == "relay/openai":
+                oreq["stream"] = True
+                data = json.dumps(oreq).encode()
+                r, first, _ct = open_stream(upstream_url or PROV["url"], data, headers)
+                with r:
+                    class _FirstThenResp:
+                        def __init__(self, first_chunk, resp):
+                            self.first = first_chunk
+                            self.resp = resp
+                        def __iter__(self):
+                            if self.first:
+                                yield self.first
+                            yield from self.resp
+                    self._openai_stream_to_anthropic(_FirstThenResp(first, r), model_id, label)
+                return
+            raw, _ct = http_post(upstream_url or PROV["url"], data, headers)
             oresp = json.loads(raw)
             aresp = openai_to_anthropic(oresp, model_id)
             if stream:
                 self._replay_as_sse(aresp)
             else:
                 self._send_json(200, aresp)
-            log(f"  <- {PROV_NAME} OK (blocks={len(aresp['content'])} stop={aresp['stop_reason']})")
+            log(f"  <- {label} OK (blocks={len(aresp['content'])} stop={aresp['stop_reason']})")
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:400]
             log(f"  !! 上游 HTTP {e.code}: {detail}")
@@ -928,6 +1089,7 @@ if __name__ == "__main__":
     KEY = load_key(PROV, args)
     AUTH_SECRET = os.environ.get("CSSWITCH_AUTH_TOKEN") or args.auth_token
     # relay：按中转站 base_url 装配上游端点（base + /v1/messages、base + /v1/models）。
+    # 非 Claude 模型会通过 base + /v1/chat/completions 走 OpenAI-compatible fallback。
     if PROV_NAME == "relay":
         base = (os.environ.get("CSSWITCH_RELAY_BASE_URL") or args.relay_base or "").strip().rstrip("/")
         if not base or not re.match(r"^https?://", base):
@@ -937,6 +1099,7 @@ if __name__ == "__main__":
         PROV = dict(PROV)
         PROV["url"] = base + "/v1/messages"
         PROV["models_url"] = base + "/v1/models"
+        RELAY_OPENAI_URL = base + "/v1/chat/completions"
         forced = (os.environ.get("CSSWITCH_RELAY_MODEL") or "").strip()
         if forced:
             RELAY_FORCE_MODEL = forced
