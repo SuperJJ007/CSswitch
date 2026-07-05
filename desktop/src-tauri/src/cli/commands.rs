@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 
 use super::types::CliEnvelope;
 
-const BUNDLED_PROXY: &str = include_str!("../../../../proxy/csswitch_proxy.py");
-const BUNDLED_DSML_SHIM: &str = include_str!("../../../../proxy/dsml_shim.py");
+const BUNDLED_PROXY: &str = include_str!(concat!(env!("CSSWITCH_BUNDLED_PROXY_DIR"), "/csswitch_proxy.py"));
+const BUNDLED_DSML_SHIM: &str = include_str!(concat!(env!("CSSWITCH_BUNDLED_PROXY_DIR"), "/dsml_shim.py"));
 const MANAGED_PROXY_HINT: &str = "~/.csswitch/proxy/csswitch_proxy.py";
 
 // ============================================================================

@@ -96,6 +96,8 @@ jobs:
         with:
           tool: cross
       - name: Build Helper
+        env:
+          CSSWITCH_BUNDLED_PROXY_DIR: ${{ github.workspace }}/proxy
         run: |
           cd desktop/src-tauri
           cross build --bin csswitch-helper --no-default-features --release --target ${{ matrix.target }}
@@ -113,6 +115,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
       - name: Run Tests
         run: cd desktop/src-tauri && cargo test --lib
       - name: Run Helper Tests

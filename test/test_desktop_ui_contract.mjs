@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 const html = readFileSync(new URL("../desktop/src/index.html", import.meta.url), "utf8");
@@ -9,6 +9,9 @@ const remoteSsh = readFileSync(new URL("../desktop/src-tauri/src/remote/ssh.rs",
 const helperCommands = readFileSync(new URL("../desktop/src-tauri/src/cli/commands.rs", import.meta.url), "utf8");
 const tauriConf = readFileSync(new URL("../desktop/src-tauri/tauri.conf.json", import.meta.url), "utf8");
 const buildWorkflow = readFileSync(new URL("../.github/workflows/build.yml", import.meta.url), "utf8");
+const tauriBuildRs = readFileSync(new URL("../desktop/src-tauri/build.rs", import.meta.url), "utf8");
+const crossTomlUrl = new URL("../desktop/src-tauri/Cross.toml", import.meta.url);
+const crossToml = existsSync(crossTomlUrl) ? readFileSync(crossTomlUrl, "utf8") : "";
 
 function remoteStartProxyBody() {
   const m = remoteCommands.match(/pub fn remote_start_proxy[\s\S]*?\n}\n\n\/\/\/ 停止远程代理/);
@@ -146,9 +149,47 @@ test("linux helper release workflow uses cross for musl target builds", () => {
   assert.match(body, /fail-fast: false/);
   assert.match(body, /taiki-e\/install-action@v2/);
   assert.match(body, /tool: cross/);
+  assert.match(body, /CSSWITCH_BUNDLED_PROXY_DIR: \$\{\{ github\.workspace \}\}\/proxy/);
   assert.match(body, /cross build --bin csswitch-helper --no-default-features --release --target \$\{\{ matrix\.target \}\}/);
   assert.doesNotMatch(body, /cargo build --bin csswitch-helper --no-default-features --release --target \$\{\{ matrix\.target \}\}/);
   assert.doesNotMatch(body, /apt-get install -y musl-tools/);
+});
+
+test("linux helper cross build mounts the bundled proxy directory into the container", () => {
+  assert.match(crossToml, /\[build\.env\]/);
+  assert.match(crossToml, /volumes\s*=\s*\[[\s\S]*"CSSWITCH_BUNDLED_PROXY_DIR"[\s\S]*\]/);
+  assert.match(crossToml, /passthrough\s*=\s*\[[\s\S]*"CSSWITCH_BUNDLED_PROXY_DIR"[\s\S]*\]/);
+  assert.match(tauriBuildRs, /CSSWITCH_BUNDLED_PROXY_DIR/);
+});
+
+test("tauri build script validates bundled proxy resources with a clear error", () => {
+  assert.match(tauriBuildRs, /fn require_bundled_proxy_file/);
+  assert.match(tauriBuildRs, /csswitch_proxy\.py/);
+  assert.match(tauriBuildRs, /dsml_shim\.py/);
+  assert.match(tauriBuildRs, /\.is_file\(\)/);
+  assert.match(tauriBuildRs, /panic!\([\s\S]*CSSWITCH_BUNDLED_PROXY_DIR/);
+});
+
+test("linux test workflow installs Tauri system dependencies before cargo tests", () => {
+  const body = workflowJob("test");
+  assert.match(body, /Install Linux desktop dependencies/);
+  assert.ok(
+    body.indexOf("Install Linux desktop dependencies") < body.indexOf("Run Tests"),
+    "Linux desktop dependencies should be installed before Rust tests compile Tauri crates",
+  );
+  for (const pkg of [
+    "libwebkit2gtk-4.1-dev",
+    "build-essential",
+    "curl",
+    "wget",
+    "file",
+    "libxdo-dev",
+    "libssl-dev",
+    "libayatana-appindicator3-dev",
+    "librsvg2-dev",
+  ]) {
+    assert.match(body, new RegExp(pkg.replaceAll(".", "\\.")));
+  }
 });
 
 test("macOS desktop builds bundle the linux helper assets too", () => {
@@ -227,8 +268,14 @@ test("remote helper sandbox start binds Science to loopback for SSH tunnel acces
 });
 
 test("remote helper carries and installs the managed proxy script", () => {
-  assert.match(helperCommands, /include_str!\("\.\.\/\.\.\/\.\.\/\.\.\/proxy\/csswitch_proxy\.py"\)/);
-  assert.match(helperCommands, /include_str!\("\.\.\/\.\.\/\.\.\/\.\.\/proxy\/dsml_shim\.py"\)/);
+  assert.match(
+    helperCommands,
+    /include_str!\(concat!\([\s\S]*env!\("CSSWITCH_BUNDLED_PROXY_DIR"\)[\s\S]*"\/csswitch_proxy\.py"[\s\S]*\)\)/,
+  );
+  assert.match(
+    helperCommands,
+    /include_str!\(concat!\([\s\S]*env!\("CSSWITCH_BUNDLED_PROXY_DIR"\)[\s\S]*"\/dsml_shim\.py"[\s\S]*\)\)/,
+  );
   assert.match(helperCommands, /fn ensure_managed_proxy_script\(\) -> Result<PathBuf, String>/);
   assert.match(helperCommands, /"~\/\.csswitch\/proxy\/csswitch_proxy\.py"/);
   assert.match(helperCommands, /dsml_shim\.py/);

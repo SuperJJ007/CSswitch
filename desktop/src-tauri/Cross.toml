@@ -1,0 +1,3 @@
+[build.env]
+passthrough = ["CSSWITCH_BUNDLED_PROXY_DIR"]
+volumes = ["CSSWITCH_BUNDLED_PROXY_DIR"]

@@ -37,3 +37,6 @@ findings/auto-maint/*
 #ai
 .claude 
 .agent
+
+docs/my_docs/
+docs/superpowers/
