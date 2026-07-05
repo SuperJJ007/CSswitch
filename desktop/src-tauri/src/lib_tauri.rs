@@ -3,10 +3,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+// 跨平台文件权限操作（Unix 设权限，Windows no-op）。
+use crate::fs_ext::{open_log_file, set_file_permissions};
 use serde::Deserialize;
 use serde_json::json;
 use tauri::{Manager, State};
 
+/// Claude Science 二进制路径，仅 macOS 本地模式有效。
+#[cfg(target_os = "macos")]
 const SCIENCE_BIN: &str = "/Applications/Claude Science.app/Contents/Resources/bin/claude-science";
 
 #[derive(Default)]
@@ -14,104 +18,44 @@ struct AppState {
     proxy: Option<Child>,
     proxy_port: u16,
     secret: String,
-    /// 褰撳墠浠ｇ悊杩涚▼鎵€鐢?adapter 鍚嶏紙deepseek | qwen | relay锛夛紱鐢ㄤ簬鍋ュ悍澶嶇敤鍒ゅ畾銆?    provider: String,
-    /// 褰撳墠浠ｇ悊杩涚▼鎵€鐢?key 鐨勯潪鍔犲瘑鎸囩汗锛堜粎鍐呭瓨銆佺粷涓嶈惤鐩?鎵撳嵃锛夈€?    /// 鎹?key/鎹笂娓稿悗鎸囩汗鍙樺寲 鈫?瑙﹀彂閲嶅惎锛岄伩鍏嶅鐢ㄥ甫鏃ч厤缃殑浠ｇ悊銆?    key_fp: u64,
+    provider: String,
+    /// 当前代理进程所用 key 的非加密指纹（仅内存、绝不落盘/打印）。
+    /// 换 key 后指纹变化 → 触发重启，避免复用带旧 key 的代理。
+    key_fp: u64,
     sandbox: Option<Child>,
     sandbox_port: u16,
     sandbox_url: Option<String>,
 }
 
-/// key 鐨勯潪鍔犲瘑鎸囩汗锛圫ipHash锛夛紝鍙敤浜庡垽鏂€岄厤缃槸鍚﹀彉浜嗐€嶃€傜粷涓嶆墦鍗般€佺粷涓嶈惤鐩樸€?fn key_fingerprint(s: &str) -> u64 {
+/// key 的非加密指纹（SipHash），只用于判断「key 是否变了」。绝不打印、绝不落盘。
+fn key_fingerprint(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
 }
 
-// ---------- adapter / profile 杩愯鍏冧俊鎭?----------
-/// adapter 鈫?璇?adapter 鏈熸湜鐨?key 鐜鍙橀噺鍚嶏紙python 浠ｇ悊渚?PROVIDERS[...]["key_env"]锛夈€?fn key_env_for_adapter(adapter: &str) -> &'static str {
-    match adapter {
-        "deepseek" => "DEEPSEEK_API_KEY",
+// ---------- provider 元信息 ----------
+fn key_env(provider: &str) -> &'static str {
+    match provider {
         "qwen" => "DASHSCOPE_API_KEY",
-        _ => "CSSWITCH_RELAY_KEY", // relay / 鍏滃簳
+        _ => "DEEPSEEK_API_KEY",
     }
 }
 
-/// 浠庝竴鏉?profile 娲剧敓鍑鸿捣浠ｇ悊闇€瑕佺殑鍏ㄩ儴鍙傛暟锛堢函鍑芥暟锛屼究浜庢祴璇曪級銆?struct ProxyLaunch {
-    adapter: String,
-    base_url: String,
-    model: String,
-    key: String,
-    key_env: &'static str,
-    thinking_policy: &'static str,
-}
-
-fn proxy_args_for(p: &config::Profile) -> ProxyLaunch {
-    let adapter = templates::adapter_for(&p.template_id).to_string();
-    let key_env = key_env_for_adapter(&adapter);
-    ProxyLaunch {
-        adapter,
-        base_url: p.base_url.clone(),
-        model: p.model.clone(),
-        key: p.api_key.clone(),
-        key_env,
-        thinking_policy: templates::thinking_policy_for(&p.template_id),
+fn upstream_host(provider: &str) -> &'static str {
+    match provider {
+        "qwen" => "dashscope.aliyuncs.com",
+        _ => "api.deepseek.com",
     }
 }
 
-/// 鏈建浠呮敮鎸?anthropic / openai_chat锛涘叾浣欒繘 schema 浣嗘縺娲绘嫆缁濓紙寰呰建閬?2锛歊ust 浠ｇ悊锛夈€?fn assert_format_supported(p: &config::Profile) -> Result<(), String> {
-    match p.api_format.as_str() {
-        "anthropic" | "openai_chat" => Ok(()),
-        other => Err(format!(
-            "api_format `{other}` 鏆備笉鏀寔锛堝緟 Rust 浠ｇ悊锛夛紝璇烽€?anthropic 鎴?openai_chat銆?
-        )),
-    }
-}
-
-/// deepseek/qwen 璧板悇鑷浐瀹氬畼鏂圭鐐癸紙python 渚х‖缂栫爜锛夛紱鍏朵綑 = relay 瀹舵棌锛岄渶甯?base_url銆?fn is_native_adapter(adapter: &str) -> bool {
-    adapter == "deepseek" || adapter == "qwen"
-}
-
-/// 涓婃父涓绘満鍚嶏紙渚?status 涓婃父鐏仛 TCP 鍙揪鎬ф帰娴嬶級銆俽elay 瀹舵棌浠庡叾 base_url 瑙ｆ瀽銆?fn upstream_host(adapter: &str, base_url: &str) -> String {
-    match adapter {
-        "deepseek" => "api.deepseek.com".to_string(),
-        "qwen" => "dashscope.aliyuncs.com".to_string(),
-        _ => parse_host(base_url).unwrap_or_default(),
-    }
-}
-
-/// 浠?`http(s)://host[:port]/path` 閲屾娊鍑?host銆傝В鏋愪笉鍑鸿繑鍥?None锛堜笉寮?url crate锛夈€?fn parse_host(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let host = rest
-        .split(['/', ':', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
-    }
-}
-
-/// 鍒ゆ柇妯″瀷 id 鏄惁浼氬钩閾鸿繘 Science 閫夋嫨鍣ㄤ富鍒楄〃锛坈laude-{opus|sonnet|haiku}-<鏁板瓧鈥?锛夈€?/// 浠呯敤浜庛€岃幏鍙栨ā鍨嬨€嶇粨鏋滄帓搴忥紙涓诲垪琛ㄩ」鎺掑墠锛夛紝闈為壌鏉冭矾寰勩€?fn is_main_list_model(id: &str) -> bool {
-    for fam in ["claude-opus-", "claude-sonnet-", "claude-haiku-"] {
-        if let Some(rest) = id.strip_prefix(fam) {
-            return rest
-                .chars()
-                .next()
-                .map(|c| c.is_ascii_digit())
-                .unwrap_or(false);
-        }
-    }
-    false
-}
-
-// ---------- 璺緞涓庢棩蹇?----------
-/// 瀹氫綅 CSSwitch 浠撳簱鏍癸紙鍚?proxy/csswitch_proxy.py锛夈€備紭鍏?CSSWITCH_REPO锛?/// 鍚﹀垯浠庡彲鎵ц鏂囦欢閫愮骇涓婃函銆傛壘涓嶅埌杩斿洖 None銆?fn repo_root() -> Option<PathBuf> {
+// ---------- 路径与日志 ----------
+/// 定位 CSSwitch 仓库根（含 proxy/csswitch_proxy.py）。优先 CSSWITCH_REPO，
+/// 否则从可执行文件与当前目录逐级上溯。找不到返回 None。
+fn repo_root() -> Option<PathBuf> {
     let marker = Path::new("proxy/csswitch_proxy.py");
+    // 显式指定优先：规范化后再判定，避免相对/软链歧义。
     if let Some(r) = std::env::var_os("CSSWITCH_REPO") {
         if let Ok(p) = std::fs::canonicalize(PathBuf::from(r)) {
             if p.join(marker).is_file() {
@@ -119,8 +63,9 @@ fn proxy_args_for(p: &config::Profile) -> ProxyLaunch {
             }
         }
     }
-    // 鍙粠銆愬彲鎵ц鏂囦欢浣嶇疆銆戜笂婧€傚埢鎰忎笉鐪?current_dir锛氬惎鍔ㄧ洰褰曞彲琚奖鍝嶏紝
-    // 鑻ユ嵁姝ゆ壘鍒板埆澶勭殑 csswitch_proxy.py锛屼細鎶婂甫 key 鐨勭幆澧冧氦缁欐潵璺笉鏄庣殑鑴氭湰銆?    if let Ok(exe) = std::env::current_exe() {
+    // 否则只从【可执行文件位置】上溯。刻意不看 current_dir：启动目录可被影响，
+    // 若据此找到别处的 csswitch_proxy.py，会把带 key 的环境交给来路不明的脚本。
+    if let Ok(exe) = std::env::current_exe() {
         let mut dir: Option<&Path> = exe.parent();
         while let Some(d) = dir {
             if d.join(marker).is_file() {
@@ -132,17 +77,27 @@ fn proxy_args_for(p: &config::Profile) -> ProxyLaunch {
     None
 }
 
-/// 瀹氫綅銆岃祫婧愭牴銆嶏紙鍚?proxy/銆乻cripts/锛夈€傛墦鍖呮垚 .app 鍚?bundle 杩?`Contents/Resources`锛?/// 寮€鍙戞€佸垯鍥為€€鍒颁粨搴撴牴銆傛壘涓嶅埌杩斿洖 None銆?fn asset_root(app: &tauri::AppHandle) -> Option<PathBuf> {
+/// 定位「资源根」（含 proxy/、scripts/）。打包成 .app 后，proxy/ 与 scripts/ 被
+/// bundle 进 `Contents/Resources`；开发态则回退到仓库根。找不到返回 None。
+/// 这样从 Finder 启动的正式 .app 也能找到代理脚本（修 P1-1）。
+fn asset_root(app: &tauri::AppHandle) -> Option<PathBuf> {
     let marker = Path::new("proxy/csswitch_proxy.py");
+    // 打包态：Tauri 资源目录。
     if let Ok(res) = app.path().resource_dir() {
         if res.join(marker).is_file() {
             return Some(res);
         }
     }
+    // 开发态：从可执行文件位置上溯（见 repo_root 注释，刻意不看 current_dir）。
     repo_root()
 }
 
-/// 娌欑鍙啓宸ヤ綔鐩綍锛堢嫭绔?HOME锛夛細`~/.csswitch/sandbox/home`銆?fn sandbox_home() -> PathBuf {
+/// 沙箱可写工作目录（独立 HOME）：`~/.csswitch/sandbox/home`。
+/// 仅 macOS 本地模式有效（依赖 SCIENCE_BIN 和沙箱脚本）。
+/// 打包后资源目录只读，沙箱状态（虚拟登录、克隆运行时、钥匙串）必须落在可写处；
+/// 该路径同时交给 launch/stop 脚本（`SANDBOX_HOME` 环境变量）与取 URL 逻辑，三者一致。
+#[cfg(target_os = "macos")]
+fn sandbox_home() -> PathBuf {
     config::default_dir().join("sandbox").join("home")
 }
 
@@ -150,35 +105,27 @@ fn log_path(name: &str) -> PathBuf {
     config::default_dir().join("logs").join(name)
 }
 
-/// `O_NOFOLLOW` 鐨勫钩鍙板父閲忥紙鏈」鐩笉寮?libc锛夈€俶acOS/BSD=0x0100锛孡inux=0x20000銆?const fn libc_o_nofollow() -> i32 {
-    if cfg!(target_os = "linux") {
-        0x2_0000
-    } else {
-        0x0100
-    }
-}
-
-/// 鎵撳紑锛坱runcate锛変竴涓瓙杩涚▼鏃ュ織鏂囦欢锛岀埗鐩綍 0700銆佹枃浠?0600锛堥槻鍚屾満鍏跺畠鐢ㄦ埛璇诲埌 secret 灏惧反锛夈€?fn open_log(name: &str) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+/// 打开（truncate）一个子进程日志文件，父目录 0700、文件 0600（防同机其它用户读到 secret 尾巴）。
+/// 跨平台：Unix 用 `O_NOFOLLOW` 防符号链接跟随；Windows 无此概念，仅做普通 open。
+/// 注意：symlink 检查 `config::assert_not_symlink` 本身在所有平台可用
+/// （`std::fs::symlink_metadata` + `is_symlink()` 是跨平台的）。
+fn open_log(name: &str) -> std::io::Result<std::fs::File> {
     let p = log_path(name);
     if let Some(parent) = p.parent() {
         config::assert_not_symlink(parent)?;
         std::fs::create_dir_all(parent)?;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        let _ = set_file_permissions(parent, 0o700);
     }
+    // 日志路径不许是符号链接：否则 truncate+写会覆盖链接目标文件（修 P2-1）。
     config::assert_not_symlink(&p)?;
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc_o_nofollow())
-        .open(&p)?;
-    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    let f = open_log_file(&p)?;
+    // 文件已存在时 mode 不复位，显式再夹一次。
+    let _ = set_file_permissions(&p, 0o600);
     Ok(f)
 }
 
-/// 鎶婂瓧绗︿覆閲岀殑 secret 鏄庢枃鏇挎崲鎴?****锛岀敤浜庝换浣曡鍥炴樉缁欏墠绔殑閿欒灏惧反銆?fn redact(s: &str, secret: &str) -> String {
+/// 把字符串里的 secret 明文替换成 ****，用于任何要回显给前端的错误尾巴。
+fn redact(s: &str, secret: &str) -> String {
     if secret.is_empty() {
         s.to_string()
     } else {
@@ -203,23 +150,56 @@ fn kill_child(slot: &mut Option<Child>) {
     }
 }
 
-/// 鍙栭攣骞朵粠 poison 涓仮澶嶏細鏌愮嚎绋嬫寔閿佹椂 panic 涓嶅簲鎶婃暣涓?app 鍗℃銆?fn lock(m: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
+/// 取锁并从 poison 中恢复：某线程持锁时 panic 不应把整个 app 卡死。
+fn lock(m: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 鐢ㄧ郴缁熸祻瑙堝櫒鎵撳紑 URL锛坢acOS `open`锛夈€傛牎楠岄€€鍑虹爜锛氶潪闆惰涓哄け璐ワ紙P2c锛夈€?fn open_in_browser(url: &str) -> Result<(), String> {
-    let st = Command::new("open")
-        .arg(url)
-        .status()
-        .map_err(|e| format!("鎵撳紑娴忚鍣ㄥけ璐ワ細{e}"))?;
-    if !st.success() {
-        return Err(format!("open 闈為浂閫€鍑猴紙{:?}锛?, st.code()));
+/// 用系统浏览器打开 URL。
+/// 跨平台：macOS 用 `open` 命令，Windows 用 `cmd /c start`（或 Tauri opener 插件）。
+/// 校验退出码：非零视为失败（P2c）。
+fn open_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let st = Command::new("open")
+            .arg(url)
+            .status()
+            .map_err(|e| format!("打开浏览器失败：{e}"))?;
+        if !st.success() {
+            return Err(format!("open 非零退出（{:?}）", st.code()));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let st = Command::new("cmd")
+            .args(["/c", "start", url])
+            .status()
+            .map_err(|e| format!("打开浏览器失败：{e}"))?;
+        if !st.success() {
+            return Err(format!("start 非零退出（{:?}）", st.code()));
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Linux 等其他平台：尝试 xdg-open
+        let st = Command::new("xdg-open")
+            .arg(url)
+            .status()
+            .map_err(|e| format!("打开浏览器失败：{e}"))?;
+        if !st.success() {
+            return Err(format!("xdg-open 非零退出（{:?}）", st.code()));
+        }
     }
     Ok(())
 }
 
-// ---------- 浠ｇ悊鐢熷懡鍛ㄦ湡鏍稿績 ----------
-/// 杞箟 ERE 鍏冨瓧绗︼紝璁╄矾寰勬寜瀛楅潰鍙備笌 `pkill -f` 鍖归厤銆?fn ere_escape(s: &str) -> String {
+// ---------- 代理生命周期核心 ----------
+/// 转义 ERE（extended regex）元字符，让路径按字面参与 `pkill -f` 匹配（避免路径里的
+/// `.`/`(`/`[` 等被当作正则、误配或失配）。
+/// 仅在 Unix 平台的 ensure_proxy 中被调用（pkill 为 Unix 专有）。
+/// 非 Unix 平台未使用，保留以备将来跨平台进程管理需求。
+#[allow(dead_code)]
+fn ere_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         if "\\.^$*+?()[]{}|".contains(c) {
@@ -230,152 +210,97 @@ fn kill_child(slot: &mut Option<Child>) {
     out
 }
 
-/// 鏈 ensure_proxy 瀵逛唬鐞嗗仛浜嗕粈涔堬紙渚涗竴閿嵁瀹炴彁绀猴級銆?#[derive(Clone, Copy, PartialEq)]
+/// 本次 ensure_proxy 对代理做了什么（供一键据实提示）。
+#[derive(Clone, Copy, PartialEq)]
 enum ProxyAction {
-    Reused,    // 绔彛+adapter+key 鎸囩汗涓€鑷翠笖鍋ュ悍锛屽師鏍峰鐢?    Restarted, // 棣栨璧?/ 鎹?key / 鎹?profile / 涓嶅仴搴凤紝閲嶈捣浜嗕唬鐞?}
-
-/// 鍒囨崲浜嬪姟鐨勬彁浜?鍥炴粴鍐崇瓥锛堢函鍑芥暟锛宻pec 搂7锛夈€俵ive 璺緞闅惧仛纭畾鎬у崟娴嬶紝鏁呮妸鍐崇瓥鎶藉嚭鍗曠嫭娴嬨€?#[derive(Debug, PartialEq)]
-enum SwitchOutcome {
-    Commit,           // scratch 鏍￠獙杩?+ 姝ｅ紡浠ｇ悊鎺㈡椿鍋ュ悍 鈫?鎻愪氦 active_id
-    RollbackToOld,    // scratch 杩囦絾姝ｅ紡浠ｇ悊璧?鎺㈡椿澶辫触 鈫?鏉€鍊欓€夈€佹仮澶嶆棫浠ｇ悊銆佷笉鎻愪氦
-    AbortBeforeStart, // scratch 鏍￠獙澶辫触 鈫?鏍规湰娌¤捣姝ｅ紡浠ｇ悊銆佹棫鎬侀浂鏀瑰姩
+    Reused,    // 端口+provider+key 指纹一致且健康，原样复用
+    Restarted, // 首次起 / 换 key / 换 provider / 不健康，重起了代理
 }
 
-/// 缁欏畾銆屽€欓€?scratch 鏍￠獙缁撴灉銆嶄笌銆屾寮忎唬鐞嗘帰娲荤粨鏋溿€嶏紝鍐冲畾鍒囨崲浜嬪姟璧板悜銆?fn decide_switch(scratch_ok: bool, real_healthy: bool) -> SwitchOutcome {
-    if !scratch_ok {
-        return SwitchOutcome::AbortBeforeStart;
-    }
-    if real_healthy {
-        SwitchOutcome::Commit
-    } else {
-        SwitchOutcome::RollbackToOld
-    }
-}
-
-/// 鎺㈡椿缁撴潫鍥為攣鍚庢槸鍚﹀彲鍐欏洖 `st.proxy`锛歡eneration 鏈鍙栦唬銆愪笖銆憇ecret 浠嶆槸鏈鍚姩鐨勩€?/// 鎶芥垚绾嚱鏁颁究浜庣‘瀹氭€у崟娴嬶紙gen 鍚?寮?脳 secret 鍚?寮?4 缁勫悎锛夈€?/// secret 鍚堝彇闃层€屽喎鍚姩鍙岃捣銆佷袱涓笉鍚?secret銆乬eneration 鍗寸浉绛夈€嶇殑绐勭獥锛氬彟璧疯嫢鐢ㄤ笉鍚?secret
-/// 閲嶇疆浜嗘Ы浣嶏紝鏈灏变笉璇ユ嬁鏃?child 瑕嗙洊瀹冿紙璧蜂唬鐞嗗墠浼氭妸 `st.secret` 棰勭疆鎴愭湰娆?secret锛屾晠鍚堟硶鍚姩涓婃亽鐪燂級銆?fn should_write_back(gen_captured: u64, gen_now: u64, st_secret: &str, my_secret: &str) -> bool {
-    gen_captured == gen_now && st_secret == my_secret
-}
-
-/// 纭繚浠ｇ悊鍦ㄨ窇涓斿仴搴凤紱杩斿洖 (绔彛, secret, 鏈鍔ㄤ綔)銆傚箓绛夛細宸插仴搴峰垯澶嶇敤銆?/// 璇汇€愮敓鏁?profile銆戞淳鐢?adapter/base_url/model/key锛屽鎵?[`start_proxy_for`]銆?fn ensure_proxy(
+/// 确保代理在跑且健康；返回 (端口, secret, 本次动作)。幂等：已健康则复用。
+fn ensure_proxy(
     app: &tauri::AppHandle,
     state: &State<'_, Mutex<AppState>>,
-    lifecycle: &lifecycle::Lifecycle,
 ) -> Result<(u16, String, ProxyAction), String> {
-    let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
-    let profile = cfg
-        .active_profile()
-        .cloned()
-        .ok_or("鏈厤缃敓鏁?profile锛岃鍏堝湪闈㈡澘閫夋嫨鎴栨柊寤轰竴鏉￠厤缃€?)?;
-    start_proxy_for(app, state, lifecycle, &profile)
-}
-
-/// 鎺㈡椿瓒呮椂鐨勫師鍥犳帾杈烇紙绾嚱鏁帮紝淇湡鏈?P2锛夛細鏈湴 `/health` 涓嶉獙涓婃父 key锛屾晠鎺㈡椿瓒呮椂涓?key 鏈夋晥鎬?/// 鏃犲叧銆傛棩蹇楀嚭鐜扮粦瀹氬け璐ワ紙Address already in use / EADDRINUSE锛夆啋 鏄庣‘鎶ョ鍙ｅ崰鐢紱鍚﹀垯鎶ャ€屾帰娲昏秴鏃躲€?/// 锛堝涓?python 渚濊禆缂哄け / 鑴氭湰寮傚父锛夛紝缁濅笉鍐嶅惈绯婅銆屾垨 key 鏃犳晥銆嶃€?fn health_timeout_reason(port: u16, tail: &str) -> String {
-    let occupied = tail.contains("Address already in use")
-        || tail.contains("EADDRINUSE")
-        || tail.contains("Errno 48") // macOS EADDRINUSE
-        || tail.contains("Errno 98"); // Linux EADDRINUSE
-    if occupied {
-        format!("绔彛 {port} 宸茶鍗犵敤锛屾崲涓鍙ｆ垨鍏堝仠鎺夊崰鐢ㄨ繘绋嬪悗閲嶈瘯銆?)
-    } else {
-        format!(
-            "浠ｇ悊璧峰悗鎺㈡椿瓒呮椂锛堢鍙?{port}锛夛細澶氫负 python 渚濊禆缂哄け鎴栦唬鐞嗚剼鏈紓甯革紝璇锋煡鐪嬩唬鐞嗘棩蹇椼€?
-        )
-    }
-}
-
-/// 鐢ㄣ€愮粰瀹?profile銆戯紙涓嶈 active锛夎捣浠ｇ悊骞舵帰娲伙紱杩斿洖 (绔彛, secret, 鍔ㄤ綔)銆?///
-/// 骞跺彂姝ｇ‘鎬э紙spec 搂8.1锛夛細
-/// - **璇?spawn 鍘熷瓙**锛氬鐢ㄥ垽瀹?/ 娓呮畫鐣?/ spawn 閮藉湪鍚屼竴鎶?AppState 閿佸唴锛涙柊 child 鍏堟彙鏈湴銆?/// - **鎺㈡椿閿佸**锛氭帰娲诲埢鎰忓湪 AppState 閿佸鍋氾紝涓嶉樆濉?status 绛夊懡浠ゃ€?/// - **generation token**锛歴pawn 鍓嶆姄 `gen`锛涙帰娲诲仴搴峰悗鍥為攣鏍￠獙 `current_generation()==gen`锛?///   鑻ユ湡闂磋娓?key/鍋?鍒?bump 杩?鈫?鏉€鎺夎嚜宸卞垰璧风殑 child銆?*涓嶅啓鍥?st.proxy**锛堜笉鎷挎棫閰嶇疆澶嶆椿锛夈€?///
-/// 鏈嚱鏁?*缁濅笉鍙栦覆琛屽櫒閿?*锛堣皟鐢ㄦ柟鍛戒护鎵嶅彇锛夛紝鏁呬笌鍛戒护灞傜殑 `with_serialized` 涓嶄細鑷閿併€?fn start_proxy_for(
-    app: &tauri::AppHandle,
-    state: &State<'_, Mutex<AppState>>,
-    lifecycle: &lifecycle::Lifecycle,
-    profile: &config::Profile,
-) -> Result<(u16, String, ProxyAction), String> {
-    assert_format_supported(profile)?;
-    let launch = proxy_args_for(profile);
-    if launch.key.is_empty() {
-        return Err(format!(
-            "銆寋}銆嶈繕娌″～ API key锛岃鍏堝湪闈㈡澘濉啓骞朵繚瀛樸€?,
-            profile.name
-        ));
-    }
-    let native = is_native_adapter(&launch.adapter);
-    if !native && launch.base_url.is_empty() {
-        return Err(
-            "璇ラ厤缃渶瑕佸～ base_url锛堝 https://your-relay/claude锛夛紝璇峰厛鍦ㄩ潰鏉垮～鍐欏苟淇濆瓨銆?.into(),
-        );
-    }
-    // 鎸囩汗骞跺叆 adapter+base_url+model+key锛氭崲鍏朵腑浠讳竴閮借Е鍙戜唬鐞嗛噸鍚紙閬垮厤澶嶇敤鏃т笂娓革級銆?    let key_fp = key_fingerprint(&format!(
-        "{}\n{}\n{}\n{}",
-        launch.adapter, launch.base_url, launch.model, launch.key
-    ));
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+    let provider = cfg.provider.clone();
+    let key = cfg
+        .key_for(&provider)
+        .ok_or_else(|| format!("缺少 {provider} 的 API key，请先在面板填写并保存。"))?;
+    let key_fp = key_fingerprint(&key);
     let port = cfg.proxy_port;
     let root = asset_root(app)
-        .ok_or("鎵句笉鍒颁唬鐞嗚剼鏈?proxy/csswitch_proxy.py锛堟墦鍖呰祫婧愭垨浠撳簱鏍瑰潎鏈懡涓級銆傚紑鍙戞€佸彲璁?CSSWITCH_REPO銆?)?;
+        .ok_or("找不到代理脚本 proxy/csswitch_proxy.py（打包资源或仓库根均未命中）。开发态可设 CSSWITCH_REPO。")?;
     let py = proc::find_exe("python3")
-        .ok_or("缂哄皯渚濊禆 python3锛堣捣缈昏瘧浠ｇ悊闇€瑕侊級銆傚凡鏌?PATH銆佸父瑙佺洰褰曚笌鐧诲綍 shell 浠嶆湭鎵惧埌锛沵acOS 涓€鑸嚜甯?/usr/bin/python3锛堣 Xcode 鍛戒护琛屽伐鍏凤細xcode-select --install锛夈€?)?;
+        .ok_or("缺少依赖 python3（起翻译代理需要）。已查 PATH、常见目录与登录 shell 仍未找到；macOS 一般自带 /usr/bin/python3（装 Xcode 命令行工具：xcode-select --install）。")?;
 
-    // path-secret锛?*鎸佷箙鍖栧鐢?*锛堝凡鍦ㄨ窇鐨勬矙绠辨妸璇?secret 宓岃繘浜?ANTHROPIC_BASE_URL锛?    // 鑻ユ瘡娆¤捣浠ｇ悊閮芥崲 secret锛屼唬鐞嗕竴閲嶅惎娌欑灏变細鎷挎棫 secret 鎵撳埌鏂颁唬鐞?鈫?鍏ㄩ儴 403锛夈€?    let secret = if !cfg.secret.is_empty() {
+    // path-secret：**持久化复用**。已在跑的沙箱把该 secret 嵌进了 ANTHROPIC_BASE_URL，
+    // 若每次起代理都换 secret，代理一重启（换 key/换 provider/重开 app）沙箱就会拿旧 secret
+    // 打到新代理 → 全部 403（修 P1：代理重启后沙箱失联）。故从 config 读稳定 secret，
+    // 首次为空才生成一次并写回，之后所有代理进程都复用它。
+    let secret = if !cfg.secret.is_empty() {
         cfg.secret.clone()
     } else {
-        let s = proc::gen_secret().map_err(|e| format!("鏃犳硶鐢熸垚瀹夊叏 secret锛歿e}"))?;
+        let s = proc::gen_secret().map_err(|e| format!("无法生成安全 secret：{e}"))?;
         let s2 = s.clone();
         config::update(&dir, move |c| c.secret = s2).map_err(|e| e.to_string())?;
         s
     };
 
-    // generation token锛?*spawn 鍓?*鎶撳綋鍓嶅彿锛涙帰娲诲悗鍥為攣姣斿锛岄槻琚洿鏅氭搷浣滃彇浠ｈ繕鍐欏洖銆?    let gen = lifecycle.current_generation();
-
-    // 銆屾鏌ュ鐢?鈫?娓呮畫鐣?鈫?璧疯繘绋嬨€嶅湪鍚屼竴鎶?AppState 閿佸唴瀹屾垚锛堣-spawn 鍘熷瓙锛夈€?    // 浣嗘柊 child 鍙彙鍦ㄦ湰鍦帮紝**鎺㈡椿鍋ュ悍 + generation 鏈彉**鎵嶅啓鍥?st.proxy銆?    let child = {
+    // 整个「检查 → 清残留 → 起进程 → 记账」在同一把锁内完成，避免并发双击时
+    // 两路都判定「没健康代理」各起一个、后者覆盖前者的 Child 句柄导致前者被孤儿泄漏。
+    {
         let mut st = lock(state);
-        // 骞傜瓑锛氬凡鍦ㄨ窇涓斿仴搴枫€佷笖銆愮鍙?+ adapter + key 鎸囩汗銆戦兘涓€鑷存墠澶嶇敤銆?        if st.proxy.is_some()
+        // 幂等：已在跑且健康、且【端口 + provider + key 指纹】都一致才复用。
+        // 只比端口会在「换 provider / 换 key」后误用带旧配置的代理（修 P1-2）。
+        if st.proxy.is_some()
             && st.proxy_port == port
-            && st.provider == launch.adapter
+            && st.provider == provider
             && st.key_fp == key_fp
             && proc::http_health(port, Some(&st.secret), 500)
         {
             return Ok((port, st.secret.clone(), ProxyAction::Reused));
         }
-        // 绔彛瑕佽缁欐柊杩涚▼ 鈫?鍏堟潃鎺夋棫鍗犵敤鑰咃紙st.proxy锛変笌鍚岀鍙ｅ鍎匡紱鏈熼棿 st.proxy=None銆?        kill_child(&mut st.proxy);
-        st.provider.clear();
-        st.key_fp = 0;
-        // 棰勭疆 st.secret = 鏈 secret锛坧ersistent path-secret锛夛細浣挎帰娲诲悗鍐欏洖闂ㄧ殑 secret 鍚堝彇
-        // 鍦ㄥ悎娉曞惎鍔ㄤ笂鎭掔湡锛涘彧鏈夊苟鍙戝彟璧风敤銆屼笉鍚?secret銆嶉噸缃簡瀹冿紝鎵嶄細鎸′笅鍐欏洖锛堝喎鍚姩鍙岃捣绐勭獥闃插尽锛夈€?        st.secret = secret.clone();
+        // 清残留（换端口/换 provider/换 key/不健康）。
+        kill_child(&mut st.proxy);
         let script = root.join("proxy/csswitch_proxy.py");
-        // 鍐嶆竻鎺変笂娆′細璇濋仐鐣欍€佺粦鍦ㄥ悓绔彛涓婄殑瀛ゅ効浠ｇ悊锛堝尮閰嶆湰瀹夎鐨勭粷瀵硅剼鏈矾寰?+ 绔彛锛夈€?        let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
-        let _ = Command::new("pkill").arg("-f").arg(&pat).status();
+        // 再清掉上次会话遗留、绑在同端口上的孤儿代理：崩溃或强退不会触发本进程的 kill，
+        // 孤儿仍占着端口 → 新代理绑不上（Errno 48）→ 探活超时。
+        // 收紧（P2 GPT 复审）：匹配【本安装的绝对脚本路径】+ 端口，而非仅「脚本名+端口」，
+        // 避免误杀另一个 checkout / 用户手启的同名代理。路径里的正则元字符转义按字面匹配。
+        // 跨平台：`pkill` 仅 Unix 可用；Windows 上孤儿进程由系统自动回收，且远程模式为主要场景。
+        #[cfg(unix)]
+        {
+            let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
+            let _ = Command::new("pkill").arg("-f").arg(&pat).status();
+        }
 
-        let logf = open_log("proxy.log").map_err(|e| format!("寤烘棩蹇楀け璐ワ細{e}"))?;
+        let logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-        let mut cmd = Command::new(&py);
-        cmd.arg(&script)
+        let child = Command::new(&py)
+            .arg(&script)
             .arg("--provider")
-            .arg(&launch.adapter)
+            .arg(&provider)
             .arg("--port")
             .arg(port.to_string())
             .arg("--auth-token")
             .arg(&secret)
-            // key 缁忕幆澧冨彉閲忔敞鍏ワ紝缁濅笉浣滀负鍛戒护琛屽弬鏁帮紙閬垮厤 ps 娉勯湶锛夈€?            .env(launch.key_env, &launch.key);
-        // relay 瀹舵棌锛歜ase_url + 閫変腑妯″瀷缁忕幆澧冨彉閲忎氦缁欎唬鐞嗭紙鍧囬潪瀵嗛挜锛屼絾涓?key 涓€鑷磋蛋 env锛夈€?        if !native {
-            cmd.env("CSSWITCH_RELAY_BASE_URL", &launch.base_url);
-            if !launch.model.is_empty() {
-                cmd.env("CSSWITCH_RELAY_MODEL", &launch.model);
-            }
-            if !launch.thinking_policy.is_empty() {
-                cmd.env("CSSWITCH_RELAY_THINKING", launch.thinking_policy);
-            }
-        }
-        cmd.stdout(Stdio::from(logf))
+            // key 经环境变量注入，绝不作为命令行参数（避免 ps 泄露）。
+            .env(key_env(&provider), &key)
+            .stdout(Stdio::from(logf))
             .stderr(Stdio::from(logf2))
             .spawn()
-            .map_err(|e| format!("鍚姩浠ｇ悊澶辫触锛歿e}"))?
-        // 娉ㄦ剰锛歝hild 鏈啓鍏?st.proxy鈥斺€旀帰娲婚€氳繃涓?generation 鏈彉鏃舵墠鍥為攣鍐欏洖銆?    };
+            .map_err(|e| format!("启动代理失败：{e}"))?;
+        st.proxy = Some(child);
+        st.proxy_port = port;
+        st.secret = secret.clone();
+        st.provider = provider;
+        st.key_fp = key_fp;
+    }
 
-    // 鎺㈡椿鏈€澶?~4s锛圓ppState 閿佸锛屼笉闃诲 status 绛夊懡浠わ級銆?    let mut ok = false;
+    // 探活最多 ~4s（锁外，不阻塞 status 等命令）。
+    let mut ok = false;
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(100));
         if proc::http_health(port, Some(&secret), 400) {
@@ -384,59 +309,62 @@ enum SwitchOutcome {
         }
     }
     if !ok {
-        // 鎺㈡椿澶辫触锛氭潃鎺夎嚜宸卞垰璧风殑 child锛堝畠浠庢湭鍐欏叆 st.proxy锛岀粷涓嶇暀瀛ゅ効锛夈€?        let mut c = child;
-        let _ = c.kill();
-        let _ = c.wait();
-        let tail = redact(&tail_file(&log_path("proxy.log"), 500), &secret);
-        // 鏈湴 /health 涓嶉獙涓婃父 key锛屾晠鎺㈡椿瓒呮椂涓?key 鏈夋晥鎬ф棤鍏筹細鎸夋棩蹇楀尯鍒嗙鍙ｅ崰鐢?vs 渚濊禆/鑴氭湰寮傚父
-        // 锛堜慨鐪熸満 P2锛氭棫鎺緸鍚硦璇淬€屾垨 key 鏃犳晥銆嶄細璇鐢ㄦ埛鍘绘煡 key锛夈€?        return Err(format!("{}\n{tail}", health_timeout_reason(port, &tail)));
-    }
-
-    // 鍋ュ悍 鈫?鍥?AppState 閿侊紝鏍￠獙 generation 鏈 bump 涓?secret 浠嶆槸鏈鐨勶紙鏈娓?key/鍋?鍒?骞跺彂鍙﹁捣鍙栦唬锛夋墠鍐欏洖銆?    {
         let mut st = lock(state);
-        if !should_write_back(gen, lifecycle.current_generation(), &st.secret, &secret) {
-            // 琚洿鏅氱殑鎿嶄綔鍙栦唬锛坓eneration 鍙橈級鎴栬骞跺彂鍙﹁捣鐢ㄤ笉鍚?secret 鍗犱簡妲斤細
-            // 鏉€鎺夎嚜宸卞垰璧风殑 child銆佷笉鍐欏洖 st.proxy锛堜笉鎷挎棫閰嶇疆澶嶆椿銆佷笉瑕嗙洊浠栦汉鐨勬Ы锛夈€?            let mut c = child;
-            let _ = c.kill();
-            let _ = c.wait();
-            return Err("浠ｇ悊鍚姩鏈熼棿閰嶇疆宸插彉鏇达紙琚洿鏅氱殑鎿嶄綔鍙栦唬锛夛紝鏈鍚姩鏈敓鏁堛€?.into());
+        // 只在仍是本次起的代理时才清（secret 匹配），避免误杀并发重启起来的新代理。
+        if st.secret == secret {
+            kill_child(&mut st.proxy);
         }
-        st.proxy = Some(child);
-        st.proxy_port = port;
-        st.secret = secret.clone();
-        st.provider = launch.adapter.clone();
-        st.key_fp = key_fp;
+        let tail = redact(&tail_file(&log_path("proxy.log"), 500), &secret);
+        return Err(format!(
+            "代理起后探活超时（端口 {port} 可能被占用，或 key 无效）。\n{tail}"
+        ));
     }
     Ok((port, secret, ProxyAction::Restarted))
 }
 
-/// 鍋滄矙绠便€傝繑鍥?Err 琛ㄧず stop 鑴氭湰闈為浂閫€鍑猴紙Science 鍙兘娌″仠骞插噣锛夛紝璋冪敤鏂规嵁姝ゅ瀹炴姤鍛娿€?fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
+/// 停沙箱。返回 Err 表示 stop 脚本非零退出（Science 可能没停干净），
+/// 调用方据此如实报告，不再无条件报「已停止」（修 P1 停止虚假成功）。
+/// 仅 macOS 有效；非 macOS 上本地沙箱不存在，直接清 state 返回 Ok。
+fn stop_sandbox_inner(_app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
+    // 沙箱由脚本以 --detached 起 Science，本进程持有的是脚本 child（已退出）。
+    // 真正停 Science 要调 stop 脚本（按 data-dir，绝不碰真实 8765）。
+    // 修 P1（GPT 复审）：定位不到资源根 / 停止脚本时，绝不静默返回成功——detached 沙箱
+    // 可能仍在跑，谎报「已停止」会让「切官方模式」误以为第三方链路已拆。此时如实报错。
+    #[cfg(not(target_os = "macos"))]
+    {
+        kill_child(&mut st.sandbox);
+        st.sandbox_url = None;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
     let mut err = None;
     match asset_root(app) {
         Some(root) => {
             let stop = root.join("scripts/stop-science-sandbox.sh");
             if stop.is_file() {
-                match Command::new("zsh")
+                match Command::new("zsh") // stop 脚本是 #!/bin/zsh（用了 ${VAR:A} realpath）
                     .arg(&stop)
+                    // 与 launch 时一致的可写沙箱 HOME，stop 才能按同一 data-dir 停对进程。
                     .env("SANDBOX_HOME", sandbox_home())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
                 {
                     Ok(s) if s.success() => {}
-                    Ok(s) => err = Some(format!("鍋滄娌欑鑴氭湰闈為浂閫€鍑猴紙{:?}锛夈€?, s.code())),
-                    Err(e) => err = Some(format!("璋冪敤鍋滄娌欑鑴氭湰澶辫触锛歿e}")),
+                    Ok(s) => err = Some(format!("停止沙箱脚本非零退出（{:?}）。", s.code())),
+                    Err(e) => err = Some(format!("调用停止沙箱脚本失败：{e}")),
                 }
             } else {
                 err = Some(format!(
-                    "鎵句笉鍒板仠姝㈣剼鏈?{}锛屾棤娉曠‘璁ゆ矙绠卞凡鍋滄锛堟矙绠卞彲鑳戒粛鍦ㄨ繍琛岋級銆?,
+                    "找不到停止脚本 {}，无法确认沙箱已停止（沙箱可能仍在运行）。",
                     stop.display()
                 ));
             }
         }
         None => {
             err = Some(
-                "瀹氫綅涓嶅埌璧勬簮鏍癸紝鍙栦笉鍒板仠姝㈣剼鏈紝鏃犳硶纭娌欑宸插仠姝紙娌欑鍙兘浠嶅湪杩愯锛夈€?
+                "定位不到资源根，取不到停止脚本，无法确认沙箱已停止（沙箱可能仍在运行）。"
                     .to_string(),
             );
         }
@@ -447,947 +375,230 @@ enum SwitchOutcome {
         Some(e) => Err(e),
         None => Ok(()),
     }
-}
-
-// ---------- 杩斿洖浣撶粍瑁咃紙绾嚱鏁帮紝渚夸簬娴嬭瘯锛?----------
-/// 缁勮 get_config 杩斿洖浣擄細profiles 鐨?key 鍙洖鎺╃爜锛屽叏 key 缁濅笉鍑哄悗绔€?fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> {
-    let cfg = config::load_from(dir).map_err(|e| e.to_string())?;
-    // 涓€娆℃€ц縼绉绘彁绀猴紙#9 鐢诧級锛氳鍑哄悗绔嬪嵆娓呯洏锛岄伩鍏嶆瘡娆?get_config 閲嶅鎻愮ず銆?    let notice = cfg.pending_notice.clone();
-    if notice.is_some() {
-        config::update(dir, |c| c.pending_notice = None).map_err(|e| e.to_string())?;
-    }
-    let profiles: Vec<serde_json::Value> = cfg
-        .profiles
-        .iter()
-        .map(|p| {
-            json!({
-                "id": p.id, "name": p.name, "template_id": p.template_id, "category": p.category,
-                "api_format": p.api_format, "base_url": p.base_url, "model": p.model,
-                "key": config::mask(&p.api_key), "icon": p.icon, "icon_color": p.icon_color,
-                "website_url": p.website_url, "sort_index": p.sort_index, "notes": p.notes,
-            })
-        })
-        .collect();
-    Ok(json!({
-        "schema_version": cfg.schema_version, "active_id": cfg.active_id, "profiles": profiles,
-        "templates": build_list_templates(), "proxy_port": cfg.proxy_port,
-        "sandbox_port": cfg.sandbox_port, "mode": cfg.mode, "pending_notice": notice,
-    }))
-}
-
-/// 妯℃澘娉ㄥ唽琛ㄤ氦鍓嶇閾?UI锛堝崟涓€鏉ユ簮锛屽墠绔笉澶嶅埗甯搁噺锛夈€?fn build_list_templates() -> Vec<serde_json::Value> {
-    templates::all()
-        .iter()
-        .map(|t| {
-            json!({
-                "id": t.id, "name": t.name, "category": t.category, "api_format": t.api_format,
-                "adapter": t.adapter, "base_url": t.base_url, "base_url_editable": t.base_url_editable,
-                "requires_model_override": t.requires_model_override,
-                "builtin_models": t.builtin_models, "icon": t.icon, "icon_color": t.icon_color,
-                "website_url": t.website_url,
-            })
-        })
-        .collect()
-}
-
-// ---------- profile CRUD 绾疄鐜帮紙*_inner锛屼究浜庣敤涓存椂 dir 鍗曟祴锛?----------
-fn create_profile_inner(
-    dir: &Path,
-    template_id: &str,
-    name: &str,
-    key: Option<&str>,
-    base_url_override: Option<&str>,
-    model: Option<&str>,
-) -> Result<String, String> {
-    let tpl = templates::by_id(template_id).ok_or_else(|| format!("鏈煡妯℃澘锛歿template_id}"))?;
-    let id = config::new_id();
-    let base_url = base_url_override
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| tpl.base_url.to_string());
-    let p = config::Profile {
-        id: id.clone(),
-        name: name.to_string(),
-        template_id: template_id.to_string(),
-        category: tpl.category.to_string(),
-        api_format: tpl.api_format.to_string(),
-        base_url,
-        api_key: key.unwrap_or("").to_string(),
-        model: model.unwrap_or("").to_string(),
-        website_url: Some(tpl.website_url.to_string()),
-        icon: Some(tpl.icon.to_string()),
-        icon_color: Some(tpl.icon_color.to_string()),
-        sort_index: Some(config::now_ms()),
-        created_at: Some(config::now_ms()),
-        notes: None,
-    };
-    assert_format_supported(&p)?; // custom 閫変簡涓嶆敮鎸佹牸寮忓垯鎷?                                  // 瀹堝崼锛堜慨 #9 P1-a锛夛細relay/鑷畾涔夌鐐瑰繀椤诲甫 model锛坒orce 鍓嶆彁锛夈€?    if relay_missing_model(tpl.adapter, &p.model) {
-        return Err("涓浆 / 鑷畾涔夌鐐瑰繀椤婚€夋嫨鎴栧～鍐欎竴涓ā鍨嬶紝鏈垱寤恒€?.to_string());
-    }
-    config::update(dir, |c| c.profiles.push(p)).map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-fn update_profile_metadata_inner(
-    dir: &Path,
-    id: &str,
-    name: &str,
-    notes: Option<&str>,
-) -> Result<(), String> {
-    // 鏈懡涓?id 鈫?Err锛堜笉闈欓粯 Ok锛屼慨 MP-1 Minor [4]锛夈€?    if config::load_from(dir)
-        .map_err(|e| e.to_string())?
-        .profile_by_id(id)
-        .is_none()
-    {
-        return Err(format!("鎵句笉鍒?profile锛歿id}"));
-    }
-    config::update(dir, |c| {
-        if let Some(p) = c.profile_by_id_mut(id) {
-            p.name = name.to_string();
-            p.notes = notes.map(str::to_string);
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-fn clear_profile_key_inner(dir: &Path, id: &str) -> Result<(), String> {
-    config::update(dir, |c| {
-        if let Some(p) = c.profile_by_id_mut(id) {
-            p.api_key.clear();
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    config::drop_rolling_backup(dir); // 娓?key 鍚庡噣鍖栨粴鍔ㄥ浠斤紝鏃ф槑鏂囦笉鍙粠 .bak 鎭㈠
-    Ok(())
-}
-
-fn delete_profile_inner(dir: &Path, id: &str) -> Result<(), String> {
-    config::update(dir, |c| {
-        c.profiles.retain(|p| p.id != id);
-        if c.active_id == id {
-            c.active_id.clear(); // 鍒?active 鈫?缃┖
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    config::drop_rolling_backup(dir);
-    Ok(())
-}
-
-fn update_profile_connection_inner(
-    dir: &Path,
-    id: &str,
-    base_url: Option<&str>,
-    api_format: Option<&str>,
-    model: Option<&str>,
-    key: Option<&str>,
-) -> Result<(), String> {
-    if let Some(fmt) = api_format {
-        let probe = config::Profile {
-            api_format: fmt.to_string(),
-            ..Default::default()
-        };
-        assert_format_supported(&probe)?;
-    }
-    // 鏈懡涓?id 鈫?Err锛堜笉闈欓粯 Ok锛屼慨 MP-1 Minor [4]锛夈€?    if config::load_from(dir)
-        .map_err(|e| e.to_string())?
-        .profile_by_id(id)
-        .is_none()
-    {
-        return Err(format!("鎵句笉鍒?profile锛歿id}"));
-    }
-    config::write_rolling_backup(dir).ok(); // 瑕嗙洊鍓嶇暀搴?    config::update(dir, |c| {
-        if let Some(p) = c.profile_by_id_mut(id) {
-            if let Some(u) = base_url {
-                p.base_url = u.to_string();
-            }
-            if let Some(f) = api_format {
-                p.api_format = f.to_string();
-            }
-            if let Some(m) = model {
-                p.model = m.to_string();
-            }
-            if let Some(k) = key {
-                if !k.is_empty() {
-                    p.api_key = k.to_string(); // 绌?涓嶆敼锛堢暀鍗犱綅涓嶈鐩栧凡瀛?key锛?                }
-            }
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    } // #[cfg(target_os = "macos")]
 }
 
 // ---------- Tauri commands ----------
 #[tauri::command]
 fn get_config() -> Result<serde_json::Value, String> {
-    build_get_config(&config::default_dir())
+    let dir = config::default_dir();
+    let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+    let mut keys = serde_json::Map::new();
+    for p in ["deepseek", "qwen"] {
+        let masked = cfg.key_for(p).map(|k| config::mask(&k)).unwrap_or_default();
+        keys.insert(p.to_string(), serde_json::Value::String(masked));
+    }
+    Ok(json!({
+        "provider": cfg.provider,
+        "proxy_port": cfg.proxy_port,
+        "sandbox_port": cfg.sandbox_port,
+        "mode": cfg.mode,
+        "keys": keys,
+    }))
 }
 
-/// 妯℃澘娉ㄥ唽琛ㄤ氦鍓嶇閾?UI锛堟柊寤哄悜瀵肩敤锛夈€?#[tauri::command]
-fn list_templates() -> Vec<serde_json::Value> {
-    build_list_templates()
-}
-
-/// 鍒囨崲杩愯妯″紡锛?proxy" 绗笁鏂?/ "official" 瀹樻柟锛夈€傚垏瀹樻柟瑕佸厛鎷嗙涓夋柟閾捐矾鎴愬姛鍐嶈惤鐩樸€?#[tauri::command]
+/// 切换运行模式（"proxy" 第三方 / "official" 官方）。
+///
+/// 切到「官方」是**真正的切换**，不只是改配置：先把第三方链路拆掉（停沙箱 Science + 杀代理、
+/// 清 secret）。否则代理/沙箱会留在后台空跑；且 macOS 单实例语义下，后面 `open` 可能只是聚焦
+/// 还活着的沙箱实例（带着改过的 ANTHROPIC_* 环境）而非官方实例，把用户误导回第三方链路。
+/// 切回「第三方」不自动起任何东西（仍需用户填 key 后点「一键开始」）。全程绝不碰真实 8765。
+#[tauri::command]
 fn set_mode(
     app: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
     mode: String,
 ) -> Result<(), String> {
     if mode != "proxy" && mode != "official" {
-        return Err(format!("鏈煡妯″紡锛歿mode}锛堝彧鏀寔 proxy / official锛夈€?));
+        return Err(format!("未知模式：{mode}（只支持 proxy / official）。"));
     }
-    // 缁忎覆琛屽櫒锛堜慨 P1-b锛夛細鍒囧畼鏂圭殑銆屾媶閾捐矾 + 钀界洏銆嶅繀椤讳笌銆屼竴閿紑濮嬨€嶇瓑浜掓枼锛屽惁鍒欎竴閿捣鍒颁竴鍗婃椂
-    // 鍒囧畼鏂逛細鍏堝仠閾捐矾銆佷竴閿殢鍚庡張鎶婃矙绠?OAuth 璧疯捣鏉?鈫?鏄剧ず瀹樻柟鍗存湁绗笁鏂规矙绠卞湪璺戙€俠ump_generation
-    // 浣滃簾浠讳綍鍦ㄩ€斿惎鍔紝闃茶鍋滃悗鍙堟嬁鏃ч厤缃啓鍥炶繍琛屾€併€?    lifecycle.with_serialized(|| {
-        let dir = config::default_dir();
-        if mode == "official" {
-            lifecycle.bump_generation();
+    let dir = config::default_dir();
+
+    // 事务化（修 P2 GPT 复审）：切官方要「先拆第三方链路，成功了再落盘 official」。
+    // 旧序（先落盘再拆）若拆沙箱失败，会留下「磁盘=official、UI/进程=第三方」的状态分裂
+    // （前端收到 Err 保持第三方 UI，磁盘却已是 official，下次启动就错进官方模式）。
+    // 现序保证：拆失败 → 不落盘、保持 proxy 模式、如实报错，磁盘/UI/进程一致。
+    if mode == "official" {
+        {
             let mut st = lock(&state);
+            // 先停沙箱：失败就在动代理/落盘之前中止，状态不分裂。
             stop_sandbox_inner(&app, &mut st).map_err(|e| {
-                format!("鍋滄娌欑澶辫触锛屾湭鍒囨崲鍒板畼鏂规ā寮忥細{e}锛堢湡瀹炲疄渚?8765 鏈彈褰卞搷锛?)
+                format!("停止沙箱失败，未切换到官方模式：{e}（真实实例 8765 未受影响）")
             })?;
             kill_child(&mut st.proxy);
             st.secret.clear();
-            st.provider.clear();
-            st.key_fp = 0;
         }
-        config::update(&dir, {
-            let mode = mode.clone();
-            move |c| c.mode = mode
-        })
-        .map_err(|e| e.to_string())?;
-        Ok(())
+    }
+    // 拆链已成功（或切回 proxy 无需拆）→ 落盘。
+    config::update(&dir, {
+        let mode = mode.clone();
+        move |c| c.mode = mode
     })
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
-/// 瀹樻柟妯″紡锛氬共鍑€鍦版墦寮€鐢ㄦ埛銆愮湡瀹炪€戠殑 Claude Science锛堜笉纰?澶嶅埗鐪熷疄鍑瘉锛屾姽鎺?ANTHROPIC_*锛夈€?#[tauri::command]
+/// 官方模式：干净地打开用户【真实】的 Claude Science（用户自己的官方登录与订阅）。
+/// 仅 macOS 有效（需本地安装 Claude Science.app）；在 Windows / 其他平台上返回明确提示，
+/// 引导用户使用远程模式管理服务器上的 Science。
+///
+/// 铁律：绝不碰/复制真实凭证；用 `open`（系统 LaunchServices 正常启动）而非注入环境变量，
+/// 并显式抹掉任何 `ANTHROPIC_*`，确保**不用改过的环境变量启动真实实例**（真实实例走它自己的
+/// 官方端点，不经本代理）。CSSwitch 只把用户交回官方客户端，不托管其登录。
+#[tauri::command]
 fn open_official() -> Result<(), String> {
-    let app_path = "/Applications/Claude Science.app";
-    let mut cmd = Command::new("open");
-    if Path::new(app_path).is_dir() {
-        cmd.arg(app_path);
-    } else {
-        cmd.arg("-a").arg("Claude Science");
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("本地模式「打开官方 Claude Science」仅支持 macOS。请使用远程模式连接到运行 Science 的 Linux 服务器。".into());
     }
-    cmd.env_remove("ANTHROPIC_BASE_URL")
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN");
-    match cmd.status() {
-        Ok(s) if s.success() => Ok(()),
-        Ok(_) => Err("鏈兘鎵撳紑 Claude Science銆傝纭宸插畨瑁呭畼鏂?Claude Science銆?.into()),
-        Err(e) => Err(format!("鎵撳紑瀹樻柟 Claude Science 澶辫触锛歿e}")),
+    #[cfg(target_os = "macos")]
+    {
+        let app_path = "/Applications/Claude Science.app";
+        let mut cmd = Command::new("open");
+        if Path::new(app_path).is_dir() {
+            cmd.arg(app_path);
+        } else {
+            cmd.arg("-a").arg("Claude Science");
+        }
+        // 防御性：即便 `open` 通常不向被启动 app 传本进程环境，也显式抹掉，杜绝把改过的
+        // ANTHROPIC_* 带进真实实例（铁律 3）。
+        cmd.env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN");
+        match cmd.status() {
+            Ok(s) if s.success() => Ok(()),
+            Ok(_) => Err("未能打开 Claude Science。请确认已安装官方 Claude Science。".into()),
+            Err(e) => Err(format!("打开官方 Claude Science 失败：{e}")),
+        }
     }
 }
 
 #[derive(Deserialize)]
 struct UiSettings {
+    provider: String,
     proxy_port: u16,
     sandbox_port: u16,
 }
 
-/// 绔彛鍙樻洿鏄惁闇€瑕佹媶鎺夌幇鏈夐摼璺紙绾嚱鏁帮紝P1-c锛夈€備唬鐞?娌欑浠讳竴绔彛鍙樹簡锛屾鍦ㄨ窇鐨勪唬鐞嗗氨缁戝湪
-/// 鏃х鍙ｃ€佹鍦ㄨ窇鐨勬矙绠卞張鎶婃棫浠ｇ悊 URL 鐑樻浜嗭紝浜岃€呬笌鏂伴厤缃笉涓€鑷?鈫?鎷嗘帀閫间笅娆°€屼竴閿紑濮嬨€嶆寜鏂扮鍙ｉ噸寤恒€?fn settings_change_needs_teardown(
-    old_proxy: u16,
-    new_proxy: u16,
-    old_sandbox: u16,
-    new_sandbox: u16,
-) -> bool {
-    old_proxy != new_proxy || old_sandbox != new_sandbox
-}
-
-/// 绔彛璁剧疆锛坧rovider/杩炴帴鏀硅蛋 profile CRUD + set_active_profile锛夈€?/// 缁忎覆琛屽櫒锛堜慨 P1-c锛夛細绔彛涓€鏃﹀彉鍖栵紝姝ｅ湪璺戠殑浠ｇ悊缁戝湪鏃х鍙ｃ€佹鍦ㄨ窇鐨勬矙绠卞張鐑樻浜嗘棫浠ｇ悊 URL锛?/// 涓庢柊绔彛涓嶄竴鑷达紱姝ゅ鎶婅繖鏉￠檲鏃ч摼璺媶鎺夛紙鍙仠鎴戜滑鐨勬矙绠便€佺粷涓嶇 8765锛夛紝閫间笅娆°€屼竴閿紑濮嬨€嶆寜鏂扮鍙ｉ噸寤猴紝
-/// 鏉滅粷銆屽鐢ㄦ棫娌欑鎸囧悜姝荤鍙ｃ€乁I 鍗存姤娌跨敤涓嶅彉銆嶃€?#[tauri::command]
-fn set_settings(
-    app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
-    cfg: UiSettings,
-) -> Result<(), String> {
+#[tauri::command]
+fn set_config(cfg: UiSettings) -> Result<(), String> {
+    // 铁律防御：代理/沙箱端口都不许用真实实例保留端口 8765。
     if cfg.proxy_port == 8765 || cfg.sandbox_port == 8765 {
-        return Err("绔彛 8765 鏄湡瀹?Science 瀹炰緥淇濈暀绔彛锛屼笉鑳界敤銆?.into());
+        return Err("端口 8765 是真实 Science 实例保留端口，不能用。".into());
     }
+    // 只认已实现的 provider，避免存进未知值后起代理时才失败（修 P2-3）。
+    if cfg.provider != "deepseek" && cfg.provider != "qwen" {
+        return Err(format!(
+            "未知 provider：{}（只支持 deepseek / qwen）。",
+            cfg.provider
+        ));
+    }
+    // 端口 0 非法（无法监听/探活）。
     if cfg.proxy_port == 0 || cfg.sandbox_port == 0 {
-        return Err("绔彛涓嶈兘涓?0銆?.into());
+        return Err("端口不能为 0。".into());
     }
+    // 代理与沙箱不能同端口，否则互相抢占。
     if cfg.proxy_port == cfg.sandbox_port {
-        return Err("浠ｇ悊绔彛涓庢矙绠辩鍙ｄ笉鑳界浉鍚屻€?.into());
+        return Err("代理端口与沙箱端口不能相同。".into());
     }
-    lifecycle.with_serialized(|| {
-        let dir = config::default_dir();
-        let old = config::load_from(&dir).map_err(|e| e.to_string())?;
-        let teardown = settings_change_needs_teardown(
-            old.proxy_port,
-            cfg.proxy_port,
-            old.sandbox_port,
-            cfg.sandbox_port,
-        );
-        // 鎷嗛摼璺€愬厛銆戜簬钀界洏锛屼笖鍋滄矙绠辩粨鏋滃繀椤绘嵁瀹炲鐞嗭紙淇閲?P1锛夛細鍋滀笉鎺夊氨銆愪笉鏀圭鍙ｃ€戔€斺€?        // 鍚﹀垯浼氱暀涓嬨€宑onfig 宸叉槸鏂扮鍙ｃ€佹棫娌欑浠嶅湪鏃х鍙ｆ寚鍚戞棫浠ｇ悊銆嶇殑涓嶄竴鑷存€侊紝涓嬫涓€閿繕浼氬鐢ㄨ繖鏉℃閾捐矾銆?        // 淇濇寔绔彛涓嶅彉鍒欎竴鍒囦粛鑷唇锛堟棫娌欑鎸囨棫浠ｇ悊绔彛銆佷笅娆′竴閿湪鏃х鍙ｉ噸寤轰唬鐞嗭紝閾捐矾鐓ч€氾級銆?        if teardown {
-            let mut st = lock(&state);
-            stop_sandbox_inner(&app, &mut st).map_err(|e| {
-                format!(
-                    "绔彛鏈洿鏀癸細鏃犳硶鍋滄鎸囧悜鏃х鍙ｇ殑娌欑锛坽e}锛夛紝涓洪伩鍏嶇暀涓嬪け鏁堥摼璺紝绔彛淇濇寔涓嶅彉銆傝鎵嬪姩鍋滄娌欑鎴栭噸鍚?app 鍚庨噸璇曘€傦紙鐪熷疄瀹炰緥 8765 鏈彈褰卞搷锛?
-                )
-            })?;
-            lifecycle.bump_generation(); // 鍋滄垚鍔熷悗浣滃簾鍦ㄩ€斿惎鍔?            kill_child(&mut st.proxy);
-            st.secret.clear();
-            st.provider.clear();
-            st.key_fp = 0;
-        }
-        // 鎷嗛摼璺垚鍔燂紙鎴栨棤闇€鎷嗭級鈫?鎵嶈惤鐩樻柊绔彛锛屼繚璇?config 涓庤繍琛屾€佷竴鑷淬€?        config::update(&dir, move |c| {
-            c.proxy_port = cfg.proxy_port;
-            c.sandbox_port = cfg.sandbox_port;
-        })
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    })
-}
-
-// ---------- profile CRUD 鍛戒护锛堣杽鍖呰 *_inner锛岀粺涓€缁忎覆琛屽櫒锛?----------
-#[tauri::command]
-fn create_profile(
-    lifecycle: State<'_, lifecycle::Lifecycle>,
-    template_id: String,
-    name: String,
-    key: Option<String>,
-    base_url: Option<String>,
-    model: Option<String>,
-) -> Result<String, String> {
-    lifecycle.with_serialized(|| {
-        create_profile_inner(
-            &config::default_dir(),
-            &template_id,
-            &name,
-            key.as_deref(),
-            base_url.as_deref(),
-            model.as_deref(),
-        )
-    })
-}
-
-#[tauri::command]
-fn update_profile_metadata(
-    lifecycle: State<'_, lifecycle::Lifecycle>,
-    id: String,
-    name: String,
-    notes: Option<String>,
-) -> Result<(), String> {
-    lifecycle.with_serialized(|| {
-        update_profile_metadata_inner(&config::default_dir(), &id, &name, notes.as_deref())
-    })
-}
-
-/// 娓?key锛氱粡涓茶鍣紱鑻ユ竻鐨勬槸銆愮敓鏁堛€憄rofile 鈫?bump_generation 浣滃簾鍦ㄩ€斿惎鍔?+ 鍋滆繍琛屼腑浠ｇ悊
-/// 锛堜笉鍐嶆嬁鏃?key 鏈嶅姟锛屾瘮鐓?spec 搂8.2 杩愯鎬佹挙閿€锛夈€?#[tauri::command]
-fn clear_profile_key(
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
-    id: String,
-) -> Result<(), String> {
-    lifecycle.with_serialized(|| {
-        let dir = config::default_dir();
-        let was_active = config::load_from(&dir)
-            .map(|c| c.active_id == id)
-            .unwrap_or(false);
-        clear_profile_key_inner(&dir, &id)?;
-        if was_active {
-            lifecycle.bump_generation();
-            let mut st = lock(&state);
-            kill_child(&mut st.proxy);
-            st.provider.clear();
-            st.key_fp = 0;
-        }
-        Ok(())
-    })
-}
-
-/// 鍒?profile锛氱粡涓茶鍣紱鍒犵殑鏄€愮敓鏁堛€憄rofile 鈫?active 缃┖锛坕nner 鍐咃級+ bump + 鍋滀唬鐞嗐€?#[tauri::command]
-fn delete_profile(
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
-    id: String,
-) -> Result<(), String> {
-    lifecycle.with_serialized(|| {
-        let dir = config::default_dir();
-        let was_active = config::load_from(&dir)
-            .map(|c| c.active_id == id)
-            .unwrap_or(false);
-        delete_profile_inner(&dir, &id)?;
-        if was_active {
-            lifecycle.bump_generation();
-            let mut st = lock(&state);
-            kill_child(&mut st.proxy);
-            st.provider.clear();
-            st.key_fp = 0;
-        }
-        Ok(())
-    })
-}
-
-/// 闈?active 杩炴帴缂栬緫鐨勪笂娓告牎楠岃鍐筹紙绾嚱鏁帮紝P2-d锛夛細鍙湁涓婃父銆愭槑纭€戞嫆缁濓紙Auth 401/403銆?/// ModelError 400/404/422锛夋墠 Some(hint) 鎷︿笅涓嶈惤鐩橈紱Ok / 鍚硦(429/5xx) / 鏃犲搷搴?鈫?None 鐓у父钀界洏
-/// 锛坆est-effort锛氶潪 active 娌℃湁姝ｅ湪鏈嶅姟鐨勯摼璺彲淇濇姢锛屽崱鍦ㄧ綉缁滄姈鍔ㄤ笂姣旀斁琛屾洿绯燂級銆?/// 闈?active 杩炴帴缂栬緫鐨勪笂娓告牎楠岃鍐筹紙绾嚱鏁帮紝P2-d锛夛細
-/// - `Ok(true)`  涓婃父鏄庣‘鎺ュ彈(200)锛屽凡鏍￠獙锛?/// - `Ok(false)` 鏃犳硶纭(429/5xx/鏃犲搷搴?锛宐est-effort 钀界洏銆佹爣璁般€屾湭鏍￠獙銆嶏紙婵€娲绘椂浼氬啀楠岋級锛?/// - `Err(hint)` 涓婃父鏄庣‘鎷掔粷(401/403/400/404/422)锛屾嫤涓嬩笉钀界洏銆?///
-/// 閫夈€屽瀹炴爣璁板悗淇濆瓨銆嶏細涓嶅洜缃戠粶鎶栧姩/涓婃父绻佸繖鎸′綇淇濆瓨锛屼絾涔熺粷涓嶅亣绉板凡鏍￠獙銆?fn nonactive_probe_verdict(outcome: &scratch::ProbeOutcome) -> Result<bool, String> {
-    match outcome {
-        scratch::ProbeOutcome::Ok => Ok(true),
-        scratch::ProbeOutcome::Auth(code) => {
-            Err(format!("涓婃父鎷掔粷锛坽code}锛夛紝key/鏉冮檺鏈夎锛岃繛鎺ユ湭淇濆瓨銆?))
-        }
-        scratch::ProbeOutcome::ModelError(code) => Err(format!(
-            "涓婃父鎷掔粷璇ユā鍨嬶紙{code}锛夛紝杩炴帴鏈繚瀛樸€傝鎹竴涓ā鍨嬫垨鏍稿 base_url銆?
-        )),
-        // 鏃犳硶纭锛?05/429/5xx/鏃犲搷搴旓級锛氳惤鐩樹絾鏍囪鏈牎楠岋紝婵€娲绘椂鍐嶉獙銆?        // Unsupported(405) 骞跺叆姝ょ被锛歴ave 璧?Message 鎺㈡祴锛?05 缃曡锛堢鐐?base_url 寮傚父锛夛紝淇濆畧鏍囨湭鏍￠獙锛堜笌鏃ц涓轰竴鑷达級銆?        scratch::ProbeOutcome::Ambiguous(_)
-        | scratch::ProbeOutcome::NoResponse
-        | scratch::ProbeOutcome::Unsupported(_) => Ok(false),
-    }
-}
-
-/// 鏄惁瀵瑰€欓€夎繛鎺ヨ窇涓婃父 scratch 鏍￠獙锛堢函鍑芥暟锛屼慨鐪熸満 P1锛夛細绌?key 鈫?鍏嶏紙鏃犱粠楠岋級锛涢潪鍘熺敓涓旂┖
-/// base_url 鈫?鍏嶏紙relay 蹇呴』甯?base_url锛夛紱鍘熺敓锛坉eepseek/qwen锛夊嵆渚?base_url 涓虹┖涔熴€愯銆戦獙
-/// 锛堢敤鍚勮嚜纭紪鐮佸畼鏂圭鐐癸紝鍧?key 鎵嶈兘鍦ㄤ繚瀛樻椂琚嫤锛屼笉鍐嶉『寤跺埌婵€娲伙級銆?fn should_scratch_candidate(adapter: &str, key: &str, base_url: &str) -> bool {
-    if key.is_empty() {
-        return false; // 鏃?key 鈫?鏃犱粠楠岋紝濡傚疄鏍囪鏈牎楠屻€?    }
-    if !is_native_adapter(adapter) && base_url.is_empty() {
-        return false; // relay 瀹舵棌缂?base_url 鈫?鏃犱粠楠屻€?    }
-    true
-}
-
-/// 淇濆瓨鍓嶅畧鍗紙绾嚱鏁帮紝淇?P2锛夛細relay 瀹舵棌锛堥潪 native锛夌┖ base_url 鐨勫€欓€夎繛鎺ヤ笉鍙敤鈥斺€?/// 婵€娲诲繀澶辫触锛坮elay 鏃犵‖缂栫爜绔偣鍙洖閫€锛夈€?.3.1 璧峰唴缃璁?base_url 鍙紪杈戯紝鐢ㄦ埛娓呯┖鍚?/// 鏃ц矾寰勪細璺宠繃鏍￠獙銆侀潤榛樿惤鐩樺苟璋庢姤銆屽凡淇濆瓨銆嶃€傛澶勫湪淇濆瓨鏃跺氨鎷︿笅锛岀粷涓嶈惤鐩樸€?/// native(deepseek/qwen) 璧板悇鑷‖缂栫爜瀹樻柟绔偣锛岀┖ base_url 鏃犲Θ 鈫?涓嶆嫤銆?fn relay_missing_base_url(adapter: &str, base_url: &str) -> bool {
-    !is_native_adapter(adapter) && base_url.trim().is_empty()
-}
-
-/// 淇濆瓨/婵€娲诲墠瀹堝崼锛堢函鍑芥暟锛屼慨 #9 P1-a锛夛細relay 瀹舵棌锛堥潪 native锛夌┖锛堝惈绾┖鐧斤級model 涓嶅彲鐢ㄢ€斺€?/// 鏃?model 鈫?launcher 涓嶆敞鍏?CSSWITCH_RELAY_MODEL 鈫?鏃?force 鈫?閫€鍥?passthrough 鈫?Science 鏄剧ず claude銆?/// native(deepseek/qwen) 璧板唴缃槧灏?纭紪鐮佺鐐癸紝model 鍙┖ 鈫?涓嶆嫤銆?fn relay_missing_model(adapter: &str, model: &str) -> bool {
-    !is_native_adapter(adapter) && model.trim().is_empty()
-}
-
-/// 瀵瑰€欓€夎繛鎺ュ仛涓€娆′笂娓?scratch 鏍￠獙锛堥潪 active 缂栬緫鐢紝P2-d锛夈€傝捣涓存椂浠ｇ悊鎺㈠畬鍗虫潃锛?/// **缁濅笉纰?config / AppState / 姝ｅ湪鏈嶅姟鐨勬寮忎唬鐞?*銆傝繑鍥炴槸鍚︺€愬凡閫氳繃涓婃父鏍￠獙銆戯紙渚涜皟鐢ㄦ柟鎹疄鎺緸锛夛細
-/// 绌?key / relay 瀹舵棌绌?base_url 鈫?`Ok(false)`锛堟棤浠庨妫€锛屾爣璁版湭鏍￠獙锛夛紱
-/// native(deepseek/qwen) 鍗充究 base_url 绌轰篃銆愪細銆戣蛋鍚勮嚜瀹樻柟绔偣鎺㈡祴锛堜慨鐪熸満 P1锛夛紱
-/// 鏄庣‘鎺ュ彈(200) 鈫?`Ok(true)`锛涙槑纭嫆缁?鈫?`Err(hint)`锛涙棤娉曠‘璁?鈫?`Ok(false)`锛堣 [`nonactive_probe_verdict`]锛夈€?fn scratch_validate_candidate(
-    app: &tauri::AppHandle,
-    candidate: &config::Profile,
-) -> Result<bool, String> {
-    let launch = proxy_args_for(candidate);
-    if !should_scratch_candidate(&launch.adapter, &launch.key, &launch.base_url) {
-        return Ok(false); // 璺宠繃 = 鏈牎楠岋紙濡傚疄鏍囪锛?    }
-    let root = asset_root(app).ok_or("鎵句笉鍒颁唬鐞嗚剼鏈?proxy/csswitch_proxy.py銆?)?;
-    let py = proc::find_exe("python3").ok_or("缂哄皯渚濊禆 python3锛堣捣涓存椂浠ｇ悊闇€瑕侊級銆?)?;
-    let script = root.join("proxy/csswitch_proxy.py");
-    let res = scratch::scratch_probe(
-        &py,
-        &script,
-        &scratch::ScratchTarget {
-            provider: &launch.adapter,
-            key_env: launch.key_env,
-            base_url: &launch.base_url,
-            key: &launch.key,
-            model: Some(&launch.model),
-            relay_thinking: launch.thinking_policy,
-        },
-        probe_kind_for(&launch.adapter, &launch.model),
-    );
-    nonactive_probe_verdict(&scratch::classify(res.status))
-}
-
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-fn update_profile_connection(
-    app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
-    id: String,
-    base_url: Option<String>,
-    api_format: Option<String>,
-    model: Option<String>,
-    key: Option<String>,
-) -> Result<serde_json::Value, String> {
-    lifecycle.with_serialized(|| {
-        let dir = config::default_dir();
-        let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
-        // 鏈懡涓?id 鈫?Err锛堜笉闈欓粯 Ok锛夈€?        let mut candidate = cfg
-            .profile_by_id(&id)
-            .cloned()
-            .ok_or_else(|| format!("鎵句笉鍒?profile锛歿id}"))?;
-        // 鐢熸晥銆愬悗銆戠殑鍊欓€夎繛鎺ワ紙None=涓嶆敼鍒欐部鐢ㄦ棫鍊硷級锛宎ctive/闈?active 鍏辩敤涓€浠姐€?        let edit = ConnectionEdit {
-            base_url: base_url.clone(),
-            api_format: api_format.clone(),
-            model: model.clone(),
-            key: key.clone(),
-        };
-        edit.apply(&mut candidate);
-        // 淇濆瓨鍓嶅畧鍗紙淇?P2锛夛細relay/鑷畾涔夌鐐规竻绌?base_url 鈫?涓嶅彲鐢ㄨ繛鎺ワ紙婵€娲诲繀澶辫触锛夈€?        // 鏍￠獙鐢熸晥鍚庣殑 base_url锛岀┖鍒欐嫆缁濊惤鐩樸€佺粷涓嶈皫鎶ャ€屽凡淇濆瓨銆嶏紱native 璧扮‖缂栫爜绔偣锛岀┖鏃犲Θ銆?        if relay_missing_base_url(
-            templates::adapter_for(&candidate.template_id),
-            &candidate.base_url,
-        ) {
-            return Err("涓浆 / 鑷畾涔夌鐐瑰繀椤诲～鍐欒繛鎺ュ湴鍧€锛坆ase_url锛夛紝杩炴帴鏈繚瀛樸€?.to_string());
-        }
-        // 淇濆瓨鍓嶅畧鍗紙淇?#9 P1-a锛夛細relay/鑷畾涔夌鐐圭┖ model 鈫?鏃?force 鈫?閫€鍥?passthrough锛堟樉绀?claude锛夈€?        if relay_missing_model(
-            templates::adapter_for(&candidate.template_id),
-            &candidate.model,
-        ) {
-            return Err("涓浆 / 鑷畾涔夌鐐瑰繀椤婚€夋嫨鎴栧～鍐欎竴涓ā鍨嬶紝杩炴帴鏈繚瀛樸€?.to_string());
-        }
-        if cfg.active_id == id {
-            // active锛堟湁姝ｅ湪鏈嶅姟鐨勪唬鐞嗭級锛歷alidate-before-persist 鈥斺€?鏂拌繛鎺ヤ綔銆愬唴瀛樺€欓€夈€戝杺杩?            // 鍒囨崲浜嬪姟锛堟牎楠屸啋璧锋寮忊啋鍋ュ悍锛夛紝鎺㈡椿鍋ュ悍銆愭墠銆戣繛鍚岃惤鐩橈紱澶辫触鍒欑鐩樿繛鎺ラ浂鏀瑰姩銆?            // 浠嶈窇鏃ц繛鎺ワ紙鏉滅粷銆岀洏鏂拌繍琛屾棫銆嶏紝淇?P1-4锛夈€?            let v =
-                set_active_profile_txn(&app, &state, lifecycle.inner(), &id, false, Some(&edit))?;
-            // 杩炴帴缂栬緫锛歝ommitted:false锛坰cratch 鍒嗙被澶辫触锛変篃濡傚疄浣滀负閿欒涓婃姏锛堢鐩樻湭鏀广€佷唬鐞嗕粛璺戞棫鐨勶級銆?            if v.get("committed").and_then(|b| b.as_bool()) == Some(false) {
-                let hint = v
-                    .get("hint")
-                    .and_then(|h| h.as_str())
-                    .unwrap_or("杩炴帴鏍￠獙鏈€氳繃锛岃繛鎺ユ湭淇濆瓨銆?)
-                    .to_string();
-                return Err(hint);
-            }
-            // active锛氬凡杩炲悓璧锋寮忎唬鐞嗘帰娲诲苟钀界洏锛岃涓哄凡鏍￠獙銆?            Ok(json!({ "validated": true }))
-        } else {
-            // 闈?active锛氭棤姝ｅ湪鏈嶅姟鐨勪唬鐞嗐€傚厛瀵瑰€欓€夊仛涓婃父 scratch 鏍￠獙锛堜粎鏄庣‘鎷掔粷鎵嶆嫤锛屽叾浣?            // best-effort 钀界洏骞跺瀹炴爣璁般€屾湭鏍￠獙銆嶏紝淇?P2-d锛氳创鍚堣璁°€屾牎楠屽€欓€夊悗鎻愪氦銆? 濡傚疄鎶ュ憡锛夛紝
-            // 鍐嶈惤鐩橈紙inner 鍐呭惈鏍煎紡闂?+ 瑕嗙洊鍓嶇暀搴曪級銆?            let validated = scratch_validate_candidate(&app, &candidate)?;
-            update_profile_connection_inner(
-                &dir,
-                &id,
-                base_url.as_deref(),
-                api_format.as_deref(),
-                model.as_deref(),
-                key.as_deref(),
-            )?;
-            Ok(json!({ "validated": validated }))
-        }
-    })
-}
-
-/// 涓€閿垏鐢熸晥 profile锛氱粡涓茶鍣ㄨ蛋 [`set_active_profile_txn`] 鍒囨崲浜嬪姟銆?#[tauri::command]
-fn set_active_profile(
-    app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
-    id: String,
-    skip_verify: bool,
-) -> Result<serde_json::Value, String> {
-    lifecycle.with_serialized(|| {
-        set_active_profile_txn(&app, &state, lifecycle.inner(), &id, skip_verify, None)
-    })
-}
-
-/// active 杩炴帴缂栬緫鐨勫唴瀛樺€欓€夊€硷紙validate-before-persist 鐢級锛氫笉鏀圭殑瀛楁涓?None銆?/// 鏍￠獙鏃舵妸瀹冨鍒版棫 profile 鐨勫厠闅嗕笂鍋?scratch/璧锋寮忥紱鎻愪氦鎴愬姛鏃剁敤**鍚屼竴濂?* [`ConnectionEdit::apply`]
-/// 閫昏緫杩炲悓 active_id 涓€璧疯惤鐩橈紝鏉滅粷銆屽厛钀界洏鍚庢牎楠屻€嶅鑷寸殑銆岀洏鏂拌繍琛屾棫銆嶏紙P1-4锛夈€?#[derive(Default)]
-struct ConnectionEdit {
-    base_url: Option<String>,
-    api_format: Option<String>,
-    model: Option<String>,
-    key: Option<String>,
-}
-
-impl ConnectionEdit {
-    /// 鎶婇潪绌虹紪杈戝€煎鍒扮洰鏍?profile锛堝唴瀛樺€欓€変笌钀界洏鍏辩敤鍚屼竴閫昏緫锛夈€?    /// 璇箟涓?`update_profile_connection_inner` 涓€鑷达細None=涓嶆敼锛沰ey 涓虹┖涓?涓嶆敼锛堢暀鍗犱綅涓嶈鐩栧凡瀛?key锛夈€?    fn apply(&self, p: &mut config::Profile) {
-        if let Some(u) = &self.base_url {
-            p.base_url = u.clone();
-        }
-        if let Some(f) = &self.api_format {
-            p.api_format = f.clone();
-        }
-        if let Some(m) = &self.model {
-            p.model = m.clone();
-        }
-        if let Some(k) = &self.key {
-            if !k.is_empty() {
-                p.api_key = k.clone();
-            }
-        }
-    }
-}
-
-/// 婵€娲?鍒囨崲鏄惁璺宠繃 scratch 涓婃父鏍￠獙锛堢函鍑芥暟锛屼慨鐪熸満 P1锛夛細鍙湁鐢ㄦ埛鏄惧紡 `skip_verify` 鎵嶈烦锛?/// 鍘熺敓 adapter 涓嶅啀璞佸厤锛堟棫琛屼负 `native || skip_verify` 浼氳鍘熺敓鏃犳晥 key 鎻愪氦涓?active 骞惰皫鎶ャ€屽凡鍒囧埌銆嶏紝
-/// 棣栦釜鐪熷疄鎺ㄧ悊鎵?401锛夈€俙native` 鍙傛暟鍒绘剰淇濈暀锛氳褰曞畠鏇炬槸璞佸厤鏉′欢銆佺幇宸蹭綔搴熴€?fn skip_scratch_verify(native: bool, skip_verify: bool) -> bool {
-    let _ = native; // native 鏇炬槸璞佸厤鏉′欢锛岀幇宸蹭綔搴燂紙淇濈暀鍙傛暟浠ュ浐鍖栧洖褰掗槻绾匡級銆?    skip_verify
-}
-
-/// 鍒囨崲浜嬪姟鏈綋锛坰pec 搂7锛夛細scratch 鏍￠獙鍊欓€?鈫?璧锋寮忎唬鐞嗘帰娲?鈫?鎺㈡椿鍋ュ悍銆愭墠銆戞彁浜?active_id锛?/// 浠讳竴姝ュけ璐ユ潃鍊欓€?+ 鎭㈠鏃т唬鐞嗭紝`active_id` 涓嶅姩锛?*涓嶅仠娌欑**锛坧ath-secret 鎸佷箙锛岀鍙?secret
-/// 涓嶅彉锛屾矙绠遍摼璺笉鏂紝鍋滄矙绠卞彧浼氭墿澶уけ璐ラ潰锛夈€?*鏈嚱鏁颁笉鍙栦覆琛屽櫒閿?*锛堣皟鐢ㄦ柟鍛戒护宸叉寔鏈夛級銆?fn set_active_profile_txn(
-    app: &tauri::AppHandle,
-    state: &State<'_, Mutex<AppState>>,
-    lifecycle: &lifecycle::Lifecycle,
-    id: &str,
-    skip_verify: bool,
-    conn_edit: Option<&ConnectionEdit>,
-) -> Result<serde_json::Value, String> {
     let dir = config::default_dir();
-    let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
-    let mut candidate = cfg
-        .profile_by_id(id)
-        .cloned()
-        .ok_or_else(|| format!("鎵句笉鍒?profile锛歿id}"))?;
-    // active 杩炴帴缂栬緫锛氭妸鏂拌繛鎺ュ瓧娈靛鍒般€愬唴瀛樺€欓€夈€戝仛鏍￠獙锛坴alidate-before-persist锛夆€斺€?    // 纾佺洏姝ゅ埢浠嶆槸鏃ц繛鎺ワ紱鍙湁鎺㈡椿鍋ュ悍鎻愪氦鏃舵墠钀界洏锛堣涓嬫柟 Commit 鍒嗘敮锛夈€?    if let Some(edit) = conn_edit {
-        edit.apply(&mut candidate);
-    }
-    let is_edit = conn_edit.is_some();
-    // 澶辫触鎺緸锛氳繛鎺ョ紪杈戣銆屾湭淇濆瓨/浠嶅湪鐢ㄥ師閰嶇疆杩愯銆嶏紝鏅€氬垏鎹㈣銆屾湭鍒囨崲/褰撳墠閰嶇疆涓嶅彉銆嶃€?    let (verb, tail): (&str, &str) = if is_edit {
-        ("鏈繚瀛?, "浠嶅湪鐢ㄥ師閰嶇疆杩愯")
-    } else {
-        ("鏈垏鎹?, "褰撳墠閰嶇疆涓嶅彉")
-    };
-    assert_format_supported(&candidate)?;
-    let launch = proxy_args_for(&candidate);
-    if launch.key.is_empty() {
-        return Err(format!("銆寋}銆嶈繕娌″～ API key锛岃鍏堝～鍐欍€?, candidate.name));
-    }
-    let native = is_native_adapter(&launch.adapter);
-    if !native && launch.base_url.is_empty() {
-        return Err("璇ラ厤缃渶瑕佸～ base_url锛坔ttp:// 鎴?https:// 寮€澶达級銆?.into());
-    }
-    // 瀹堝崼锛堜慨 #9 P1-a锛夛細relay/鑷畾涔夌鐐圭┖ model 鏃犳硶婵€娲伙紙鏃?force 鈫?閫€鍥?passthrough 鏄剧ず claude锛夈€?    if relay_missing_model(&launch.adapter, &candidate.model) {
-        return Err(
-            "璇ラ厤缃渶瑕侀€夋嫨鎴栧～鍐欎竴涓ā鍨嬶紙涓浆/鑷畾涔夌鐐瑰繀濉級锛岃鍦ㄨ繛鎺ョ紪杈戦噷琛ヤ笂銆?.into(),
-        );
-    }
-    // 蹇収鏃?active锛堝洖婊氶敋鐐癸級锛氭棫 profile 浠嶅湪鐩樹笂鏈姩銆乤ctive_id 鏈敼锛屾仮澶嶆嵁瀹冮噸璧锋棫浠ｇ悊銆?    let old_active = cfg.active_id.clone();
-
-    // 1) scratch 鏍￠獙鍊欓€夛紙涓存椂绔彛+secret+鍊欓€?key锛岄伩寮€ 8765锛涚粷涓嶇姝ｅ紡閾捐矾锛夈€?    //    鎵€鏈?adapter 閮介妫€锛歯ative(deepseek/qwen) 鐢ㄥ悇鑷畼鏂圭鐐?+ Message 鎺㈡祴锛堝叾 /v1/models 闈欐€侊紝
-    //    鎺笉鍑哄潖 key锛夛紱鍙湁鐢ㄦ埛鏄惧紡 skip_verify 鎵嶈烦杩囷紙淇湡鏈?P1锛氬師鐢熷厤鏍￠獙浼氳鏃犳晥 key 鎻愪氦涓?    //    active 骞惰皫鎶ャ€屽凡鍒囧埌銆嶏紝棣栦釜鐪熷疄鎺ㄧ悊鎵?401锛夈€傚垎绫诲け璐ヤ繚鐣欑粨鏋勫寲鎻愮ず锛坈ommitted:false/can_skip锛夈€?    let scratch_ok = if skip_scratch_verify(native, skip_verify) {
-        true
-    } else {
-        let root = asset_root(app).ok_or("鎵句笉鍒颁唬鐞嗚剼鏈?proxy/csswitch_proxy.py銆?)?;
-        let py = proc::find_exe("python3").ok_or("缂哄皯渚濊禆 python3锛堣捣涓存椂浠ｇ悊闇€瑕侊級銆?)?;
-        let script = root.join("proxy/csswitch_proxy.py");
-        let res = scratch::scratch_probe(
-            &py,
-            &script,
-            &scratch::ScratchTarget {
-                provider: &launch.adapter,
-                key_env: launch.key_env,
-                base_url: &launch.base_url,
-                key: &launch.key,
-                model: Some(&launch.model),
-                relay_thinking: launch.thinking_policy,
-            },
-            probe_kind_for(&launch.adapter, &launch.model),
-        );
-        match scratch::classify(res.status) {
-            scratch::ProbeOutcome::Ok => true,
-            scratch::ProbeOutcome::Auth(code) => {
-                return Ok(json!({ "committed": false,
-                    "hint": format!("涓婃父鎷掔粷锛坽code}锛夛紝key/鏉冮檺鏈夎锛寋verb}锛坽tail}锛夈€?) }));
-            }
-            scratch::ProbeOutcome::ModelError(code) => {
-                return Ok(json!({ "committed": false,
-                    "hint": format!("涓婃父鎷掔粷璇ユā鍨嬶紙{code}锛夛紝{verb}銆傝鎹竴涓ā鍨嬫垨鏍稿 base_url銆?) }));
-            }
-            scratch::ProbeOutcome::Ambiguous(_)
-            | scratch::ProbeOutcome::NoResponse
-            | scratch::ProbeOutcome::Unsupported(_) => {
-                return Ok(json!({ "committed": false, "can_skip": true,
-                    "hint": format!("鏃犳硶纭锛堢綉缁?涓婃父绻佸繖锛夛紝{verb}銆傚彲閲嶈瘯锛屾垨鐢ㄣ€岃烦杩囬獙璇併€嶃€?) }));
-            }
-        }
-    };
-
-    // 2/3) 鐢ㄥ€欓€夎捣銆愭寮忎唬鐞嗐€戝苟鎺㈡椿銆俠ump_generation 浣垮苟鍙戜腑鐨勬棫鍚姩锛堝鍚屾椂鐨?verify_key锛変綔搴熴€?    lifecycle.bump_generation();
-    let real_healthy = scratch_ok && start_proxy_for(app, state, lifecycle, &candidate).is_ok();
-
-    match decide_switch(scratch_ok, real_healthy) {
-        SwitchOutcome::Commit => {
-            // 鎺㈡椿鍋ュ悍銆愭墠銆戣惤鐩橈細杩炴帴缂栬緫杩炲悓 active_id 涓€璧锋彁浜わ紙validate-before-persist锛夛紝
-            // 鐩樹笂涓庤繍琛屾€佷竴鑷达紝鏉滅粷銆岀洏鏂拌繍琛屾棫銆嶃€?            if is_edit {
-                config::write_rolling_backup(&dir).ok(); // 瑕嗙洊杩炴帴鍓嶇暀搴曪紙浠呯紪杈戣矾寰勯渶瑕侊級
-            }
-            if let Err(e) = config::update(&dir, |c| {
-                c.active_id = id.to_string();
-                if let Some(edit) = conn_edit {
-                    if let Some(p) = c.profile_by_id_mut(id) {
-                        edit.apply(p);
-                    }
-                }
-            }) {
-                // spec 搂7 姝?5锛歝onfig 鎻愪氦澶辫触涔熻鍥炴粴杩涚▼鈥斺€旀寮忎唬鐞嗗凡璧凤紝鑻ヤ笉鍥炴粴灏辨垚銆岃繍琛屾柊/鐩樻棫銆嶃€?                // 鎭㈠鏃?active 浠ｇ悊锛宎ctive_id 浠嶄负鏃у€硷紝鐢ㄦ埛鍙噸璇曘€?                let restored = restore_proxy_for_active(app, state, lifecycle, &cfg, &old_active);
-                return Err(format!(
-                    "鏍￠獙閫氳繃銆佷唬鐞嗗凡璧凤紝浣嗗啓鐩樺け璐ワ紙{e}锛夛紝{}銆傝妫€鏌ョ鐩樼┖闂?鏉冮檺鍚庨噸璇曘€?,
-                    rollback_status_clause(restored)
-                ));
-            }
-            let hint = if is_edit {
-                format!("宸蹭繚瀛樺苟搴旂敤銆寋}銆嶇殑鏂拌繛鎺ャ€?, candidate.name)
-            } else {
-                format!("宸插垏鍒般€寋}銆嶃€?, candidate.name)
-            };
-            Ok(json!({ "committed": true, "active_id": id, "hint": hint }))
-        }
-        SwitchOutcome::RollbackToOld => {
-            // 鍊欓€夋寮忎唬鐞嗚捣/鎺㈡椿澶辫触锛氭仮澶嶆棫浠ｇ悊锛宎ctive_id 涓嶅姩锛岃繛鎺ヤ笉钀界洏锛屼笉鍋滄矙绠便€?            let restored = restore_proxy_for_active(app, state, lifecycle, &cfg, &old_active);
-            let clause = rollback_status_clause(restored);
-            if is_edit {
-                Err(format!(
-                    "杩炴帴宸叉牎楠岄€氳繃锛屼絾姝ｅ紡浠ｇ悊鍚姩/鎺㈡椿澶辫触锛岃繛鎺ユ湭淇濆瓨锛寋clause}銆?
-                ))
-            } else {
-                Err(format!(
-                    "鍊欓€夐厤缃牎楠岄€氳繃锛屼絾姝ｅ紡浠ｇ悊鍚姩/鎺㈡椿澶辫触锛寋clause}銆?
-                ))
-            }
-        }
-        SwitchOutcome::AbortBeforeStart => {
-            // scratch 鏍￠獙鏈繃锛涙棫鎬侀浂鏀瑰姩銆佽繛鎺ヤ笉钀界洏銆傦紙鏄庣‘鎷掔粷/鍚硦鎬佸湪涓婇潰宸?committed:false 鏃╄繑锛?            // 姝ゅ垎鏀槸 scratch_ok=false 鐨勫厹搴曟帾杈炪€傦級
-            if is_edit {
-                Err("杩炴帴涓婃父鏍￠獙澶辫触锛坘ey/base_url/缃戠粶锛燂級锛岃繛鎺ユ湭淇濆瓨銆?.into())
-            } else {
-                Err("鍊欓€変笂娓告牎楠屽け璐ワ紙key/base_url/缃戠粶锛燂級锛屾湭鍒囨崲銆?.into())
-            }
-        }
-    }
+    config::update(&dir, move |c| {
+        c.provider = cfg.provider;
+        c.proxy_port = cfg.proxy_port;
+        c.sandbox_port = cfg.sandbox_port;
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
-/// 鍥炴粴缁撴灉鎺緸锛堢函鍑芥暟锛孭2-e锛夛細restored=true 鎵嶈銆屽凡鍥炴粴鍒板師閰嶇疆銆嶏紱鎭㈠澶辫触蹇呴』濡傚疄璇存槑浠ｇ悊宸插仠锛?/// 缁濅笉璋庣О鍥炴粴鎴愬姛锛堟瘮鐓ф湰椤圭洰銆屽瀹炴姤鍛娿€嶉搧寰嬶紝鎺╃洊浠ｇ悊宸插仠浼氳瀵肩敤鎴凤級銆?fn rollback_status_clause(restored: bool) -> &'static str {
-    if restored {
-        "宸插洖婊氬埌鍘熼厤缃紙娌欑鏈彈褰卞搷锛?
-    } else {
-        "鍥炴粴鏈垚鍔燂細浠ｇ悊褰撳墠宸插仠锛岃閲嶈瘯鎴栨墜鍔ㄣ€屼竴閿紑濮嬨€嶏紙娌欑鏈彈褰卞搷锛?
-    }
-}
-
-/// 鍒囨崲澶辫触鍥炴粴锛氭寜銆愭棫 active銆戦噸璧锋棫浠ｇ悊锛堟棫 profile 浠嶅湪鐩樹笂锛夛紱best-effort锛屽け璐ュ垯浠ｇ悊鏆傚仠銆?/// active_id 浠嶄负鏃у€硷紝鐢ㄦ埛鍙噸璇曘€傛棫 active 涓虹┖锛堟鍓嶆湭閰嶇疆鐢熸晥锛夆啋 涓嶅娲伙紝淇濇寔浠ｇ悊鍋滅潃銆?/// 杩斿洖鏄惁宸叉妸鏃т唬鐞嗘仮澶嶅埌浣嶏紙渚涜皟鐢ㄦ柟鎹疄鎺緸锛屼慨 P2-e锛夈€?fn restore_proxy_for_active(
-    app: &tauri::AppHandle,
-    state: &State<'_, Mutex<AppState>>,
-    lifecycle: &lifecycle::Lifecycle,
-    cfg: &config::Config,
-    old_active: &str,
-) -> bool {
-    if old_active.is_empty() {
-        return true; // 姝ゅ墠鏃犵敓鏁堥厤缃?鈫?鏈氨鏃犱唬鐞嗗彲鎭㈠锛岀姸鎬佷笌鍒囨崲鍓嶄竴鑷?    }
-    match cfg.profile_by_id(old_active) {
-        Some(old) => {
-            lifecycle.bump_generation();
-            start_proxy_for(app, state, lifecycle, old).is_ok()
-        }
-        None => false, // 鏃?active 鎸囧悜宸蹭笉瀛樺湪鐨?profile锛堢綍瑙侊級鈫?鏃犳硶鎭㈠锛屼唬鐞嗗凡鍋?    }
+#[tauri::command]
+fn save_provider_key(provider: String, key: String) -> Result<String, String> {
+    let dir = config::default_dir();
+    let key2 = key.clone();
+    config::update(&dir, move |c| {
+        c.providers.entry(provider).or_default().key = key2;
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(config::mask(&key))
 }
 
 #[tauri::command]
 fn start_proxy(
     app: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
 ) -> Result<serde_json::Value, String> {
-    // 缁忎覆琛屽櫒锛氫笌鍒囨崲/杩炴帴缂栬緫/娓?key/鍒?鍋滅瓑 ensure_proxy 绔炰簤涓茶鍖栵紝闃查檲鏃ц璧锋棫閰嶇疆浠ｇ悊
-    // 鍙堝啓鍥炶繍琛屾€侊紙淇?P1-a锛屾瘮鐓?spec 搂8.1銆宔nsure_proxy 閮界粡涓€鎶?app 绾?mutex銆嶏級銆?    lifecycle.with_serialized(|| {
-        let (port, _secret, _action) = ensure_proxy(&app, &state, lifecycle.inner())?;
-        Ok(json!({ "port": port }))
-    })
+    let (port, _secret, _action) = ensure_proxy(&app, &state)?;
+    Ok(json!({ "port": port }))
 }
 
-/// 銆屽瓨 key 鍗抽獙璇併€嶏細纭繚浠ｇ悊鍦ㄨ窇锛屽啀缁忎唬鐞嗗悜涓婃父鍙戜竴涓渶灏忚姹傦紝鎹姸鎬佺爜鍒ゆ柇 key 鏄惁鍙敤銆?#[tauri::command]
+/// 「存 key 即验证」：确保代理在跑，再经代理向上游发一个**最小**请求
+/// （`max_tokens:1`，一句 "ping"），据响应状态码判断 key 是否真的可用。
+/// 返回 `{ok, hint}`：ok=true 表示上游接受（key 有效）；ok=false 表示上游拒绝或异常，
+/// hint 给人话。彻底避免「只看绿灯（代理起来了）≠ key 真能用」。
+#[tauri::command]
 fn verify_key(
     app: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
 ) -> Result<serde_json::Value, String> {
-    // 缁忎覆琛屽櫒锛堜慨 P1-a锛夛細ensure_proxy 涓庡叾瀹冪敓鍛藉懆鏈熸搷浣滀笉骞跺彂浜ゅ彔銆?    lifecycle.with_serialized(|| {
-        let (port, secret, _action) = ensure_proxy(&app, &state, lifecycle.inner())?;
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}"#;
-        match proc::http_post_status(port, Some(&secret), "/v1/messages", body, 15000) {
-            Some(200) => Ok(json!({ "ok": true, "hint": "key 鏈夋晥锛屼笂娓稿凡鎺ュ彈銆? })),
-            Some(code @ (401 | 403)) => Ok(
-                json!({ "ok": false, "hint": format!("涓婃父鎷掔粷锛坽code}锛夛紝key 鍙兘鏃犳晥鎴栨棤鏉冮檺銆?) }),
-            ),
-            Some(code) => Ok(json!({
-                "ok": false,
-                "hint": format!("涓婃父杩斿洖 {code}锛屽彲鑳芥槸 key 鏃犳晥銆侀搴︿笉瓒虫垨涓婃父寮傚父銆?)
-            })),
-            None => Err("楠岃瘉璇锋眰鏃犲搷搴旓紙澶氫负缃戠粶鎴栦笂娓镐笉閫氾級銆?.to_string()),
-        }
-    })
-}
-
-#[derive(Deserialize)]
-struct FetchModelsReq {
-    /// 妯℃澘 id锛堝喅瀹?builtin / base_url 鍙紪杈戞€?/ 榛樿 base_url锛夈€?    template_id: String,
-    /// 鑷畾涔夋ā鏉挎椂鐢ㄦ埛濉殑 base_url锛堜笉鍙紪杈戞ā鏉垮拷鐣ワ級銆?    #[serde(default)]
-    base_url: String,
-    /// 鐢ㄦ埛鏂板～鐨?key锛涗负绌鸿〃绀烘部鐢?profile_id 宸插瓨鐨?key锛堝悗绔笉鍥炰紶瀹屾暣 key锛夈€?    #[serde(default)]
-    key: String,
-    /// 缂栬緫宸插瓨 profile 鏃朵紶鍏?id锛堢敤浜庢部鐢ㄥ凡瀛?key锛夈€?    #[serde(default)]
-    profile_id: Option<String>,
-}
-
-/// live 鎺㈡祴缁撴灉锛坕d + 鑳藉姏锛夆埅 builtin锛屽幓閲嶏紙鎸?id锛? 鎺掑簭锛坱rue>null>false锛屼富鍒楄〃 id 寰皟闈犲墠锛夈€?fn merge_and_sort_models(
-    live: Vec<(String, Option<bool>)>,
-    builtin: &[&str],
-) -> Vec<serde_json::Value> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut merged: Vec<(String, Option<bool>)> = Vec::new();
-    for (id, st) in live {
-        if seen.insert(id.clone()) {
-            merged.push((id, st));
-        }
-    }
-    for b in builtin {
-        if seen.insert(b.to_string()) {
-            merged.push((b.to_string(), None));
-        }
-    }
-    merged.sort_by_key(|(id, st)| {
-        let cap = match st {
-            Some(true) => 0u8,
-            None => 1,
-            Some(false) => 2,
-        };
-        let main = if is_main_list_model(id) { 0u8 } else { 1 };
-        (cap, main)
-    });
-    merged
-        .into_iter()
-        .map(|(id, st)| json!({ "id": id, "supports_tools": st }))
-        .collect()
-}
-
-/// 瑙ｆ瀽鎺㈡祴鐢?key锛氭柊濉殑浼樺厛锛屽惁鍒欐部鐢?profile_id 宸插瓨鐨勶紙鍚庣鍐呴儴鐢紝缁濅笉鍥炰紶鍓嶇锛夈€?fn resolve_probe_key(profile_id: Option<&str>, candidate: &str) -> Result<String, String> {
-    let c = candidate.trim();
-    if !c.is_empty() {
-        return Ok(c.to_string());
-    }
-    let pid = profile_id.ok_or("璇峰厛濉啓 API Key / Token銆?)?;
-    let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
-    cfg.profile_by_id(pid)
-        .map(|p| p.api_key.clone())
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| "璇峰厛濉啓 API Key / Token銆?.to_string())
-}
-
-/// 銆岃幏鍙栧彲鐢ㄦā鍨嬨€嶁€斺€旂函 scratch 鎺㈡祴锛氬彧鐢ㄤ复鏃朵唬鐞嗘帰鍊欓€?base_url/key 鐨?/v1/models锛?/// 缁濅笉鍐?config銆佷笉鏀?AppState銆佷笉纰版鍦ㄦ湇鍔?Science 鐨勬寮忎唬鐞嗐€?#[tauri::command]
-fn fetch_models(app: tauri::AppHandle, req: FetchModelsReq) -> Result<serde_json::Value, String> {
-    let tid = req.template_id.trim();
-    let tpl = templates::by_id(tid).ok_or_else(|| format!("鏈煡妯℃澘锛歿tid}"))?;
-    let base_url = if tpl.base_url_editable {
-        req.base_url.trim().to_string()
-    } else {
-        tpl.base_url.to_string()
-    };
-    if base_url.is_empty() || !(base_url.starts_with("http://") || base_url.starts_with("https://"))
-    {
-        return Err("璇峰厛濉啓 base_url锛坔ttp:// 鎴?https:// 寮€澶达級銆?.into());
-    }
-    let key = resolve_probe_key(req.profile_id.as_deref(), &req.key)?;
-    let root = asset_root(&app).ok_or("鎵句笉鍒颁唬鐞嗚剼鏈?proxy/csswitch_proxy.py銆?)?;
-    let py = proc::find_exe("python3").ok_or("缂哄皯渚濊禆 python3锛堣捣涓存椂浠ｇ悊闇€瑕侊級銆?)?;
-    let script = root.join("proxy/csswitch_proxy.py");
-
-    let res = scratch::scratch_probe(
-        &py,
-        &script,
-        &scratch::ScratchTarget {
-            provider: "relay",
-            key_env: "CSSWITCH_RELAY_KEY",
-            base_url: &base_url,
-            key: &key,
-            model: None,
-            relay_thinking: tpl.thinking_policy,
-        },
-        scratch::ProbeKind::Models,
-    );
-    let builtin = tpl.builtin_models;
-    match scratch::classify(res.status) {
-        scratch::ProbeOutcome::Ok => {
-            let v: serde_json::Value =
-                serde_json::from_str(&res.body).map_err(|e| format!("瑙ｆ瀽妯″瀷鍒楄〃澶辫触锛歿e}"))?;
-            let live: Vec<(String, Option<bool>)> = v
-                .get("data")
-                .and_then(|d| d.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| {
-                            let id = m.get("id")?.as_str()?.to_string();
-                            let st = m.get("supports_tools").and_then(|b| b.as_bool());
-                            Some((id, st))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if live.is_empty() {
-                return Ok(json!({
-                    "models": merge_and_sort_models(vec![], builtin),
-                    "source": "builtin", "error_kind": null, "upstream_status": 200
-                }));
-            }
-            Ok(json!({
-                "models": merge_and_sort_models(live, builtin),
-                "source": "live", "error_kind": null, "upstream_status": 200
-            }))
-        }
-        scratch::ProbeOutcome::Auth(code) => {
-            Err(format!("涓婃父鎷掔粷锛坽code}锛夛紝key 鎴栨潈闄愬彲鑳芥湁璇€?))
-        }
-        // 闈?200 涓旈潪 Auth锛氫竴寰?builtin 鍏滃簳锛屼絾鎸夎涔夊垎銆屽彂鐜颁笉鏀寔銆?4xx) 涓庛€岀綉缁?涓婃父涓存椂銆?5xx/429/鏃犲搷搴?锛?        // 渚涘墠绔尯鍒嗘彁绀猴紙spec v3 搂3.4.3锛夈€傜粷涓嶆妸 Auth 娣疯繘鏉ユ帺鐩栧潖 key銆?        other => {
-            let source = scratch::discovery_fallback_source(&other);
-            let error_kind = if source == "network" {
-                json!("network")
-            } else {
-                json!(null)
-            };
-            Ok(json!({
-                "models": merge_and_sort_models(vec![], builtin),
-                "source": source,
-                "error_kind": error_kind,
-                "upstream_status": res.status
-            }))
-        }
-    }
-}
-
-/// 鎺㈡祴绫诲瀷閫夋嫨锛堢函鍑芥暟锛屼慨鐪熸満 P1锛夛細
-/// - 鍘熺敓 adapter锛坉eepseek/qwen锛夌殑 `/v1/models` 鏄€愰潤鎬佸垪琛ㄣ€佷笉鍥炴簮銆戯紝鎺笉鍑哄潖 key锛屾晠涓€寰嬬敤
-///   Message 鎺㈡祴锛堟墦 `/v1/messages` 浼氱湡鍙戜笂娓革紝鍧?key 鈫?401锛夈€?/// - relay锛氱暀绌虹敤 Models锛坄/v1/models` 鍥炴簮鍗冲彲楠岀鐐?閴存潈锛夛紱閫変簡鍏蜂綋妯″瀷鐢?Message 楠岃妯″瀷銆?fn probe_kind_for(adapter: &str, model: &str) -> scratch::ProbeKind {
-    if is_native_adapter(adapter) {
-        return scratch::ProbeKind::Message; // native /v1/models 闈欐€侊紝鍙湁 Message 鎵撲笂娓歌兘楠?key銆?    }
-    probe_kind_for_model(model)
-}
-
-/// 閫変簡妯″瀷 鈫?楠屽叿浣撴ā鍨嬶紙POST /v1/messages锛夛紱鐣欑┖ 鈫?楠岀鐐?閴存潈锛圙ET /v1/models锛夈€?fn probe_kind_for_model(model: &str) -> scratch::ProbeKind {
-    if model.trim().is_empty() {
-        scratch::ProbeKind::Models
-    } else {
-        scratch::ProbeKind::Message
+    let (port, secret, _action) = ensure_proxy(&app, &state)?;
+    // 走稳定模型 id（代理内部映射到当前 provider 的真实模型），非流式、只要 1 个 token。
+    let body = br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}"#;
+    match proc::http_post_status(port, Some(&secret), "/v1/messages", body, 15000) {
+        Some(200) => Ok(json!({ "ok": true, "hint": "key 有效，上游已接受。" })),
+        Some(code @ (401 | 403)) => Ok(
+            json!({ "ok": false, "hint": format!("上游拒绝（{code}），key 可能无效或无权限。") }),
+        ),
+        Some(code) => Ok(json!({
+            "ok": false,
+            "hint": format!("上游返回 {code}，可能是 key 无效、额度不足或上游异常。")
+        })),
+        None => Err("验证请求无响应（多为网络或上游不通）。".to_string()),
     }
 }
 
 #[tauri::command]
-fn stop_all(
-    app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
-) -> Result<(), String> {
-    lifecycle.with_serialized(|| {
-        lifecycle.bump_generation(); // 浣滃簾浠讳綍鍦ㄩ€斿惎鍔紙闃茶鍋滃悗鍙堟嬁鏃?key 澶嶆椿锛?        let mut st = lock(&state);
-        let sandbox_res = stop_sandbox_inner(&app, &mut st);
-        kill_child(&mut st.proxy);
-        st.secret.clear();
-        st.provider.clear();
-        st.key_fp = 0;
-        sandbox_res.map_err(|e| format!("浠ｇ悊宸插仠锛涗絾{e}鐪熷疄瀹炰緥 8765 鏈彈褰卞搷銆?))
-    })
+fn stop_all(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let mut st = lock(&state);
+    // 先停沙箱并记录结果；代理无论如何都杀。沙箱没停干净则如实返错，不虚报成功。
+    let sandbox_res = stop_sandbox_inner(&app, &mut st);
+    kill_child(&mut st.proxy);
+    st.secret.clear();
+    sandbox_res.map_err(|e| format!("代理已停；但{e}真实实例 8765 未受影响。"))
 }
 
+/// 「一键开始」：起代理 → 写虚拟 OAuth → 起沙箱 Science → 探活 → 开浏览器。
+/// 仅 macOS 本地模式有效。Windows/其他平台应使用远程模式 (`remote_*` 命令)。
 #[tauri::command]
 fn one_click_login(
-    app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    _app: tauri::AppHandle,
+    _state: State<'_, Mutex<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    lifecycle.with_serialized(|| one_click_login_inner(app, state, lifecycle.inner()))
-}
-
-/// 涓€閿紑濮嬫湰浣擄紙缁忎覆琛屽櫒锛夛細纭繚浠ｇ悊鍦ㄨ窇涓斿仴搴?鈫?骞傜瓑铏氭嫙鐧诲綍 鈫?璧锋矙绠?鈫?鎵撳紑 UI銆?fn one_click_login_inner(
-    app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: &lifecycle::Lifecycle,
-) -> Result<serde_json::Value, String> {
-    // 1~3. 纭繚浠ｇ悊鍦ㄨ窇涓斿仴搴凤紙鍐呴儴宸叉煡鐢熸晥 profile銆乲ey銆佹帰娲伙級銆傚甫鍥炴湰娆℃槸澶嶇敤杩樻槸閲嶅惎銆?    let (pport, secret, proxy_action) = ensure_proxy(&app, &state, lifecycle)?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("本地模式「一键开始」仅支持 macOS。请切换到「远程服务器」模式管理 Linux 服务器上的 Science。".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+    // 1~3. 确保代理在跑且健康（内部已查 key、探活）。带回本次是复用还是重启。
+    let (pport, secret, proxy_action) = ensure_proxy(&app, &state)?;
 
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
     let sport = cfg.sandbox_port;
 
+    // sandbox_home() 作沙箱根：伪造器要求解析后的 auth_dir 落在其下，防符号链接重定向（P1）。
     let sbx_home = sandbox_home();
     let auth_dir = sbx_home.join(".claude-science");
 
-    // 娌欑宸插仴搴?鈫?浣嗐€宒aemon 娲荤潃銆嶁墵銆岀櫥褰曟€佸彲鐢ㄣ€嶏細鍏堝彧璇绘牎楠岃櫄鎷熺櫥褰曟槸鍚﹁嚜娲姐€?    if sandbox_running_ours(sport) {
+    // 沙箱已健康 → 但「daemon 活着」≠「登录态可用」：先只读校验虚拟登录是否自洽（修 0.2.1 Bug2）。
+    // - 自洽 → 绝不重伪造、绝不重跑 launch（连 auth 文件都不读，operon 可能正在用），只重取
+    //   URL + 打开。修 #3/#6：活动 org 不变，旧对话一直在。
+    // - 健康但登录失效（旧版遗留 / 凭证损坏 / 已落登录页）→ 重开也只会再落登录页，故停沙箱、
+    //   落到下面「修复保 org + 重启」路径自愈（0.2.0 的健康快捷路径漏了这一步）。
+    // P2b：asset_root() 只在下面「需启动」分支才取。
+    // P2（GPT 复审）：用 sandbox_running_ours 而非裸端口 /health——按 data-dir 强身份判定，
+    // 避免端口被冒名服务占用且恰好返回 200 时误报「已重新打开 Science」。
+    if sandbox_running_ours(sport) {
         if oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home) {
             let url = sandbox_url(sport);
             {
@@ -1396,41 +607,49 @@ fn one_click_login(
                 st.sandbox_url = Some(url.clone());
             }
             let base = match proxy_action {
-                ProxyAction::Reused => "宸插湪杩愯",
-                ProxyAction::Restarted => "宸茬敤鏂伴厤缃噸鍚唬鐞嗭紝Science 娌跨敤涓嶅彉",
+                ProxyAction::Reused => "已在运行",
+                ProxyAction::Restarted => "已用新配置重启代理，Science 沿用不变",
             };
+            // P2c：捕获打开结果——open 失败不谎报「已重新打开」，改提示手动打开。
             let msg = match open_in_browser(&url) {
-                Ok(()) => format!("{base}锛屽凡閲嶆柊鎵撳紑 Science銆?),
-                Err(_) => format!("{base}锛屾湇鍔″凡灏辩华锛岃鎵嬪姩鎵撳紑锛歿url}"),
+                Ok(()) => format!("{base}，已重新打开 Science。"),
+                Err(_) => format!("{base}，服务已就绪，请手动打开：{url}"),
             };
             return Ok(json!({ "url": url, "msg": msg, "action": "reopened" }));
         }
+        // 健康但登录态失效：停沙箱，让下面 relaunch 拿到修复后的登录材料（daemon 运行中不会
+        // 重读 auth）。ensure_virtual_login 幂等：保住 org（旧对话不丢），只重铸失效的登录。
         {
             let mut st = lock(&state);
             let _ = stop_sandbox_inner(&app, &mut st);
         }
     }
 
-    // 娌欑娌¤捣 / 鎸備簡 / 鐧诲綍澶辨晥宸插仠 鈫?闇€瑕?launch 璧勬簮锛屾鏃舵墠瀹氫綅銆傜‘淇濊櫄鎷熺櫥褰曪紙骞傜瓑锛? launch銆?    let root = asset_root(&app)
-        .ok_or("鎵句笉鍒?scripts/launch-virtual-sandbox.sh锛堟墦鍖呰祫婧愭垨浠撳簱鏍瑰潎鏈懡涓級銆?)?;
+    // 沙箱没起 / 挂了 / 登录失效已停 → 需要 launch 资源，此时才定位（P2b）。确保虚拟登录（幂等）+ launch。
+    let root = asset_root(&app)
+        .ok_or("找不到 scripts/launch-virtual-sandbox.sh（打包资源或仓库根均未命中）。")?;
 
+    // 进程内确保虚拟 OAuth（Rust 原生密码学，零 node）。幂等：现有登录完整就复用、部分坏就
+    // 修复但保住 org、真首次才铸新 —— 修 #3/#6 的核心（不再无条件换 org 孤儿化旧对话）。
     let (forged, login_action) =
         oauth_forge::ensure_virtual_login(&auth_dir, "virtual@localhost.invalid", &sbx_home)
-            .map_err(|e| format!("鍐欒櫄鎷熺櫥褰曞け璐ワ細{e}"))?;
+            .map_err(|e| format!("写虚拟登录失败：{e}"))?;
 
     let launch = root.join("scripts/launch-virtual-sandbox.sh");
     if !launch.is_file() {
-        return Err("鎵句笉鍒?scripts/launch-virtual-sandbox.sh銆?.into());
+        return Err("找不到 scripts/launch-virtual-sandbox.sh。".into());
     }
 
-    // 4. 璧锋矙绠憋細鑴氭湰浠?--detached 璧?Science锛岀劧鍚庤繑鍥炪€?    let proxy_url = format!("http://127.0.0.1:{pport}/{secret}");
-    let logf = open_log("sandbox.log").map_err(|e| format!("寤烘棩蹇楀け璐ワ細{e}"))?;
+    // 4. 起沙箱：脚本以 --detached 起 Science，然后返回。
+    let proxy_url = format!("http://127.0.0.1:{pport}/{secret}");
+    let logf = open_log("sandbox.log").map_err(|e| format!("建日志失败：{e}"))?;
+    // 虚拟登录摘要面包屑（无密钥；uuid/假账号/沙箱路径均不敏感），便于用户附日志排查。
     {
         use std::io::Write;
         let mut lw = &logf;
         let _ = writeln!(
             lw,
-            "[oauth] 铏氭嫙鐧诲綍宸插氨缁紙Rust锛岄浂 node锛沘ction={:?}锛夛細auth_dir={} account={} org={} enc={}",
+            "[oauth] 虚拟登录已就绪（Rust，零 node；action={:?}）：auth_dir={} account={} org={} enc={}",
             login_action,
             forged.auth_dir.display(),
             forged.account_uuid,
@@ -1439,24 +658,26 @@ fn one_click_login(
         );
     }
     let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-    let status = Command::new("zsh")
+    let status = Command::new("zsh") // launch 脚本是 #!/bin/zsh（用了 ${VAR:A} realpath）
         .arg(&launch)
         .arg("--port")
         .arg(sport.to_string())
         .arg("--proxy-url")
         .arg(&proxy_url)
-        .arg("--skip-oauth-forge")
+        .arg("--skip-oauth-forge") // OAuth 已由上面 Rust 进程内伪造，脚本别再调 node
+        // 沙箱状态落在可写目录（打包后资源目录只读），launch/stop/取 URL 三处同一路径。
         .env("SANDBOX_HOME", sandbox_home())
         .stdout(Stdio::from(logf))
         .stderr(Stdio::from(logf2))
         .status()
-        .map_err(|e| format!("璧锋矙绠卞け璐ワ細{e}"))?;
+        .map_err(|e| format!("起沙箱失败：{e}"))?;
     if !status.success() {
         let tail = redact(&tail_file(&log_path("sandbox.log"), 600), &secret);
-        return Err(format!("璧锋矙绠辫剼鏈け璐ャ€俓n{tail}"));
+        return Err(format!("起沙箱脚本失败。\n{tail}"));
     }
 
-    // 5. 杞娌欑 /health 鐩村埌灏辩华鎴栬秴鏃讹紙~8s锛夈€?    let mut ok = false;
+    // 5. 轮询沙箱 /health 直到就绪或超时（~8s）。
+    let mut ok = false;
     for _ in 0..80 {
         std::thread::sleep(Duration::from_millis(100));
         if proc::http_health(sport, None, 400) {
@@ -1466,43 +687,58 @@ fn one_click_login(
     }
     if !ok {
         let tail = redact(&tail_file(&log_path("sandbox.log"), 600), &secret);
+        // 探活超时：脚本已把 Science 以 --detached 起在后台，必须停掉，
+        // 否则留一个孤儿沙箱进程（修 P2-2）。
+        {
+            let mut st = lock(&state);
+            let _ = stop_sandbox_inner(&app, &mut st); // best-effort 清理，结果不影响这里的报错
+        }
+        return Err(format!(
+            "沙箱起后探活超时（端口 {sport}）。已尝试停掉刚起的沙箱。\n{tail}"
+        ));
+    }
+
+    // 5b. 身份确认（修 P2 GPT 复审）：/health 200 只证明端口在服务，不证明是我们的 Science。
+    // 用 data-dir 强身份再确认一次；不是我们的（端口被冒名服务占用）→ 当启动失败处理，
+    // 停掉可能已在后台的沙箱并如实报错，别对着冒名服务谎报「已启动」。
+    if !sandbox_running_ours(sport) {
         {
             let mut st = lock(&state);
             let _ = stop_sandbox_inner(&app, &mut st);
         }
         return Err(format!(
-            "娌欑璧峰悗鎺㈡椿瓒呮椂锛堢鍙?{sport}锛夈€傚凡灏濊瘯鍋滄帀鍒氳捣鐨勬矙绠便€俓n{tail}"
+            "端口 {sport} 有服务响应，但按 data-dir 确认不是本沙箱 Science（疑似被其它服务占用）。已尝试停掉刚起的沙箱。"
         ));
     }
 
-    // 5b. 韬唤纭锛?health 200 鍙瘉鏄庣鍙ｅ湪鏈嶅姟锛岀敤 data-dir 寮鸿韩浠藉啀纭涓€娆°€?    if !sandbox_running_ours(sport) {
-        {
-            let mut st = lock(&state);
-            let _ = stop_sandbox_inner(&app, &mut st);
-        }
-        return Err(format!(
-            "绔彛 {sport} 鏈夋湇鍔″搷搴旓紝浣嗘寜 data-dir 纭涓嶆槸鏈矙绠?Science锛堢枒浼艰鍏跺畠鏈嶅姟鍗犵敤锛夈€傚凡灏濊瘯鍋滄帀鍒氳捣鐨勬矙绠便€?
-        ));
-    }
-
-    // 6. 鍙?UI URL锛堢櫥褰曟€侊級锛屼氦绯荤粺娴忚鍣ㄦ墦寮€銆?    let url = sandbox_url(sport);
+    // 6. 取 UI URL（登录态），交系统浏览器打开。
+    let url = sandbox_url(sport);
     {
         let mut st = lock(&state);
         st.sandbox_port = sport;
         st.sandbox_url = Some(url.clone());
     }
     let started = match login_action {
-        oauth_forge::LoginAction::Created => "宸插惎鍔?,
-        _ => "娌欑宸查噸鏂板惎鍔紝娌跨敤鍘熸湁瀵硅瘽",
+        oauth_forge::LoginAction::Created => "已启动",
+        _ => "沙箱已重新启动，沿用原有对话", // Reused / Repaired
     };
+    // P2c：同样捕获打开结果。
     let msg = match open_in_browser(&url) {
-        Ok(()) => format!("{started}銆?),
-        Err(_) => format!("{started}锛屾湇鍔″凡灏辩华锛岃鎵嬪姩鎵撳紑锛歿url}"),
+        Ok(()) => format!("{started}。"),
+        Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
     };
     Ok(json!({ "url": url, "msg": msg, "action": "started" }))
+    } // #[cfg(target_os = "macos")]
 }
 
-/// 浠?`claude-science url` 鐨?stdout 閲屽彇**绗竴鏉?*鍚堟硶 http(s) URL銆?fn first_http_url(stdout: &str) -> Option<String> {
+/// 从 `claude-science url` 的 stdout 里取**第一条**合法 http(s) URL。
+/// 仅 macOS 本地模式需要（依赖 `claude-science` 二进制调用）。
+/// Science 的 `url` 命令会输出多行（第一行是真 URL，随后行是「single-use…」说明）；把整段
+/// stdout 当 URL 交给 `open` 会带上换行与说明文字 → 打开错误入口、nonce 不被正确消费 → 落到
+/// `/login`（修 0.2.1 Bug1）。故逐行找第一条以 `http://`/`https://` 开头的行，并只取该行首个
+/// 非空白 token（URL 内不含空白，若同行尾随了说明也被切掉）。找不到返回 None。
+#[cfg(target_os = "macos")]
+fn first_http_url(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
         let t = line.trim();
         if t.starts_with("http://") || t.starts_with("https://") {
@@ -1513,7 +749,17 @@ fn one_click_login(
     None
 }
 
-/// 鍙栨矙绠?UI 閾炬帴锛歚<bin> url --data-dir <home>/.claude-science`锛孒OME 鎸囧悜娌欑 HOME銆?fn sandbox_url(port: u16) -> String {
+/// 取沙箱 UI 链接：`<bin> url --data-dir <home>/.claude-science`，HOME 指向沙箱 HOME。
+/// 仅 macOS 调用（one_click_login 的 macOS 路径）。非 macOS 平台编译通过但无调用方。
+/// 失败退回 http://127.0.0.1:<port>。沙箱 HOME 用 [`sandbox_home`]（与 launch 时一致）。
+#[allow(dead_code)]
+fn sandbox_url(port: u16) -> String {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return format!("http://127.0.0.1:{port}");
+    }
+    #[cfg(target_os = "macos")]
+    {
     let home = sandbox_home();
     let data_dir = home.join(".claude-science");
     if Path::new(SCIENCE_BIN).is_file() {
@@ -1525,16 +771,29 @@ fn one_click_login(
             .output()
         {
             let s = String::from_utf8_lossy(&out.stdout);
+            // 只取第一条合法 URL（修 0.2.1 Bug1）：url 命令多行输出里第一行才是真 URL。
             if let Some(url) = first_http_url(&s) {
                 return url;
             }
         }
     }
     format!("http://127.0.0.1:{port}")
+    } // #[cfg(target_os = "macos")]
 }
 
-/// 鍒ゆ柇銆屾垜浠嚜宸辩殑銆嶆矙绠?Science 鏄惁鍦ㄨ窇锛堜緵涓€閿仴搴峰垎娲撅級銆備紭鍏堢敤 Science 浜岃繘鍒舵寜
-/// 銆愭垜浠殑 data-dir銆戞煡 `{"running":true}`锛堝己韬唤锛夛紱鍐嶅彔鍔犵鍙?/health 纭銆?fn sandbox_running_ours(port: u16) -> bool {
+/// 判断「我们自己的」沙箱 Science 是否在跑（供一键健康分派）。收紧（P2 GPT 复审）：优先用
+/// Science 二进制按【我们的 data-dir】查 `{"running":true}`，这是强身份——不会被恰好占用
+/// `port` 且返回 200 的冒名服务骗过；再叠加端口 /health 确认确实在服务。二进制不在（纯 dev /
+/// 研究者机器）时退化为仅端口探活（原行为）。
+/// 仅 macOS 调用（one_click_login/status 的 macOS 路径）。非 macOS 退化为纯端口探活。
+#[allow(dead_code)]
+fn sandbox_running_ours(port: u16) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return proc::http_health(port, None, 400);
+    }
+    #[cfg(target_os = "macos")]
+    {
     let home = sandbox_home();
     let data_dir = home.join(".claude-science");
     if Path::new(SCIENCE_BIN).is_file() {
@@ -1547,18 +806,24 @@ fn one_click_login(
         {
             Ok(out) => {
                 let s = String::from_utf8_lossy(&out.stdout);
-                let running = s.contains("\"running\":true") || s.contains("\"running\": true");
+                // 审核 P2-8 修复：用 serde_json 解析而非 contains 字符串匹配（避免嵌套误判）。
+                let running = serde_json::from_str::<serde_json::Value>(&s)
+                    .map(|v| v.get("running").and_then(|r| r.as_bool()).unwrap_or(false))
+                    .unwrap_or(false);
                 return running && proc::http_health(port, None, 400);
             }
+            // 二进制在但调用失败 → 保守退化到端口探活，别因探测本身出错就误判没起。
             Err(_) => return proc::http_health(port, None, 400),
         }
     }
     proc::http_health(port, None, 400)
+    } // #[cfg(target_os = "macos")]
 }
 
 #[tauri::command]
 fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
-    // 鍙湪閿佸唴鍙栧€硷紝閿佸鍋氶樆濉炴帰娲汇€?    let (pport, secret, sport, adapter, base_url) = {
+    // 只在锁内取值，锁外做阻塞探活。
+    let (pport, secret, sport, provider) = {
         let st = lock(&state);
         let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
         let pport = if st.proxy_port != 0 {
@@ -1571,27 +836,21 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
         } else {
             cfg.sandbox_port
         };
-        // 涓婃父鐏鐢熸晥 profile 鐨?adapter/base_url锛涙棤鐢熸晥閰嶇疆 鈫?绌猴紙鐏樉榛勶紝涓嶈鎺級銆?        let (adapter, base_url) = match cfg.active_profile() {
-            Some(p) => (
-                templates::adapter_for(&p.template_id).to_string(),
-                p.base_url.clone(),
-            ),
-            None => (String::new(), String::new()),
-        };
-        (pport, st.secret.clone(), sport, adapter, base_url)
+        (pport, st.secret.clone(), sport, cfg.provider)
     };
     let proxy = if !secret.is_empty() && proc::http_health(pport, Some(&secret), 300) {
         "green"
     } else {
         "amber"
     };
+    // 状态灯也用 data-dir 强身份（修 P2 GPT 复审），避免端口被冒名服务占用时误显绿灯。
+    // status() 是按需调用（前端 refreshStatus 在动作后触发，非高频轮询），一次子进程可接受。
     let sandbox = if sandbox_running_ours(sport) {
         "green"
     } else {
         "amber"
     };
-    let uhost = upstream_host(&adapter, &base_url);
-    let upstream = if !uhost.is_empty() && proc::tcp_reachable(&uhost, 443, 500) {
+    let upstream = if proc::tcp_reachable(upstream_host(&provider), 443, 500) {
         "green"
     } else {
         "amber"
@@ -1602,30 +861,32 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
 #[tauri::command]
 fn open_url(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
     let url = { lock(&state).sandbox_url.clone() };
-    let url = url.ok_or("杩樻病鏈夋矙绠?URL锛岃鍏堛€屼竴閿紑濮嬨€嶃€?)?;
+    let url = url.ok_or("还没有沙箱 URL，请先「一键开始」。")?;
     open_in_browser(&url)
 }
 
+/// 运行诊断脚本 `scripts/doctor.sh`。仅 macOS 本地模式有效。
+/// Windows/其他平台上返回明确提示，引导使用远程模式诊断。
 #[tauri::command]
-fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
-    let root = asset_root(&app).ok_or("鎵句笉鍒?scripts/doctor.sh锛堟墦鍖呰祫婧愭垨浠撳簱鏍瑰潎鏈懡涓級銆?)?;
+fn run_doctor(_app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("本地模式「自检」仅支持 macOS。请切换到「远程服务器」模式使用远程诊断功能。".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+    let root = asset_root(&app).ok_or("找不到 scripts/doctor.sh（打包资源或仓库根均未命中）。")?;
     let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
     let doctor = root.join("scripts/doctor.sh");
-    // 鐢熸晥 profile 鐨勫睍绀哄悕锛坱emplate_id锛? adapter + 鏈夋棤 key锛涙棤鐢熸晥閰嶇疆鍒欑暀绌恒€?    let (provider_label, adapter, has_key) = match cfg.active_profile() {
-        Some(p) => (
-            p.template_id.clone(),
-            templates::adapter_for(&p.template_id),
-            !p.api_key.is_empty(),
-        ),
-        None => (String::new(), "", false),
-    };
     let mut cmd = Command::new("bash");
-    // 澶?profile锛氫紶 template_id + adapter + key 鏈夋棤锛堝竷灏旓級銆俤octor 涓嶅啀鎸?provider 鍚嶅啓姝汇€?    // 涓嶅啀鍘?shell 鐜鎵?key锛坘ey 瀛?config.json锛夈€傜粷涓嶆妸鐪熷疄 key 鍊间紶杩涘叾鐜銆?    cmd.arg(&doctor)
-        .env("CSSWITCH_PROVIDER", &provider_label)
-        .env("CSSWITCH_ADAPTER", adapter)
-        .env("CSSWITCH_KEY_PRESENT", if has_key { "1" } else { "0" })
+    cmd.arg(&doctor)
+        .env("CSSWITCH_PROVIDER", &cfg.provider)
         .env("CSSWITCH_PROXY_PORT", cfg.proxy_port.to_string())
         .env("CSSWITCH_SANDBOX_PORT", cfg.sandbox_port.to_string());
+    // doctor 只做 -n 判空来报 key 有无。只让它知道「存在」，绝不把真实 key 传进其环境。
+    if cfg.key_for(&cfg.provider).is_some() {
+        cmd.env(key_env(&cfg.provider), "***present***");
+    }
     let out = cmd.output().map_err(|e| e.to_string())?;
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     let err = String::from_utf8_lossy(&out.stderr);
@@ -1634,37 +895,61 @@ fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
         text.push_str(err.trim());
     }
     Ok(text)
+    } // #[cfg(target_os = "macos")]
 }
 
-/// 褰撳墠 app 鐗堟湰锛堜緵鍓嶇銆屾鏌ユ洿鏂般€嶄笌椤佃剼鐗堟湰鍙风敤锛夈€?#[tauri::command]
+/// 当前 app 版本（供前端「检查更新」与页脚版本号用）。
+#[tauri::command]
 fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// 鎵撳紑 GitHub Releases 椤碉紙妫€鏌ユ洿鏂版椂鐢ㄧ郴缁熸祻瑙堝櫒鎵撳紑锛屾祻瑙堝櫒璧扮敤鎴疯嚜宸辩殑浠ｇ悊锛夈€?#[tauri::command]
+/// 打开 GitHub Releases 页（检查更新时用系统浏览器打开，浏览器走用户自己的代理）。
+#[tauri::command]
 fn open_release_page() -> Result<(), String> {
-    open_in_browser("https://github.com/SuperJJ007/CSSwitch/releases/latest")
+    open_in_browser("https://github.com/SuperJJ007/CSswitch/releases/latest")
 }
 
-/// 鎵撳紑銆屾姤 bug銆嶉〉锛堥濉?bug 妯℃澘锛夛紱鐢ㄧ郴缁熸祻瑙堝櫒锛岃蛋鐢ㄦ埛鑷繁鐨勪唬鐞嗐€?#[tauri::command]
+/// 打开「报 bug」页（预填 bug 模板）；用系统浏览器，走用户自己的代理。
+#[tauri::command]
 fn report_bug() -> Result<(), String> {
-    open_in_browser("https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml")
+    open_in_browser("https://github.com/SuperJJ007/CSswitch/issues/new?template=bug_report.yml")
 }
 
-/// 鍦ㄨ杈鹃噷鎵撳紑鏃ュ織鐩綍 `~/.csswitch/logs`锛屾柟渚跨敤鎴烽檮鍒?bug 鍙嶉閲岋紙鍏堣嚜鏌ユ湁鏃犲瘑閽ワ級銆?#[tauri::command]
+/// 在文件管理器中打开日志目录 `~/.csswitch/logs`（跨平台）。
+/// macOS 用 `open`，Windows 用 `explorer`，Linux 用 `xdg-open`。
+#[tauri::command]
 fn open_logs() -> Result<(), String> {
     let dir = config::default_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
-    Command::new("open")
-        .arg(&dir)
-        .status()
-        .map_err(|e| format!("鎵撳紑鏃ュ織鐩綍澶辫触锛歿e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&dir)
+            .status()
+            .map_err(|e| format!("打开日志目录失败：{e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(&dir)
+            .status()
+            .map_err(|e| format!("打开日志目录失败：{e}"))?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Command::new("xdg-open")
+            .arg(&dir)
+            .status()
+            .map_err(|e| format!("打开日志目录失败：{e}"))?;
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    // 榛樿锛氶€€ app 鍋滀唬鐞嗐€佷繚鐣欐矙绠辫繍琛岋紙spec 搂5.1锛夈€?    {
+    // 默认：退 app 停代理、保留沙箱运行（spec §5.1）。
+    {
         let mut st = lock(&state);
         kill_child(&mut st.proxy);
         st.secret.clear();
@@ -1673,28 +958,21 @@ fn quit_app(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<
     Ok(())
 }
 
-// ---------- 鍏ュ彛 ----------
+// ---------- 入口 ----------
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(Mutex::new(AppState::default()))
-        .manage(lifecycle::Lifecycle::new())
         .invoke_handler(tauri::generate_handler![
+            // 本地命令（macOS 本地模式）
             get_config,
-            list_templates,
-            set_settings,
+            set_config,
             set_mode,
             open_official,
-            create_profile,
-            update_profile_metadata,
-            update_profile_connection,
-            clear_profile_key,
-            delete_profile,
-            set_active_profile,
+            save_provider_key,
             start_proxy,
             verify_key,
-            fetch_models,
             stop_all,
             one_click_login,
             status,
@@ -1705,7 +983,7 @@ pub fn run() {
             report_bug,
             open_logs,
             quit_app,
-            // 杩滅▼鍛戒护锛堣法骞冲彴锛?
+            // 远程命令（跨平台）
             remote_commands::remote_list_profiles,
             remote_commands::remote_save_profile,
             remote_commands::remote_delete_profile,
@@ -1721,12 +999,19 @@ pub fn run() {
             remote_commands::remote_verify_key,
             remote_commands::remote_status,
             remote_commands::remote_logs,
+            remote_commands::remote_doctor,
+            remote_commands::remote_one_click,
         ])
         .setup(|app| {
-            // 姝ｅ父妗岄潰搴旂敤锛氳繘 Dock銆佽蛋甯歌搴旂敤鐢熷懡鍛ㄦ湡銆傜獥鍙ｅ湪 tauri.conf.json 閲岄厤浜?            // decorations + visible + center锛屽惎鍔ㄥ嵆灞呬腑寮瑰嚭銆佸彲鎷栧姩銆傛墭鐩樺浘鏍囧凡绉婚櫎銆?
-            // 鍚姩鍗宠Е鍙戜竴娆?load锛氳嫢鏄棫 v1 鍥哄畾妲芥枃浠讹紝杩欓噷瀹屾垚 v1鈫抳2 杩佺Щ + 钀界洏 + 鐣?.v1.bak锛?            // 鎮┖ active 褰掍竴鍖栦负绌恒€傝縼绉婚€昏緫骞跺叆 config::load_from锛堜笉鍐嶅崟鐙窇 relay_presets锛夈€?            let _ = config::load_from(&config::default_dir());
+            // 正常桌面应用：进 Dock、走常规应用生命周期（默认 Regular 策略，
+            // 不再设 Accessory）。窗口在 tauri.conf.json 里配了 decorations（标题栏
+            // 三键：关闭/最小化/缩放）+ visible + center，启动即居中弹出、可拖动
+            // （修 #4；标题栏自带拖动，顺带解决 #1 拖不动）。托盘图标已移除。
 
-            // 鍏崇獥鍗抽€€鍑猴細涓庛€岄€€鍑恒€嶆寜閽竴鑷?鈥斺€?鍋滀唬鐞嗐€佹竻 secret锛屼繚鐣欐矙绠辫繍琛岋紙spec 搂5.1锛夈€?            if let Some(win) = app.get_webview_window("main") {
+            // 关窗即退出：与「退出」按钮一致 —— 停代理、清 secret，保留沙箱运行
+            // （spec §5.1）。不接这一步，从标题栏红叉关窗会绕过 quit_app 直接退，
+            // 把代理子进程留成孤儿。
+            if let Some(win) = app.get_webview_window("main") {
                 let handle = app.handle().clone();
                 win.on_window_event(move |ev| {
                     if let tauri::WindowEvent::CloseRequested { .. } = ev {
@@ -1745,389 +1030,40 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        assert_format_supported, build_get_config, build_list_templates, clear_profile_key_inner,
-        create_profile_inner, decide_switch, delete_profile_inner, first_http_url,
-        health_timeout_reason, is_main_list_model, key_env_for_adapter, key_fingerprint,
-        merge_and_sort_models, nonactive_probe_verdict, parse_host, probe_kind_for,
-        probe_kind_for_model, proxy_args_for, redact, relay_missing_base_url, relay_missing_model,
-        rollback_status_clause, sandbox_home, settings_change_needs_teardown,
-        should_scratch_candidate, should_write_back, skip_scratch_verify,
-        update_profile_connection_inner, update_profile_metadata_inner, upstream_host,
-        ConnectionEdit, SwitchOutcome,
-    };
-    use crate::config;
+    // first_http_url 和 sandbox_home 仅 macOS 编译，测试也仅在 macOS 运行。
+    #[cfg(target_os = "macos")]
+    use super::{first_http_url, sandbox_home};
+    use super::{key_fingerprint, redact};
 
-    /// 姣忎釜娴嬭瘯鐢ㄧ嫭绔嬩复鏃?`.csswitch` 鐩綍锛堣繘绋?id + 绾跨▼ id + 闅忔満鍚庣紑锛夛紝浜掍笉骞叉壈銆?    fn tmpdir_lib() -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!("csswitch-lib-test-{}", std::process::id()));
-        let d = base.join(format!(
-            "{:?}-{}",
-            std::thread::current().id(),
-            config::new_id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.join(".csswitch")
-    }
-
-    // ---------- B2: proxy_args_for / assert_format_supported ----------
-    #[test]
-    fn proxy_args_derive_adapter_and_key_env() {
-        use crate::config::Profile;
-        let ds = Profile {
-            template_id: "deepseek".into(),
-            api_format: "anthropic".into(),
-            base_url: "https://api.deepseek.com/anthropic".into(),
-            api_key: "sk-ds".into(),
-            ..Default::default()
-        };
-        let a = proxy_args_for(&ds);
-        assert_eq!(a.adapter, "deepseek");
-        assert_eq!(a.key_env, "DEEPSEEK_API_KEY");
-
-        let glm = Profile {
-            template_id: "glm".into(),
-            api_format: "anthropic".into(),
-            base_url: "https://open.bigmodel.cn/api/anthropic".into(),
-            api_key: "gk".into(),
-            model: "glm-5".into(),
-            ..Default::default()
-        };
-        let b = proxy_args_for(&glm);
-        assert_eq!(b.adapter, "relay");
-        assert_eq!(b.key_env, "CSSWITCH_RELAY_KEY");
-        assert_eq!(b.base_url, "https://open.bigmodel.cn/api/anthropic");
-        assert_eq!(b.model, "glm-5");
-    }
-
-    #[test]
-    fn unsupported_api_format_is_rejected() {
-        use crate::config::Profile;
-        let p = Profile {
-            template_id: "custom".into(),
-            api_format: "gemini_native".into(),
-            base_url: "https://x/y".into(),
-            api_key: "k".into(),
-            ..Default::default()
-        };
-        assert!(assert_format_supported(&p).is_err());
-        let ok = Profile {
-            api_format: "anthropic".into(),
-            ..p.clone()
-        };
-        assert!(assert_format_supported(&ok).is_ok());
-        let ok2 = Profile {
-            api_format: "openai_chat".into(),
-            ..p
-        };
-        assert!(assert_format_supported(&ok2).is_ok());
-    }
-
-    #[test]
-    fn key_env_for_adapter_maps_adapters() {
-        assert_eq!(key_env_for_adapter("deepseek"), "DEEPSEEK_API_KEY");
-        assert_eq!(key_env_for_adapter("qwen"), "DASHSCOPE_API_KEY");
-        assert_eq!(key_env_for_adapter("relay"), "CSSWITCH_RELAY_KEY");
-        assert_eq!(key_env_for_adapter("anything-else"), "CSSWITCH_RELAY_KEY");
-    }
-
-    // ---------- P1-c: 绔彛鍙樻洿鏄惁闇€鎷嗛摼璺紙绾嚱鏁帮紝4 缁勫悎锛?----------
-    #[test]
-    fn settings_teardown_when_any_port_changes() {
-        assert!(
-            !settings_change_needs_teardown(18991, 18991, 8990, 8990),
-            "绔彛鏈彉 鈫?涓嶆媶閾捐矾"
-        );
-        assert!(
-            settings_change_needs_teardown(18991, 19000, 8990, 8990),
-            "浠ｇ悊绔彛鍙?鈫?鎷嗭紙鏃т唬鐞嗙粦鏃х鍙ｃ€佹矙绠辩儤鏃?URL锛?
-        );
-        assert!(
-            settings_change_needs_teardown(18991, 18991, 8990, 9000),
-            "娌欑绔彛鍙?鈫?鎷嗭紙鏃ф矙绠卞湪鏃х鍙ｆ垚瀛ゅ効锛?
-        );
-        assert!(
-            settings_change_needs_teardown(18991, 19000, 8990, 9000),
-            "閮藉彉 鈫?鎷?
-        );
-    }
-
-    // ---------- P2-e: 鍥炴粴鎺緸濡傚疄锛堟仮澶嶅け璐ヤ笉寰楄皫绉板凡鍥炴粴锛?----------
-    #[test]
-    fn rollback_clause_tells_truth_when_restore_failed() {
-        assert!(
-            rollback_status_clause(true).contains("宸插洖婊?),
-            "鎭㈠鎴愬姛 鈫?璇村凡鍥炴粴"
-        );
-        let failed = rollback_status_clause(false);
-        assert!(
-            !failed.contains("宸插洖婊氬埌鍘熼厤缃?),
-            "鎭㈠澶辫触涓嶅緱璋庣О宸插洖婊氬埌鍘熼厤缃?
-        );
-        assert!(failed.contains("浠ｇ悊褰撳墠宸插仠"), "濡傚疄璇存槑浠ｇ悊宸插仠");
-    }
-
-    // ---------- P2-d: 闈?active銆屽瀹炴爣璁板悗淇濆瓨銆嶈鍐筹紙鏄庣‘鎷掔粷鎵嶆嫤锛?00=宸叉牎楠岋紱鍚硦/鏃犲搷搴?钀界洏浣嗘湭鏍￠獙锛?----------
-    #[test]
-    fn nonactive_probe_verdict_maps_outcomes() {
-        use crate::scratch::ProbeOutcome;
-        assert!(
-            nonactive_probe_verdict(&ProbeOutcome::Auth(401))
-                .unwrap_err()
-                .contains("401"),
-            "401 鏄庣‘閴存潈澶辫触 鈫?鎷︿笅涓嶈惤鐩?
-        );
-        assert!(
-            nonactive_probe_verdict(&ProbeOutcome::ModelError(404))
-                .unwrap_err()
-                .contains("404"),
-            "404 妯″瀷涓嶈鎺ュ彈 鈫?鎷︿笅涓嶈惤鐩?
-        );
-        assert_eq!(
-            nonactive_probe_verdict(&ProbeOutcome::Ok),
-            Ok(true),
-            "200 鈫?钀界洏涓斻€愬凡鏍￠獙銆?
-        );
-        assert_eq!(
-            nonactive_probe_verdict(&ProbeOutcome::Ambiguous(Some(429))),
-            Ok(false),
-            "鍚硦(429) 鈫?best-effort 钀界洏浣嗐€愭湭鏍￠獙銆?
-        );
-        assert_eq!(
-            nonactive_probe_verdict(&ProbeOutcome::NoResponse),
-            Ok(false),
-            "鏃犲搷搴?鈫?best-effort 钀界洏浣嗐€愭湭鏍￠獙銆?
-        );
-    }
-
-    // ---------- B3: 鍒囨崲浜嬪姟鍐崇瓥锛堢函鍑芥暟锛? 鍒嗘敮锛?----------
-    #[test]
-    fn transaction_commits_only_when_healthy() {
-        // scratch ok + real ok 鈫?鎻愪氦
-        assert_eq!(decide_switch(true, true), SwitchOutcome::Commit);
-        // scratch 鏍￠獙澶辫触 鈫?涓嶈捣姝ｅ紡銆佷笉鎻愪氦銆佹棫鎬佷笉鍔?        assert_eq!(decide_switch(false, false), SwitchOutcome::AbortBeforeStart);
-        assert_eq!(decide_switch(false, true), SwitchOutcome::AbortBeforeStart);
-        // scratch ok 浣嗘寮忚捣/鎺㈡椿澶辫触 鈫?鏉€鍊欓€夈€佹仮澶嶆棫銆佷笉鎻愪氦
-        assert_eq!(decide_switch(true, false), SwitchOutcome::RollbackToOld);
-    }
-
-    // ---------- MP-2 fix [3]: 鍐欏洖闂ㄧ函鍑芥暟锛坓en 鍚?寮?脳 secret 鍚?寮?4 缁勫悎锛?----------
-    #[test]
-    fn should_write_back_requires_both_gen_and_secret() {
-        // gen 鍚?+ secret 鍚?鈫?鍐欏洖锛堝悎娉曞惎鍔紝鏈鍙栦唬锛?        assert!(should_write_back(5, 5, "sekret", "sekret"));
-        // gen 鍚?+ secret 寮?鈫?涓嶅啓鍥烇紙琚苟鍙戝彟璧风敤涓嶅悓 secret 鍗犱簡妲斤紝鍐峰惎鍔ㄥ弻璧风獎绐楋級
-        assert!(!should_write_back(5, 5, "other", "sekret"));
-        // gen 寮?+ secret 鍚?鈫?涓嶅啓鍥烇紙琚竻 key/鍋?鍒?bump 鍙栦唬锛?        assert!(!should_write_back(5, 6, "sekret", "sekret"));
-        // gen 寮?+ secret 寮?鈫?涓嶅啓鍥?        assert!(!should_write_back(5, 6, "other", "sekret"));
-    }
-
-    // ---------- MP-2 fix [1]: 杩炴帴缂栬緫 validate-before-persist 鐨勫瓧娈靛簲鐢ㄩ€昏緫锛堝唴瀛?钀界洏鍏辩敤锛?----------
-    #[test]
-    fn connection_edit_apply_only_changes_provided_fields() {
-        use crate::config::Profile;
-        let mut p = Profile {
-            base_url: "old-url".into(),
-            api_format: "anthropic".into(),
-            model: "old-model".into(),
-            api_key: "old-key".into(),
-            ..Default::default()
-        };
-        let edit = ConnectionEdit {
-            base_url: Some("new-url".into()),
-            api_format: None, // None = 涓嶆敼
-            model: Some("new-model".into()),
-            key: Some(String::new()), // 绌?key = 涓嶆敼锛堢暀鍗犱綅涓嶈鐩栧凡瀛?key锛?        };
-        edit.apply(&mut p);
-        assert_eq!(p.base_url, "new-url");
-        assert_eq!(p.api_format, "anthropic", "None 瀛楁涓嶆敼");
-        assert_eq!(p.model, "new-model");
-        assert_eq!(p.api_key, "old-key", "绌?key 涓嶈鐩栧凡瀛?key");
-
-        // 闈炵┖ key 瑕嗙洊锛涘叾浣?None 涓嶅姩銆?        let edit2 = ConnectionEdit {
-            key: Some("new-key".into()),
-            ..Default::default()
-        };
-        edit2.apply(&mut p);
-        assert_eq!(p.api_key, "new-key", "闈炵┖ key 瑕嗙洊");
-        assert_eq!(p.base_url, "new-url", "None 瀛楁涓嶆敼");
-        assert_eq!(p.model, "new-model", "None 瀛楁涓嶆敼");
-    }
-
-    // ---------- B4: profile CRUD *_inner ----------
-    #[test]
-    fn create_profile_from_template_prefills() {
-        let d = tmpdir_lib();
-        let id =
-            create_profile_inner(&d, "glm", "鎴戠殑 GLM", Some("gk"), None, Some("glm-5.2")).unwrap();
-        let cfg = config::load_from(&d).unwrap();
-        let p = cfg.profile_by_id(&id).unwrap();
-        assert_eq!(p.template_id, "glm");
-        assert_eq!(p.name, "鎴戠殑 GLM");
-        assert_eq!(p.api_format, "anthropic");
-        assert_eq!(p.base_url, "https://open.bigmodel.cn/api/anthropic");
-        assert_eq!(p.api_key, "gk");
-        assert_eq!(cfg.active_id, "", "鏂板缓涓嶈嚜鍔ㄧ敓鏁?);
-    }
-
-    #[test]
-    fn create_relay_without_model_is_rejected() {
-        // 淇?#9 P1-a锛氬悗绔懡浠ゅ眰鐩存帴鍒涘缓 relay/鑷畾涔夌鐐圭┖ model 涔熻鎷︼紙涓嶅彉閲忎笉鍙粫杩囷級銆?        let d = tmpdir_lib();
-        let e = create_profile_inner(&d, "glm", "GLM", Some("gk"), None, None);
-        assert!(e.is_err(), "relay 绌?model 搴旀嫆缁濆垱寤?);
-        assert!(e.unwrap_err().contains("妯″瀷"));
-        // native 涓嶅彈绾︽潫锛坢odel 鍙┖锛夈€?        assert!(create_profile_inner(&d, "deepseek", "DS", Some("gk"), None, None).is_ok());
-    }
-
-    #[test]
-    fn update_metadata_does_not_touch_key() {
-        let d = tmpdir_lib();
-        let id =
-            create_profile_inner(&d, "glm", "GLM", Some("secret9"), None, Some("glm-5.2")).unwrap();
-        update_profile_metadata_inner(&d, &id, "鏀瑰悕", Some("澶囨敞")).unwrap();
-        let cfg = config::load_from(&d).unwrap();
-        let p = cfg.profile_by_id(&id).unwrap();
-        assert_eq!(p.name, "鏀瑰悕");
-        assert_eq!(p.notes.as_deref(), Some("澶囨敞"));
-        assert_eq!(p.api_key, "secret9", "鍏冩暟鎹紪杈戜笉鍔?key");
-    }
-
-    #[test]
-    fn clear_key_empties_key_and_drops_backup() {
-        let d = tmpdir_lib();
-        let id = create_profile_inner(&d, "glm", "GLM", Some("secretTAIL"), None, Some("glm-5.2"))
-            .unwrap();
-        config::write_rolling_backup(&d).ok();
-        clear_profile_key_inner(&d, &id).unwrap();
-        let cfg = config::load_from(&d).unwrap();
-        assert_eq!(cfg.profile_by_id(&id).unwrap().api_key, "");
-        assert!(!d.join("config.json.bak").exists(), "娓?key 鍚庡噣鍖栨粴鍔ㄥ浠?);
-    }
-
-    #[test]
-    fn delete_active_clears_active() {
-        let d = tmpdir_lib();
-        let id = create_profile_inner(&d, "glm", "GLM", Some("k"), None, Some("glm-5.2")).unwrap();
-        config::update(&d, |c| c.active_id = id.clone()).unwrap();
-        delete_profile_inner(&d, &id).unwrap();
-        let cfg = config::load_from(&d).unwrap();
-        assert!(cfg.profile_by_id(&id).is_none());
-        assert_eq!(cfg.active_id, "", "鍒?active 鈫?缃┖");
-    }
-
-    #[test]
-    fn update_connection_rejects_unsupported_format() {
-        let d = tmpdir_lib();
-        let id =
-            create_profile_inner(&d, "custom", "C", None, Some("https://x/y"), Some("m")).unwrap();
-        let e = update_profile_connection_inner(
-            &d,
-            &id,
-            Some("https://x/y"),
-            Some("gemini_native"),
-            None,
-            None,
-        );
-        assert!(e.is_err());
-    }
-
-    // ---------- MP-2 Minor [4]: 鏈懡涓?id 鈫?Err锛堜笉闈欓粯 Ok锛?----------
-    #[test]
-    fn update_metadata_unknown_id_errors() {
-        let d = tmpdir_lib();
-        create_profile_inner(&d, "glm", "GLM", Some("k"), None, Some("glm-5.2")).unwrap();
-        let e = update_profile_metadata_inner(&d, "no-such-id", "鏀瑰悕", None);
-        assert!(e.is_err(), "鏈懡涓?id 搴旀姤閿欙紝鑰岄潪闈欓粯鎴愬姛");
-        assert!(e.unwrap_err().contains("鎵句笉鍒?profile"));
-    }
-
-    #[test]
-    fn update_connection_unknown_id_errors() {
-        let d = tmpdir_lib();
-        create_profile_inner(&d, "glm", "GLM", Some("k"), None, Some("glm-5.2")).unwrap();
-        let e = update_profile_connection_inner(
-            &d,
-            "no-such-id",
-            Some("https://x/y"),
-            None,
-            None,
-            None,
-        );
-        assert!(e.is_err(), "鏈懡涓?id 搴旀姤閿欙紝鑰岄潪闈欓粯鎴愬姛");
-        assert!(e.unwrap_err().contains("鎵句笉鍒?profile"));
-    }
-
-    // ---------- B5: build_get_config / build_list_templates ----------
-    #[test]
-    fn get_config_masks_keys_and_lists_profiles() {
-        let d = tmpdir_lib();
-        let id = create_profile_inner(
-            &d,
-            "glm",
-            "GLM",
-            Some("sk-longsecret9999"),
-            None,
-            Some("glm-5.2"),
-        )
-        .unwrap();
-        let v = build_get_config(&d).unwrap();
-        assert_eq!(v["schema_version"], 2);
-        let arr = v["profiles"].as_array().unwrap();
-        let p = arr.iter().find(|p| p["id"] == id).unwrap();
-        assert!(p["key"].as_str().unwrap().ends_with("9999"));
-        assert!(
-            !p["key"].as_str().unwrap().contains("longsecret"),
-            "鍙洖鎺╃爜"
-        );
-        assert!(
-            p.get("api_key").is_none() || p["api_key"].is_null(),
-            "鍏?key 涓嶅嚭鍚庣"
-        );
-    }
-
-    #[test]
-    fn get_config_returns_notes_so_rename_does_not_wipe_them() {
-        // M1 鍥炲綊锛歜uild_get_config 蹇呴』鍥炰紶 notes锛屽惁鍒欏墠绔鍒扮┖銆佷笅娆℃敼鍚嶆妸澶囨敞闈欓粯娓呮帀銆?        let d = tmpdir_lib();
-        let id = create_profile_inner(&d, "glm", "GLM", Some("k"), None, Some("glm-5.2")).unwrap();
-        update_profile_metadata_inner(&d, &id, "GLM", Some("鎴戠殑澶囨敞")).unwrap();
-        let v = build_get_config(&d).unwrap();
-        let p = v["profiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["id"] == id)
-            .unwrap();
-        assert_eq!(p["notes"], "鎴戠殑澶囨敞", "notes 蹇呴』闅?get_config 鍥炰紶");
-    }
-
-    #[test]
-    fn list_templates_has_nine() {
-        let v = build_list_templates();
-        assert_eq!(v.len(), 9);
-        assert!(v.iter().any(|t| t["id"] == "custom"));
-        assert!(v.iter().any(|t| t["id"] == "kimi"));
-        assert!(v.iter().any(|t| t["id"] == "minimax"));
-    }
-
-    // ---------- 鏃㈡湁绾€昏緫涓嶅彉閲忥紙淇濈暀锛?----------
+    /// 测试 URL 解析（仅 macOS，依赖 first_http_url）。
+    #[cfg(target_os = "macos")]
     #[test]
     fn first_http_url_takes_only_first_valid_url() {
+        // Science 的 `url` 命令输出两行：第一行是真 URL，第二行是「single-use…」说明。
+        // 旧代码把整段 stdout 当 URL 交给 open → 换行+说明污染参数、nonce 不被消费 → 落登录页。
+        // 只能取第一条合法 http(s) URL（修 0.2.1 Bug1）。
         let multi = "http://127.0.0.1:8990/setup?nonce=abc123\n\
                      This is a single-use link, expires in 60 seconds.";
         assert_eq!(
             first_http_url(multi).as_deref(),
             Some("http://127.0.0.1:8990/setup?nonce=abc123"),
+            "多行输出必须只取第一行 URL，丢弃说明文字"
         );
+        // 同一行 URL 后跟了说明，只取 URL token（URL 内不含空白）。
         let inline = "https://x.example/y?z=1  (single-use)";
         assert_eq!(
             first_http_url(inline).as_deref(),
             Some("https://x.example/y?z=1")
         );
+        // 前导非 URL 行被跳过，取第一条 http 行。
         let lead = "Open this link in your browser:\nhttp://127.0.0.1:8990/a";
         assert_eq!(
             first_http_url(lead).as_deref(),
             Some("http://127.0.0.1:8990/a")
         );
+        // 无任何 URL → None（sandbox_url 据此退回裸端口）。
         assert_eq!(first_http_url("no url here\nnor here"), None);
+        // 单行纯 URL 原样返回。
         assert_eq!(
             first_http_url("http://127.0.0.1:8990").as_deref(),
             Some("http://127.0.0.1:8990")
@@ -2135,173 +1071,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_host_extracts_host_from_relay_base_url() {
-        assert_eq!(
-            parse_host("https://byteswarm.ai/claude").as_deref(),
-            Some("byteswarm.ai")
-        );
-        assert_eq!(
-            parse_host("http://127.0.0.1:8080/v1").as_deref(),
-            Some("127.0.0.1")
-        );
-        assert_eq!(
-            parse_host("https://relay.example.com:8443").as_deref(),
-            Some("relay.example.com")
-        );
-        assert_eq!(parse_host("byteswarm.ai/claude"), None);
-        assert_eq!(parse_host(""), None);
-    }
-
-    #[test]
-    fn upstream_host_by_adapter() {
-        assert_eq!(upstream_host("deepseek", ""), "api.deepseek.com");
-        assert_eq!(upstream_host("qwen", ""), "dashscope.aliyuncs.com");
-        assert_eq!(
-            upstream_host("relay", "https://open.bigmodel.cn/api/anthropic"),
-            "open.bigmodel.cn"
-        );
-        assert_eq!(upstream_host("", ""), "", "鏃犵敓鏁堥厤缃?鈫?绌猴紙鐏樉榛勶級");
-    }
-
-    #[test]
-    fn main_list_model_matches_family_plus_digit() {
-        assert!(is_main_list_model("claude-opus-4-8"));
-        assert!(is_main_list_model("claude-sonnet-5"));
-        assert!(is_main_list_model("claude-haiku-4-5-20251001"));
-        assert!(!is_main_list_model("claude-3-5-sonnet-20241022"));
-        assert!(!is_main_list_model("claude-fable-5"));
-        assert!(!is_main_list_model("gpt-4o"));
-    }
-
-    #[test]
     fn redact_scrubs_secret_and_is_noop_when_empty() {
         assert_eq!(
-            redact("鎺ㄧ悊鎸囧悜 http://127.0.0.1:18991/abcd1234 灏惧反", "abcd1234"),
-            "鎺ㄧ悊鎸囧悜 http://127.0.0.1:18991/**** 灏惧反"
+            redact("推理指向 http://127.0.0.1:18991/abcd1234 尾巴", "abcd1234"),
+            "推理指向 http://127.0.0.1:18991/**** 尾巴"
         );
-        assert_eq!(redact("鍘熸牱杩斿洖", ""), "鍘熸牱杩斿洖");
+        assert_eq!(redact("原样返回", ""), "原样返回");
         assert!(!redact("leak abcd1234 leak abcd1234", "abcd1234").contains("abcd1234"));
     }
 
     #[test]
     fn key_fingerprint_stable_and_distinct() {
+        // 同 key 稳定、异 key 不同：这是「换 key 触发代理重启」判断的基础（P1-2）。
         assert_eq!(key_fingerprint("sk-aaaa"), key_fingerprint("sk-aaaa"));
         assert_ne!(key_fingerprint("sk-aaaa"), key_fingerprint("sk-bbbb"));
         assert_ne!(key_fingerprint(""), key_fingerprint("x"));
     }
 
+    /// 测试 sandbox_home 路径（仅 macOS，依赖 sandbox_home 函数）。
+    #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_home_is_writable_under_config_dir() {
+        // 沙箱状态目录必须在可写的 ~/.csswitch 下（不在只读的 .app 资源里）——P1-1。
         let h = sandbox_home();
-        assert!(h.ends_with("sandbox/home"), "搴斾互 sandbox/home 缁撳熬锛歿h:?}");
+        assert!(h.ends_with("sandbox/home"), "应以 sandbox/home 结尾：{h:?}");
         assert!(
             h.to_string_lossy().contains(".csswitch"),
-            "搴斿湪 .csswitch 涓嬶細{h:?}"
-        );
-    }
-
-    #[test]
-    fn merge_and_sort_prefers_tools_then_dedupes_builtin() {
-        let live = vec![
-            ("m-notools".to_string(), Some(false)),
-            ("m-tools".to_string(), Some(true)),
-            ("m-unknown".to_string(), None),
-        ];
-        let out = merge_and_sort_models(live, &["m-tools", "m-builtin-only"]);
-        let ids: Vec<String> = out
-            .iter()
-            .map(|v| v.get("id").unwrap().as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(ids[0], "m-tools");
-        assert!(ids.contains(&"m-builtin-only".to_string()));
-        assert_eq!(ids.iter().filter(|i| *i == "m-tools").count(), 1, "鍘婚噸");
-        assert_eq!(ids.last().unwrap(), "m-notools");
-    }
-
-    #[test]
-    fn probe_kind_picks_message_when_model_set() {
-        assert!(matches!(
-            probe_kind_for_model("mimo-v2.5-pro"),
-            crate::scratch::ProbeKind::Message
-        ));
-        assert!(matches!(
-            probe_kind_for_model(""),
-            crate::scratch::ProbeKind::Models
-        ));
-    }
-
-    // ---------- 淇湡鏈?P1锛歯ative adapter 涓婃父鏍￠獙锛圙PT 楠屾敹鎶ュ憡 RM-06锛?----------
-
-    #[test]
-    fn native_probe_uses_message_since_native_models_is_static() {
-        // native 鐨?/v1/models 鏄潤鎬佸垪琛ㄣ€佹帰涓嶅嚭鍧?key锛屾晠涓€寰嬬敤 Message锛堟墦涓婃父 /v1/messages锛夈€?        assert!(matches!(
-            probe_kind_for("deepseek", ""),
-            crate::scratch::ProbeKind::Message
-        ));
-        assert!(matches!(
-            probe_kind_for("qwen", ""),
-            crate::scratch::ProbeKind::Message
-        ));
-        // relay锛氱┖ model 鐢?Models锛?v1/models 鍥炴簮鍗抽獙閴存潈锛夛紱閫変簡 model 鐢?Message 楠岃妯″瀷銆?        assert!(matches!(
-            probe_kind_for("relay", ""),
-            crate::scratch::ProbeKind::Models
-        ));
-        assert!(matches!(
-            probe_kind_for("relay", "m1"),
-            crate::scratch::ProbeKind::Message
-        ));
-    }
-
-    #[test]
-    fn native_adapter_no_longer_bypasses_upstream_verify() {
-        // 鍙湁鏄惧紡 skip_verify 鎵嶈烦杩囷紱native 涓嶅啀鏄眮鍏嶆潯浠讹紙鏃ц涓虹殑鏍稿績婕忔礊锛夈€?        assert!(
-            !skip_scratch_verify(true, false),
-            "native 涓嶅緱鍐嶈眮鍏嶄笂娓告牎楠?
-        );
-        assert!(!skip_scratch_verify(false, false));
-        assert!(skip_scratch_verify(false, true), "鏄惧紡 skip_verify 鎵嶈烦");
-        assert!(skip_scratch_verify(true, true));
-    }
-
-    #[test]
-    fn native_candidate_is_upstream_validated_even_without_base_url() {
-        // 闈?active 缂栬緫锛歯ative 鍗充究 base_url 绌轰篃瑕侀獙锛堣蛋纭紪鐮佸畼鏂圭鐐癸級銆?        assert!(should_scratch_candidate("deepseek", "sk-x", ""));
-        assert!(should_scratch_candidate("qwen", "sk-x", ""));
-        // relay 浠嶉渶 base_url锛涚┖ key 涓€寰嬪厤楠屻€?        assert!(!should_scratch_candidate("relay", "sk-x", ""));
-        assert!(should_scratch_candidate("relay", "sk-x", "https://r"));
-        assert!(!should_scratch_candidate("deepseek", "", ""));
-    }
-
-    #[test]
-    fn relay_empty_base_url_is_rejected_before_save() {
-        // 淇?P2锛歳elay/鑷畾涔夌鐐圭┖锛堟垨绾┖鐧斤級base_url 鈫?鎷︿笅锛屼笉钀界洏銆?        assert!(relay_missing_base_url("relay", ""));
-        assert!(relay_missing_base_url("glm", "   "));
-        assert!(relay_missing_base_url("custom", ""));
-        // 甯﹀湴鍧€鐨?relay 鏀捐銆?        assert!(!relay_missing_base_url("relay", "https://r"));
-        // native 璧扮‖缂栫爜绔偣锛岀┖ base_url 鏃犲Θ 鈫?涓嶆嫤銆?        assert!(!relay_missing_base_url("deepseek", ""));
-        assert!(!relay_missing_base_url("qwen", ""));
-    }
-
-    #[test]
-    fn relay_empty_model_is_rejected() {
-        // 淇?#9 P1-a锛歳elay/鑷畾涔夌鐐圭┖锛堟垨绾┖鐧斤級model 鈫?鎷︿笅锛堟棤 model 鍒欐棤 force 鈫?閫€鍥?passthrough锛夈€?        assert!(relay_missing_model("relay", ""));
-        assert!(relay_missing_model("glm", "   "));
-        assert!(relay_missing_model("custom", ""));
-        assert!(!relay_missing_model("relay", "glm-5.2"));
-        // native 璧板唴缃槧灏?纭紪鐮佺鐐癸紝model 鍙┖ 鈫?涓嶆嫤銆?        assert!(!relay_missing_model("deepseek", ""));
-        assert!(!relay_missing_model("qwen", ""));
-    }
-
-    #[test]
-    fn health_timeout_reason_flags_port_conflict_and_never_blames_key() {
-        // 绔彛鍗犵敤锛氭槑纭姤鍗犵敤銆佸甫绔彛鍙凤紝缁濅笉鎻愩€宬ey 鏃犳晥銆嶃€?        let occ = health_timeout_reason(18991, "OSError: [Errno 48] Address already in use");
-        assert!(occ.contains("18991"));
-        assert!(occ.contains("鍗犵敤"), "搴旀槑纭姤绔彛鍗犵敤锛歿occ}");
-        assert!(!occ.contains("key"), "绔彛鍗犵敤涓嶈鎵笂 key锛歿occ}");
-        // 鍏跺畠鎺㈡椿澶辫触锛堜緷璧栫己澶辩瓑锛夛細鏈湴鎺㈡椿涓?key 鏈夋晥鎬ф棤鍏筹紝涓嶅緱璇淬€宬ey 鏃犳晥銆嶃€?        let generic = health_timeout_reason(18991, "ModuleNotFoundError: No module named 'x'");
-        assert!(
-            !generic.contains("key 鏃犳晥"),
-            "鏈湴鎺㈡椿瓒呮椂涓?key 鏈夋晥鎬ф棤鍏筹細{generic}"
+            "应在 .csswitch 下：{h:?}"
         );
     }
 }
+
