@@ -1,6 +1,8 @@
 import os
+import json
 import sys
 import unittest
+import io
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
 import csswitch_proxy as cs
@@ -115,6 +117,91 @@ class RelayProvider(unittest.TestCase):
         h = cs._upstream_auth_headers()
         self.assertEqual(h.get("x-api-key"), "cr_testkey")
         self.assertEqual(h.get("Authorization"), "Bearer cr_testkey")
+
+    def test_non_claude_force_model_uses_openai_fallback(self):
+        cs.PROV_NAME = "relay"
+        cs.RELAY_FORCE_MODEL = "gpt5.5"
+        cs.RELAY_OPENAI_URL = "https://relay.test/v1/chat/completions"
+        calls = []
+        orig_post = cs.http_post
+        try:
+            def fake_post(url, data, headers):
+                calls.append((url, json.loads(data), headers))
+                return json.dumps({
+                    "id": "chatcmpl_mock",
+                    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }).encode(), "application/json"
+
+            cs.http_post = fake_post
+            handler = object.__new__(cs.H)
+            sent = []
+            handler._send_json = lambda code, obj: sent.append((code, obj))
+            handler._handle_anthropic({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+        finally:
+            cs.http_post = orig_post
+            cs.RELAY_FORCE_MODEL = None
+            cs.RELAY_OPENAI_URL = None
+            cs.PROV_NAME = None
+
+        self.assertEqual(calls[0][0], "https://relay.test/v1/chat/completions")
+        self.assertEqual(calls[0][1]["model"], "gpt5.5")
+        self.assertEqual(calls[0][2]["x-api-key"], "cr_testkey")
+        self.assertEqual(calls[0][2]["Authorization"], "Bearer cr_testkey")
+        self.assertEqual(sent[0][0], 200)
+        self.assertEqual(sent[0][1]["content"][0]["text"], "ok")
+
+    def test_openai_stream_fallback_replays_anthropic_sse(self):
+        cs.PROV_NAME = "relay"
+        cs.RELAY_FORCE_MODEL = "gpt5.5"
+        cs.RELAY_OPENAI_URL = "https://relay.test/v1/chat/completions"
+        frames = [
+            {"id": "chatcmpl_s", "choices": [{"delta": {"role": "assistant"}, "finish_reason": None}]},
+            {"id": "chatcmpl_s", "choices": [{"delta": {"content": "ok"}, "finish_reason": None}]},
+            {"id": "chatcmpl_s", "choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]
+        sse = "".join("data: " + json.dumps(x) + "\n\n" for x in frames) + "data: [DONE]\n\n"
+        orig_stream = cs.open_stream
+        try:
+            class FakeResp:
+                def __iter__(self):
+                    return iter([sse.encode()])
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    return False
+
+            def fake_stream(url, data, headers):
+                return FakeResp(), b"", "text/event-stream"
+
+            cs.open_stream = fake_stream
+            handler = object.__new__(cs.H)
+            out = io.BytesIO()
+            handler.wfile = out
+            handler.send_response = lambda code: None
+            handler.send_header = lambda k, v: None
+            handler.end_headers = lambda: None
+            handler._handle_anthropic({
+                "model": "claude-opus-4-8",
+                "max_tokens": 64,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+        finally:
+            cs.open_stream = orig_stream
+            cs.RELAY_FORCE_MODEL = None
+            cs.RELAY_OPENAI_URL = None
+            cs.PROV_NAME = None
+
+        body = out.getvalue().decode("utf-8", "replace")
+        self.assertIn("event: message_start", body)
+        self.assertIn("text_delta", body)
+        self.assertIn("ok", body)
+        self.assertIn("event: message_stop", body)
 
     def test_deepseek_auth_headers_default_xapikey(self):
         # 回归：deepseek 未设 auth_style → 仍只带 x-api-key（不误引入 Bearer）。
