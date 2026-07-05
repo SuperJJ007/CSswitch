@@ -169,6 +169,7 @@ let editingConnId = null;
 let editingMetaId = null;
 let pendingSkipActivateId = null;
 let pendingConfirm = null;
+let pendingAuthPrompt = null;
 
 let state = {
   profiles: [],
@@ -846,8 +847,8 @@ function openProfileEdit(id) {
   els.editProfileHost.value = p ? p.host : "";
   els.editProfilePort.value = p ? p.port : 22;
   els.editProfileUsername.value = p ? p.username : "";
-  const auth = p && p.authMethod ? p.authMethod : { type: "sshAgent" };
-  els.editProfileAuth.value = auth.type === "keyFile" ? "key_file" : "ssh_agent";
+  const auth = p && p.authMethod ? p.authMethod : { type: "recommended" };
+  els.editProfileAuth.value = authSelectValue(auth);
   els.editProfileKeyPath.value = auth.path || "~/.ssh/id_ed25519";
   els.editProfileHelperPath.value = p ? p.helperPath : "~/.csswitch/bin/csswitch-helper";
   els.profileEditMsg.textContent = "";
@@ -863,15 +864,163 @@ function toggleKeyFileGroup() {
   els.keyFileGroup.style.display = els.editProfileAuth.value === "key_file" ? "" : "none";
 }
 
+function authSelectValue(auth) {
+  if (!auth || !auth.type) return "recommended";
+  if (auth.type === "keyFile") return "key_file";
+  if (auth.type === "password") return "password";
+  if (auth.type === "sshAgent") return "saved_keys";
+  if (auth.type === "recommended" && auth.allowPassword === false && auth.useDefaultKeyFiles === false) {
+    return "saved_keys";
+  }
+  return "recommended";
+}
+
+function buildAuthMethodFromForm() {
+  const method = els.editProfileAuth.value;
+  if (method === "password") {
+    return {
+      type: "password",
+      savePassword: true,
+      allowVerificationCode: true,
+      rememberConnection: true,
+    };
+  }
+  if (method === "key_file") {
+    const path = els.editProfileKeyPath.value.trim();
+    if (!path) throw new Error("请填写密钥路径。");
+    return {
+      type: "keyFile",
+      path,
+      saveKeyPassword: true,
+      allowPasswordFallback: true,
+      allowVerificationCode: true,
+      rememberConnection: true,
+    };
+  }
+  if (method === "saved_keys") {
+    return {
+      type: "recommended",
+      useSavedKeys: true,
+      useDefaultKeyFiles: false,
+      allowPassword: false,
+      allowVerificationCode: false,
+      rememberConnection: true,
+    };
+  }
+  return {
+    type: "recommended",
+    useSavedKeys: true,
+    useDefaultKeyFiles: true,
+    allowPassword: true,
+    allowVerificationCode: true,
+    rememberConnection: true,
+  };
+}
+
+function authPromptCopy(kind) {
+  if (kind === "keyPassword") {
+    return { title: "请输入密钥密码", label: "密钥密码", type: "password" };
+  }
+  if (kind === "verificationCode") {
+    return { title: "请输入验证码", label: "验证码", type: "text" };
+  }
+  if (kind === "password") {
+    return { title: "请输入密码", label: "服务器密码", type: "password" };
+  }
+  return { title: "请输入登录信息", label: "登录信息", type: "password" };
+}
+
+function showAuthPrompt(payload) {
+  pendingAuthPrompt = payload;
+  const copy = authPromptCopy(payload && payload.kind);
+  const canRemember = !!(payload && payload.rememberAllowed && payload.profileId !== "_test_");
+  els.authPromptTitle.textContent = copy.title;
+  els.authPromptLabel.textContent = copy.label;
+  els.authPromptInput.type = copy.type;
+  els.authPromptInput.value = "";
+  els.authPromptMsg.textContent = "";
+  els.authPromptMsg.className = "";
+  els.authPromptRemember.checked = false;
+  els.authPromptRememberRow.style.display = canRemember ? "flex" : "none";
+  els.authPromptModal.style.display = "flex";
+  if (els.remoteHealthText) els.remoteHealthText.textContent = "需要输入登录信息";
+  setTimeout(() => els.authPromptInput.focus(), 0);
+}
+
+function closeAuthPrompt() {
+  els.authPromptModal.style.display = "none";
+  pendingAuthPrompt = null;
+}
+
+async function submitAuthPrompt() {
+  if (!pendingAuthPrompt) return;
+  const secret = els.authPromptInput.value;
+  if (!secret) {
+    els.authPromptMsg.textContent = "请输入内容。";
+    els.authPromptMsg.className = "msg err";
+    return;
+  }
+  const prompt = pendingAuthPrompt;
+  try {
+    await call("remote_auth_prompt_respond", {
+      sessionId: prompt.sessionId,
+      requestId: prompt.requestId,
+      secret,
+      cancelled: false,
+      remember: !!els.authPromptRemember.checked && els.authPromptRememberRow.style.display !== "none",
+    });
+    closeAuthPrompt();
+  } catch (e) {
+    els.authPromptMsg.textContent = "提交失败：" + e;
+    els.authPromptMsg.className = "msg err";
+  }
+}
+
+async function cancelAuthPrompt() {
+  if (!pendingAuthPrompt) {
+    closeAuthPrompt();
+    return;
+  }
+  const prompt = pendingAuthPrompt;
+  try {
+    await call("remote_auth_prompt_respond", {
+      sessionId: prompt.sessionId,
+      requestId: prompt.requestId,
+      secret: null,
+      cancelled: true,
+      remember: false,
+    });
+  } catch (e) {}
+  closeAuthPrompt();
+}
+
+function wireAuthPromptListener() {
+  if (PREVIEW || !window.__TAURI__.event || !window.__TAURI__.event.listen) return;
+  window.__TAURI__.event.listen("remote-auth-prompt", (event) => {
+    showAuthPrompt(event.payload || {});
+  }).catch((e) => setMsg("登录输入窗口准备失败：" + e, "err"));
+  window.__TAURI__.event.listen("remote-auth-prompt-close", (event) => {
+    const payload = event.payload || {};
+    if (pendingAuthPrompt && pendingAuthPrompt.sessionId === payload.sessionId) {
+      closeAuthPrompt();
+    }
+  }).catch(() => {});
+}
+
 function newRemoteId() {
   return globalThis.crypto && crypto.randomUUID ? crypto.randomUUID() : "r-" + Date.now().toString(16);
 }
 
 async function saveProfile() {
   const editId = els.profileEditModal.dataset.editId;
-  const authMethod = els.editProfileAuth.value === "key_file"
-    ? { type: "keyFile", path: els.editProfileKeyPath.value.trim() }
-    : { type: "sshAgent" };
+  let authMethod;
+  try {
+    authMethod = buildAuthMethodFromForm();
+  } catch (e) {
+    els.profileEditMsg.textContent = e.message || String(e);
+    els.profileEditMsg.className = "msg err";
+    return;
+  }
   const profile = {
     id: editId || newRemoteId(),
     name: els.editProfileName.value.trim() || "未命名",
@@ -901,9 +1050,14 @@ async function saveProfile() {
 }
 
 async function testProfileConnection() {
-  const authMethod = els.editProfileAuth.value === "key_file"
-    ? { type: "keyFile", path: els.editProfileKeyPath.value.trim() }
-    : { type: "sshAgent" };
+  let authMethod;
+  try {
+    authMethod = buildAuthMethodFromForm();
+  } catch (e) {
+    els.profileEditMsg.textContent = e.message || String(e);
+    els.profileEditMsg.className = "msg err";
+    return;
+  }
   const profile = {
     id: "_test_",
     name: "test",
@@ -974,7 +1128,9 @@ function wire() {
     "closeProfileModal", "profileEditModal", "profileEditTitle", "editProfileName",
     "editProfileHost", "editProfilePort", "editProfileUsername", "editProfileAuth",
     "editProfileKeyPath", "editProfileHelperPath", "keyFileGroup", "testProfileBtn",
-    "saveProfileBtn", "cancelProfileEditBtn", "profileEditMsg",
+    "saveProfileBtn", "cancelProfileEditBtn", "profileEditMsg", "authPromptModal",
+    "authPromptTitle", "authPromptLabel", "authPromptInput", "authPromptRememberRow",
+    "authPromptRemember", "authPromptSubmitBtn", "authPromptCancelBtn", "authPromptMsg",
   ].forEach((id) => { els[id] = $(id); });
   els.panel = document.querySelector(".panel");
 
@@ -1041,9 +1197,21 @@ function wire() {
   els.cancelProfileEditBtn.addEventListener("click", closeProfileEdit);
   els.testProfileBtn.addEventListener("click", testProfileConnection);
   els.editProfileAuth.addEventListener("change", toggleKeyFileGroup);
+  els.authPromptSubmitBtn.addEventListener("click", submitAuthPrompt);
+  els.authPromptCancelBtn.addEventListener("click", cancelAuthPrompt);
+  els.authPromptInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitAuthPrompt();
+    if (e.key === "Escape") cancelAuthPrompt();
+  });
+  wireAuthPromptListener();
   document.querySelectorAll(".modal-overlay").forEach((overlay) => {
     overlay.addEventListener("click", (e) => {
-      if (e.target === overlay) overlay.style.display = "none";
+      if (e.target !== overlay) return;
+      if (overlay === els.authPromptModal) {
+        cancelAuthPrompt();
+      } else {
+        overlay.style.display = "none";
+      }
     });
   });
   document.getElementById("remoteProfileList").addEventListener("click", async (e) => {

@@ -158,6 +158,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
   background:rgba(0,0,0,.45);z-index:100;display:flex;align-items:center;justify-content:center}
 .modal-box{background:var(--panel);border-radius:14px;padding:18px;width:300px;
   max-height:90vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.25)}
+.auth-prompt-box{width:280px}
 
 /* 表单字段（Profile 编辑弹窗） */
 .form-fields label{display:block;font-size:11px;color:var(--sub);margin:8px 0 4px}
@@ -165,6 +166,8 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
   background:var(--field);border-radius:8px;padding:0 10px;font-size:13px;color:var(--ink);
   outline:none;font-family:inherit}
 .form-fields input:focus,.form-fields select:focus{border-color:var(--accent)}
+.check-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:var(--sub)}
+.check-row input{width:14px;height:14px;margin:0;accent-color:var(--accent)}
 
 /* 连接状态动画 */
 .pulsing{animation:pulse 1.5s ease-in-out infinite}

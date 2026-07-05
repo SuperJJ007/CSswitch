@@ -8,6 +8,11 @@
 //!
 //! 架构参考 cc-switch-remote 的 `remote/` 模块，按 CSSwitch 需求大幅简化。
 
+#[cfg(feature = "desktop")]
+pub mod askpass;
+pub mod auth;
+pub mod credentials;
+pub mod prompt;
 pub mod ssh;
 pub mod store;
 pub mod types;

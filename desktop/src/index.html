@@ -74,12 +74,14 @@
 
             <label>认证方式</label>
             <select id="editProfileAuth">
-              <option value="ssh_agent">SSH Agent（推荐）</option>
-              <option value="key_file">私钥文件</option>
+              <option value="recommended">推荐登录</option>
+              <option value="password">用密码</option>
+              <option value="key_file">密钥文件</option>
+              <option value="saved_keys">已保存密钥</option>
             </select>
 
             <div id="keyFileGroup" style="display:none">
-              <label>私钥路径 <span style="color:var(--red)">*</span></label>
+              <label>密钥路径 <span style="color:var(--red)">*</span></label>
               <input type="text" id="editProfileKeyPath" placeholder="~/.ssh/id_ed25519" />
             </div>
 
@@ -92,6 +94,25 @@
             <button class="btn small" id="cancelProfileEditBtn">取消</button>
           </div>
           <div id="profileEditMsg" style="font-size:11px;margin-top:8px"></div>
+        </div>
+      </div>
+
+      <div class="modal-overlay" id="authPromptModal" style="display:none">
+        <div class="modal-box auth-prompt-box">
+          <h3 style="margin:0 0 12px" id="authPromptTitle">请输入登录信息</h3>
+          <div class="form-fields">
+            <label id="authPromptLabel">登录信息</label>
+            <input type="password" id="authPromptInput" autocomplete="off" />
+          </div>
+          <label class="check-row" id="authPromptRememberRow">
+            <input type="checkbox" id="authPromptRemember" />
+            <span>保存到系统</span>
+          </label>
+          <div class="row" style="gap:6px;margin-top:12px">
+            <button class="btn hero" id="authPromptSubmitBtn" style="height:32px;font-size:12px;flex:1">继续</button>
+            <button class="btn small" id="authPromptCancelBtn">取消</button>
+          </div>
+          <div id="authPromptMsg" style="font-size:11px;margin-top:8px"></div>
         </div>
       </div>
 

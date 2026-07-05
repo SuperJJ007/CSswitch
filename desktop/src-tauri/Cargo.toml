@@ -19,6 +19,11 @@ required-features = ["desktop"]
 name = "csswitch-helper"
 path = "src/bin/csswitch-helper.rs"
 
+[[bin]]
+name = "csswitch-ssh-askpass"
+path = "src/bin/csswitch-ssh-askpass.rs"
+required-features = ["desktop"]
+
 [features]
 default = ["desktop"]
 desktop = ["tauri", "tauri-build", "tauri-plugin-opener"]
@@ -42,4 +47,4 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
-
+keyring = "4.1.3"

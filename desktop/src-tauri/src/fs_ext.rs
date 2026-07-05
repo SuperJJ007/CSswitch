@@ -5,7 +5,6 @@
 //!
 //! 所有文件使用 `use crate::fs_ext::...` 替代 `use std::os::unix::fs::...`。
 
-
 // ---------- 平台条件编译 ----------
 
 #[cfg(unix)]
@@ -26,7 +25,11 @@ mod imp {
     /// macOS/BSD=0x0100，Linux=0x20000。
     pub fn open_log_file(path: &std::path::Path) -> std::io::Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
-        const O_NOFOLLOW: i32 = if cfg!(target_os = "linux") { 0x2_0000 } else { 0x0100 };
+        const O_NOFOLLOW: i32 = if cfg!(target_os = "linux") {
+            0x2_0000
+        } else {
+            0x0100
+        };
         fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -48,7 +51,9 @@ mod imp {
         fn mode(&mut self, _mode: u32) -> &mut Self;
     }
     impl OpenOptionsExt for fs::OpenOptions {
-        fn mode(&mut self, _mode: u32) -> &mut Self { self }
+        fn mode(&mut self, _mode: u32) -> &mut Self {
+            self
+        }
     }
 
     /// Windows: Permissions 只有只读位，mode 操作无意义。
@@ -79,7 +84,11 @@ mod imp {
             p
         }
         fn mode(&self) -> u32 {
-            if self.readonly() { 0o444 } else { 0o666 }
+            if self.readonly() {
+                0o444
+            } else {
+                0o666
+            }
         }
     }
 

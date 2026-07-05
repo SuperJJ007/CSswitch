@@ -1427,6 +1427,9 @@ pub fn run() {
             remote_commands::remote_save_profile,
             remote_commands::remote_delete_profile,
             remote_commands::remote_validate_profile,
+            remote_commands::remote_save_login_secret,
+            remote_commands::remote_delete_login_secret,
+            remote_commands::remote_auth_prompt_respond,
             remote_commands::remote_check_health,
             remote_commands::remote_prepare_helper,
             remote_commands::remote_install_helper,
@@ -1443,6 +1446,7 @@ pub fn run() {
             remote_commands::remote_one_click,
         ])
         .setup(|app| {
+            remote::askpass::set_app_handle(app.handle().clone());
             // 正常桌面应用：进 Dock、走常规应用生命周期（默认 Regular 策略，
             // 不再设 Accessory）。窗口在 tauri.conf.json 里配了 decorations（标题栏
             // 三键：关闭/最小化/缩放）+ visible + center，启动即居中弹出、可拖动

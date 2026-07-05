@@ -27,7 +27,7 @@ mod templates;
 // 跨平台文件权限抽象：Unix 下提供真实的 0600/0700 权限，Windows 下为 no-op。
 mod fs_ext;
 // 远程服务器管理：SSH 连接、Profile 存储、远程命令（跨平台，无 Tauri 依赖）。
-mod remote;
+pub mod remote;
 // 远程 Tauri commands — 仅 desktop feature 编译。
 #[cfg(feature = "desktop")]
 mod remote_commands;

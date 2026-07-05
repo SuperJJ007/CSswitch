@@ -10,12 +10,99 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn default_true() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_legacy_ssh_agent_auth_method() {
+        let auth: RemoteAuthMethod = serde_json::from_str(r#"{"type":"sshAgent"}"#).unwrap();
+        assert_eq!(auth, RemoteAuthMethod::SshAgent);
+    }
+
+    #[test]
+    fn legacy_ssh_agent_profile_still_deserializes() {
+        let raw = r#"{
+            "id":"r1",
+            "name":"old",
+            "host":"example.com",
+            "port":22,
+            "username":"ubuntu",
+            "authMethod":{"type":"sshAgent"},
+            "helperPath":"~/.csswitch/bin/csswitch-helper"
+        }"#;
+
+        let profile: RemoteHostProfile = serde_json::from_str(raw).unwrap();
+
+        assert!(matches!(profile.auth_method, RemoteAuthMethod::SshAgent));
+        assert!(!profile.ssh_options.legacy_compat);
+        assert!(profile.ssh_options.extra_args.is_empty());
+    }
+
+    #[test]
+    fn deserializes_recommended_auth_method() {
+        let auth: RemoteAuthMethod = serde_json::from_str(
+            r#"{
+                "type":"recommended",
+                "useSavedKeys":true,
+                "useDefaultKeyFiles":true,
+                "allowPassword":true,
+                "allowVerificationCode":true,
+                "rememberConnection":true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            auth,
+            RemoteAuthMethod::Recommended {
+                use_saved_keys: true,
+                use_default_key_files: true,
+                allow_password: true,
+                allow_verification_code: true,
+                remember_connection: true,
+                strict: false,
+            }
+        );
+    }
+
+    #[test]
+    fn recommended_auth_defaults_are_user_friendly() {
+        let auth: RemoteAuthMethod = serde_json::from_str(r#"{"type":"recommended"}"#).unwrap();
+
+        assert_eq!(
+            auth,
+            RemoteAuthMethod::Recommended {
+                use_saved_keys: true,
+                use_default_key_files: true,
+                allow_password: true,
+                allow_verification_code: true,
+                remember_connection: true,
+                strict: false,
+            }
+        );
+    }
+}
+
 // ============================================================================
 // Profile 与认证
 // ============================================================================
 
 /// 远程服务器连接 Profile，持久存储在本地 `~/.csswitch/remote-hosts.json`。
 /// 每个 Profile 描述如何通过 SSH 连接到一台远程 Linux 服务器。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSshAdvancedOptions {
+    #[serde(default)]
+    pub legacy_compat: bool,
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteHostProfile {
@@ -36,6 +123,8 @@ pub struct RemoteHostProfile {
     /// 最近一次成功连接的时间戳（Unix 秒），用于 UI 排序与提示。
     #[serde(default)]
     pub last_connected: Option<i64>,
+    #[serde(default)]
+    pub ssh_options: RemoteSshAdvancedOptions,
 }
 
 /// SSH 认证方式。
@@ -46,10 +135,40 @@ pub struct RemoteHostProfile {
 pub enum RemoteAuthMethod {
     /// 使用本地 SSH Agent（`ssh-agent`），无需指定密钥路径。
     SshAgent,
+    Recommended {
+        #[serde(default = "default_true")]
+        use_saved_keys: bool,
+        #[serde(default = "default_true")]
+        use_default_key_files: bool,
+        #[serde(default = "default_true")]
+        allow_password: bool,
+        #[serde(default = "default_true")]
+        allow_verification_code: bool,
+        #[serde(default = "default_true")]
+        remember_connection: bool,
+        #[serde(default)]
+        strict: bool,
+    },
+    Password {
+        #[serde(default = "default_true")]
+        save_password: bool,
+        #[serde(default = "default_true")]
+        allow_verification_code: bool,
+        #[serde(default = "default_true")]
+        remember_connection: bool,
+    },
     /// 使用指定私钥文件（如 `~/.ssh/id_ed25519`）。
     KeyFile {
         /// 私钥文件的绝对路径。
         path: String,
+        #[serde(default = "default_true")]
+        save_key_password: bool,
+        #[serde(default = "default_true")]
+        allow_password_fallback: bool,
+        #[serde(default = "default_true")]
+        allow_verification_code: bool,
+        #[serde(default = "default_true")]
+        remember_connection: bool,
     },
 }
 
@@ -158,11 +277,11 @@ pub const MIN_HELPER_VERSION: &str = "0.3.0";
 /// Helper 必须支持的 capability 列表。
 /// 桌面端调用 `status` 命令后检查返回值中的 `capabilities` 是否包含所有这些项。
 pub const REQUIRED_CAPABILITIES: &[&str] = &[
-    "proxy",   // 翻译代理进程管理
-    "config",  // ~/.csswitch/config.json 读写
-    "logs",    // 日志文件查看
-    "doctor",  // 诊断命令
-    "verify",  // Key 有效性验证
+    "proxy",  // 翻译代理进程管理
+    "config", // ~/.csswitch/config.json 读写
+    "logs",   // 日志文件查看
+    "doctor", // 诊断命令
+    "verify", // Key 有效性验证
 ];
 
 /// Helper 可选 capability（sandbox 在无 Science 的服务器上可能不可用）。

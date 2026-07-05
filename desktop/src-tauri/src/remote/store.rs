@@ -52,8 +52,7 @@ pub fn save_profiles(profiles: &[RemoteHostProfile]) -> Result<(), String> {
     }
     let path = profiles_path();
     // 拒绝符号链接目标（防止写入重定向到非预期文件）。
-    crate::config::assert_not_symlink(&path)
-        .map_err(|e| format!("远程配置路径安全拒绝：{e}"))?;
+    crate::config::assert_not_symlink(&path).map_err(|e| format!("远程配置路径安全拒绝：{e}"))?;
     if let Some(parent) = path.parent() {
         crate::config::assert_not_symlink(parent)
             .map_err(|e| format!("远程配置父目录安全拒绝：{e}"))?;
@@ -98,24 +97,22 @@ pub fn save_profiles(profiles: &[RemoteHostProfile]) -> Result<(), String> {
 
     // 在锁保护下执行写入操作
     let result = (|| {
-        let json = serde_json::to_vec_pretty(profiles)
-            .map_err(|e| format!("序列化远程配置失败：{e}"))?;
+        let json =
+            serde_json::to_vec_pretty(profiles).map_err(|e| format!("序列化远程配置失败：{e}"))?;
         // 原子写入：pid+thread 随机化临时文件名（避免并发冲突）
         let tmp = path.with_file_name(format!(
             ".remote-hosts.json.tmp.{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        fs::write(&tmp, &json)
-            .map_err(|e| format!("写入远程配置临时文件失败：{e}"))?;
+        fs::write(&tmp, &json).map_err(|e| format!("写入远程配置临时文件失败：{e}"))?;
 
         // P0-3 修复：在 rename 前先设置临时文件权限为 0600
         // 这样 rename 后目标文件继承正确的权限
         crate::fs_ext::set_file_permissions(&tmp, 0o600)
             .map_err(|e| format!("设置远程配置文件权限失败：{e}"))?;
 
-        fs::rename(&tmp, &path)
-            .map_err(|e| format!("替换远程配置文件失败：{e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("替换远程配置文件失败：{e}"))?;
 
         // 双重保险：rename 后再次确认权限（某些文件系统可能不保留权限）
         crate::fs_ext::set_file_permissions(&path, 0o600)
@@ -185,11 +182,9 @@ pub fn validate_profile(profile: &RemoteHostProfile) -> Result<(), String> {
     // 校验 helper_path 格式：应该是绝对路径或以 ~ 开头
     let hp = profile.helper_path.trim();
     if !hp.starts_with('/') && !hp.starts_with('~') {
-        return Err(format!(
-            "Helper 路径应为绝对路径或以 ~ 开头：{hp}"
-        ));
+        return Err(format!("Helper 路径应为绝对路径或以 ~ 开头：{hp}"));
     }
-    if let RemoteAuthMethod::KeyFile { path } = &profile.auth_method {
+    if let RemoteAuthMethod::KeyFile { path, .. } = &profile.auth_method {
         if path.trim().is_empty() {
             return Err("选择私钥文件认证时，密钥路径不得为空".into());
         }
@@ -203,6 +198,7 @@ pub fn validate_profile(profile: &RemoteHostProfile) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::RemoteSshAdvancedOptions;
     use super::*;
 
     fn sample_profile(id: &str) -> RemoteHostProfile {
@@ -215,12 +211,12 @@ mod tests {
             auth_method: RemoteAuthMethod::SshAgent,
             helper_path: "~/.csswitch/bin/csswitch-helper".to_string(),
             last_connected: None,
+            ssh_options: RemoteSshAdvancedOptions::default(),
         }
     }
 
     fn tmp_path() -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("csswitch-test-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("csswitch-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d.join("remote-hosts.json")
@@ -237,16 +233,19 @@ mod tests {
         let single = vec![profile.clone()];
         let json = serde_json::to_vec_pretty(&single).unwrap();
         fs::write(&p, &json).unwrap();
-        let loaded: Vec<RemoteHostProfile> = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        let loaded: Vec<RemoteHostProfile> =
+            serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "test-01");
 
         // Delete
-        let loaded: Vec<RemoteHostProfile> = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        let loaded: Vec<RemoteHostProfile> =
+            serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         let remaining: Vec<_> = loaded.into_iter().filter(|pr| pr.id != "test-01").collect();
         let json = serde_json::to_vec_pretty(&remaining).unwrap();
         fs::write(&p, &json).unwrap();
-        let loaded: Vec<RemoteHostProfile> = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        let loaded: Vec<RemoteHostProfile> =
+            serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         assert_eq!(loaded.len(), 0);
 
         let _ = fs::remove_file(&p);
@@ -285,6 +284,10 @@ mod tests {
         let mut p = sample_profile("t5");
         p.auth_method = RemoteAuthMethod::KeyFile {
             path: "".to_string(),
+            save_key_password: true,
+            allow_password_fallback: true,
+            allow_verification_code: true,
+            remember_connection: true,
         };
         assert!(validate_profile(&p).is_err());
     }

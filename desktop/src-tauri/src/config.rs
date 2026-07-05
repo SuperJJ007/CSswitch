@@ -454,13 +454,13 @@ pub fn save_to(dir: &Path, cfg: &Config) -> io::Result<()> {
     // O_CREAT|O_EXCL + 0600：拒绝复用已有临时文件，创建即定权限。
     let write_res = (|| -> io::Result<()> {
         let mut f = {
-        use crate::fs_ext::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?
-    };
+            use crate::fs_ext::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
         f.write_all(&json)?;
         f.sync_all()?;
         Ok(())

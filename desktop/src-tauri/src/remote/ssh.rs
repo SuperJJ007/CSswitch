@@ -9,15 +9,19 @@
 //! - 超时 + 重试（指数退避：2s/4s/8s）
 //! - 解析 helper 的 JSON 响应
 
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(feature = "desktop")]
+use super::askpass::{self, AskpassBroker};
+use super::auth::{AuthRuntimeOptions, SshAuthPlan};
 use super::types::{RemoteAuthMethod, RemoteError, RemoteHostProfile};
 
 /// Windows: 禁止弹出命令行窗口（CREATE_NO_WINDOW）
@@ -45,6 +49,12 @@ const DEFAULT_RETRIES: u32 = 3;
 const HELPER_RELEASE_REPO: &str = "SuperJJ007/CSswitch";
 const HELPER_RELEASE_REPO_ENV: &str = "CSSWITCH_HELPER_RELEASE_REPO";
 
+#[derive(Debug, Clone)]
+pub struct SshCommandSpec {
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
 // ============================================================================
 // SSH 参数构建
 // ============================================================================
@@ -55,7 +65,10 @@ const HELPER_RELEASE_REPO_ENV: &str = "CSSWITCH_HELPER_RELEASE_REPO";
 /// - `ServerAliveInterval`：每 15 秒发送 keepalive，防止 NAT/防火墙断开空闲连接。
 /// - `StrictHostKeyChecking=accept-new`：首次自动接受主机密钥（后续连接验证指纹）。
 /// - `BatchMode`：KeyFile/Agent 时设为 yes（禁止交互），密码时不设。
-fn build_ssh_base_args(profile: &RemoteHostProfile) -> Vec<String> {
+fn build_ssh_base_args_with_plan(
+    profile: &RemoteHostProfile,
+    auth_plan: &SshAuthPlan,
+) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
         profile.port.to_string(),
@@ -67,22 +80,9 @@ fn build_ssh_base_args(profile: &RemoteHostProfile) -> Vec<String> {
         "ServerAliveCountMax=3".to_string(),
         "-o".to_string(),
         "StrictHostKeyChecking=accept-new".to_string(),
-        "-o".to_string(),
-        "NumberOfPasswordPrompts=0".to_string(), // 禁止密码提示
     ];
 
-    match &profile.auth_method {
-        RemoteAuthMethod::KeyFile { path } => {
-            args.push("-i".to_string());
-            args.push(path.clone());
-            args.push("-o".to_string());
-            args.push("BatchMode=yes".to_string());
-        }
-        RemoteAuthMethod::SshAgent => {
-            args.push("-o".to_string());
-            args.push("BatchMode=yes".to_string());
-        }
-    }
+    args.extend(auth_plan.args.clone());
 
     args.push("--".to_string());
     args.push(format!("{}@{}", profile.username, profile.host));
@@ -92,7 +92,21 @@ fn build_ssh_base_args(profile: &RemoteHostProfile) -> Vec<String> {
 /// 构建执行一次 helper 命令的完整 SSH 参数。
 /// 远程执行：`<helper_path> --json <helper_args...>`
 pub fn build_ssh_args(profile: &RemoteHostProfile, helper_args: &[String]) -> Vec<String> {
-    let mut args = build_ssh_base_args(profile);
+    build_ssh_command_spec(
+        profile,
+        helper_args,
+        AuthRuntimeOptions::default_for(profile),
+    )
+    .args
+}
+
+fn build_ssh_command_spec(
+    profile: &RemoteHostProfile,
+    helper_args: &[String],
+    runtime: AuthRuntimeOptions,
+) -> SshCommandSpec {
+    let auth_plan = SshAuthPlan::from_profile(profile, runtime);
+    let mut args = build_ssh_base_args_with_plan(profile, &auth_plan);
     // 构建 helper 命令行：`<path> --json <args...>`
     let cmd = format!(
         "{} --json {}",
@@ -104,7 +118,10 @@ pub fn build_ssh_args(profile: &RemoteHostProfile, helper_args: &[String]) -> Ve
             .join(" ")
     );
     args.push(cmd);
-    args
+    SshCommandSpec {
+        args,
+        env: auth_plan.env,
+    }
 }
 
 /// 构建安装 helper 的 SSH 命令。
@@ -112,10 +129,18 @@ pub fn build_ssh_args(profile: &RemoteHostProfile, helper_args: &[String]) -> Ve
 ///
 /// P0-2 修复：对平台信息进行白名单校验，防止命令注入。
 pub fn build_helper_install_args(profile: &RemoteHostProfile) -> Vec<String> {
-    let mut args = build_ssh_base_args(profile);
+    build_helper_install_command_spec(profile, AuthRuntimeOptions::default_for(profile)).args
+}
+
+pub fn build_helper_install_command_spec(
+    profile: &RemoteHostProfile,
+    runtime: AuthRuntimeOptions,
+) -> SshCommandSpec {
+    let auth_plan = SshAuthPlan::from_profile(profile, runtime);
+    let mut args = build_ssh_base_args_with_plan(profile, &auth_plan);
     let helper_path = shell_quote(&profile.helper_path);
-    let repo = std::env::var(HELPER_RELEASE_REPO_ENV)
-        .unwrap_or_else(|_| HELPER_RELEASE_REPO.to_string());
+    let repo =
+        std::env::var(HELPER_RELEASE_REPO_ENV).unwrap_or_else(|_| HELPER_RELEASE_REPO.to_string());
 
     // P0-2: 安装脚本中加入架构白名单校验，防止注入
     // 即使攻击者控制了 uname 输出，也只能匹配预定义的安全值
@@ -191,7 +216,10 @@ mv "$TMP" "$HELPER_PATH"
         repo = repo,
     );
     args.push(script);
-    args
+    SshCommandSpec {
+        args,
+        env: auth_plan.env,
+    }
 }
 
 // ============================================================================
@@ -209,7 +237,9 @@ mv "$TMP" "$HELPER_PATH"
 /// 返回：反序列化后的命令结果（T 类型）。
 ///
 /// 错误：返回结构化的 `RemoteError`，包含可重试标记和修复建议。
-pub fn detect_remote_platform(profile: &RemoteHostProfile) -> Result<(String, String), RemoteError> {
+pub fn detect_remote_platform(
+    profile: &RemoteHostProfile,
+) -> Result<(String, String), RemoteError> {
     let out = run_ssh_script(
         profile,
         "printf '%s\\n%s\\n' \"$(uname -s)\" \"$(uname -m)\"",
@@ -236,7 +266,15 @@ pub fn detect_remote_platform(profile: &RemoteHostProfile) -> Result<(String, St
 }
 
 pub fn build_helper_stdin_install_args(profile: &RemoteHostProfile) -> Vec<String> {
-    let mut args = build_ssh_base_args(profile);
+    build_helper_stdin_install_command_spec(profile, AuthRuntimeOptions::default_for(profile)).args
+}
+
+fn build_helper_stdin_install_command_spec(
+    profile: &RemoteHostProfile,
+    runtime: AuthRuntimeOptions,
+) -> SshCommandSpec {
+    let auth_plan = SshAuthPlan::from_profile(profile, runtime);
+    let mut args = build_ssh_base_args_with_plan(profile, &auth_plan);
     let helper_path = shell_quote(&profile.helper_path);
     let script = format!(
         r#"set -e
@@ -252,16 +290,24 @@ mv "$TMP" "$HELPER_PATH"
         helper_path = helper_path,
     );
     args.push(script);
-    args
+    SshCommandSpec {
+        args,
+        env: auth_plan.env,
+    }
 }
 
 pub fn install_helper_from_stdin(
     profile: &RemoteHostProfile,
     helper_bytes: &[u8],
 ) -> Result<String, RemoteError> {
-    let args = build_helper_stdin_install_args(profile);
-    let mut child = hide_cmd(Command::new("ssh"))
-        .args(&args)
+    let (runtime, _broker) = auth_runtime_options(profile)?;
+    let spec = build_helper_stdin_install_command_spec(profile, runtime);
+    let mut command = hide_cmd(Command::new("ssh"));
+    command.args(&spec.args);
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -271,7 +317,9 @@ pub fn install_helper_from_stdin(
             message: format!("无法启动 SSH 客户端：{e}"),
             details: Some(format!("请确认 OpenSSH 客户端已安装并在 PATH 中：{e}")),
             recoverable: false,
-            suggestion: Some("Windows 10+ 自带 OpenSSH。请在系统可选功能中确认已安装。".to_string()),
+            suggestion: Some(
+                "Windows 10+ 自带 OpenSSH。请在系统可选功能中确认已安装。".to_string(),
+            ),
         })?;
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -284,13 +332,7 @@ pub fn install_helper_from_stdin(
         })?;
     }
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        let _ = tx.send(result);
-    });
-
-    let output = match rx.recv_timeout(std::time::Duration::from_secs(SLOW_CMD_TIMEOUT_SECS)) {
+    let output = match wait_with_timeout_legacy(child, Duration::from_secs(SLOW_CMD_TIMEOUT_SECS)) {
         Ok(result) => result.map_err(|e| RemoteError {
             code: "ssh_io_error".to_string(),
             message: format!("SSH 进程 I/O 错误：{e}"),
@@ -400,7 +442,12 @@ pub fn run_helper_json_with_retry<T: DeserializeOwned>(
     profile: &RemoteHostProfile,
     helper_args: &[String],
 ) -> Result<T, RemoteError> {
-    run_helper_json(profile, helper_args, DEFAULT_CMD_TIMEOUT_SECS, DEFAULT_RETRIES)
+    run_helper_json(
+        profile,
+        helper_args,
+        DEFAULT_CMD_TIMEOUT_SECS,
+        DEFAULT_RETRIES,
+    )
 }
 
 /// 用于慢速操作（如安装 helper、验证 key）。
@@ -411,20 +458,38 @@ pub fn run_helper_json_slow<T: DeserializeOwned>(
     run_helper_json(profile, helper_args, SLOW_CMD_TIMEOUT_SECS, DEFAULT_RETRIES)
 }
 
+pub fn run_helper_install(profile: &RemoteHostProfile) -> Result<String, RemoteError> {
+    let (runtime, _broker) = auth_runtime_options(profile)?;
+    let spec = build_helper_install_command_spec(profile, runtime);
+    run_ssh_command(
+        profile,
+        spec,
+        SLOW_CMD_TIMEOUT_SECS,
+        "install-helper".to_string(),
+    )
+}
+
 // ============================================================================
 // 内部实现
 // ============================================================================
 
 /// 执行 `ssh ... <cmd>` 并返回 stdout 字符串。
+
 pub fn run_ssh_script(
     profile: &RemoteHostProfile,
     remote_cmd: &str,
     timeout_secs: u64,
 ) -> Result<String, RemoteError> {
-    let mut args = build_ssh_base_args(profile);
+    let (runtime, _broker) = auth_runtime_options(profile)?;
+    let auth_plan = SshAuthPlan::from_profile(profile, runtime);
+    let mut args = build_ssh_base_args_with_plan(profile, &auth_plan);
     args.push(remote_cmd.to_string());
-    let child = hide_cmd(Command::new("ssh"))
-        .args(&args)
+    let mut command = hide_cmd(Command::new("ssh"));
+    command.args(&args);
+    for (key, value) in &auth_plan.env {
+        command.env(key, value);
+    }
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -434,17 +499,12 @@ pub fn run_ssh_script(
             message: format!("无法启动 SSH 客户端：{e}"),
             details: Some(format!("请确认 OpenSSH 客户端已安装并在 PATH 中：{e}")),
             recoverable: false,
-            suggestion: Some("Windows 10+ 自带 OpenSSH。请在系统可选功能中确认已安装。".to_string()),
+            suggestion: Some(
+                "Windows 10+ 自带 OpenSSH。请在系统可选功能中确认已安装。".to_string(),
+            ),
         })?;
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-    std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        let _ = tx.send(result);
-    });
-
-    let output = match rx.recv_timeout(timeout_duration) {
+    let output = match wait_with_timeout_legacy(child, Duration::from_secs(timeout_secs)) {
         Ok(result) => result.map_err(|e| RemoteError {
             code: "ssh_io_error".to_string(),
             message: format!("SSH 进程 I/O 错误：{e}"),
@@ -456,7 +516,10 @@ pub fn run_ssh_script(
             return Err(RemoteError {
                 code: "ssh_timeout".to_string(),
                 message: format!("SSH 命令执行超时（{}秒）", timeout_secs),
-                details: Some(format!("命令：{} {} {}", profile.host, profile.username, remote_cmd)),
+                details: Some(format!(
+                    "命令：{} {} {}",
+                    profile.host, profile.username, remote_cmd
+                )),
                 recoverable: true,
                 suggestion: Some("网络慢或远程命令卡住。请检查 SSH 连接后重试。".to_string()),
             });
@@ -497,14 +560,91 @@ pub fn run_ssh_script(
     })
 }
 
+#[cfg(feature = "desktop")]
+fn auth_runtime_options(
+    profile: &RemoteHostProfile,
+) -> Result<(AuthRuntimeOptions, Option<AskpassBroker>), RemoteError> {
+    let mut runtime = AuthRuntimeOptions::default_for(profile);
+    let session_dir = askpass_session_dir();
+    runtime.askpass_path = Some(askpass_executable()?.to_string_lossy().into_owned());
+    runtime.askpass_session_dir = Some(session_dir.to_string_lossy().into_owned());
+    runtime
+        .askpass_env
+        .push(("CSSWITCH_ASKPASS_MODE".to_string(), "1".to_string()));
+
+    let plan = SshAuthPlan::from_profile(profile, runtime.clone());
+    if !plan.interactive {
+        return Ok((runtime, None));
+    }
+
+    let app = askpass::app_handle().ok_or_else(|| RemoteError {
+        code: "ssh_auth_prompt_unavailable".to_string(),
+        message: "需要输入登录信息，但当前窗口还没有准备好".to_string(),
+        details: None,
+        recoverable: true,
+        suggestion: Some("请稍后重试连接。".to_string()),
+    })?;
+    let broker = AskpassBroker::start(app, session_dir).map_err(|e| RemoteError {
+        code: "ssh_auth_prompt_failed".to_string(),
+        message: "无法打开 SSH 登录输入窗口".to_string(),
+        details: Some(e),
+        recoverable: true,
+        suggestion: Some("请重试连接；如果仍失败，请检查应用日志。".to_string()),
+    })?;
+    Ok((runtime, Some(broker)))
+}
+
+#[cfg(not(feature = "desktop"))]
+fn auth_runtime_options(
+    profile: &RemoteHostProfile,
+) -> Result<(AuthRuntimeOptions, ()), RemoteError> {
+    Ok((AuthRuntimeOptions::default_for(profile), ()))
+}
+
+#[cfg(feature = "desktop")]
+fn askpass_executable() -> Result<PathBuf, RemoteError> {
+    std::env::current_exe().map_err(|e| RemoteError {
+        code: "ssh_askpass_path_failed".to_string(),
+        message: "无法定位 SSH 登录辅助程序".to_string(),
+        details: Some(e.to_string()),
+        recoverable: false,
+        suggestion: Some("请重新安装或重新启动 CSSwitch。".to_string()),
+    })
+}
+
+#[cfg(feature = "desktop")]
+fn askpass_session_dir() -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    crate::config::default_dir()
+        .join("ssh-askpass")
+        .join(format!("{}-{now}", std::process::id()))
+}
+
 fn try_run_ssh(
     profile: &RemoteHostProfile,
     helper_args: &[String],
     timeout_secs: u64,
 ) -> Result<String, RemoteError> {
-    let args = build_ssh_args(profile, helper_args);
-    let output = hide_cmd(Command::new("ssh"))
-        .args(&args)
+    let (runtime, _broker) = auth_runtime_options(profile)?;
+    let spec = build_ssh_command_spec(profile, helper_args, runtime);
+    run_ssh_command(profile, spec, timeout_secs, helper_args.join(" "))
+}
+
+fn run_ssh_command(
+    profile: &RemoteHostProfile,
+    spec: SshCommandSpec,
+    timeout_secs: u64,
+    command_details: String,
+) -> Result<String, RemoteError> {
+    let mut command = hide_cmd(Command::new("ssh"));
+    command.args(&spec.args);
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
+    let output = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -519,51 +659,31 @@ fn try_run_ssh(
             ),
         })?;
 
-    // P0-1 修复：实施真正的超时机制，防止 UI 永久卡死
-    // 使用 channel + recv_timeout 在指定时间内等待命令完成
-    let (tx, rx) = std::sync::mpsc::channel();
-    let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-
-    std::thread::spawn(move || {
-        let result = output.wait_with_output();
-        let _ = tx.send(result); // 忽略发送失败（接收端可能已超时退出）
-    });
-
-    let output = match rx.recv_timeout(timeout_duration) {
-        Ok(result) => result.map_err(|e| RemoteError {
-            code: "ssh_io_error".to_string(),
-            message: format!("SSH 进程 I/O 错误：{e}"),
-            details: None,
-            recoverable: true,
-            suggestion: Some("请重试。如持续出现，请检查系统资源。".to_string()),
-        })?,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // 超时：SSH 进程已经在后台线程中运行，无法直接杀死
-            // 注：SSH 客户端通常有自己的超时机制（ServerAliveInterval）
-            // 这里的超时是为了防止 UI 无限等待
+    let output = match wait_with_timeout(output, Duration::from_secs(timeout_secs)) {
+        Ok(Some(output)) => output,
+        Ok(None) => {
             return Err(RemoteError {
                 code: "ssh_timeout".to_string(),
                 message: format!("SSH 命令执行超时（{}秒）", timeout_secs),
                 details: Some(format!(
                     "命令：{} {} {}",
-                    profile.host,
-                    profile.username,
-                    helper_args.join(" ")
+                    profile.host, profile.username, command_details
                 )),
                 recoverable: true,
                 suggestion: Some(
-                    "网络慢或远程命令卡住。请检查网络连接，或在 SSH 配置中设置超时参数。".to_string(),
+                    "网络慢或远程命令卡住。请检查网络连接，或在 SSH 配置中设置超时参数。"
+                        .to_string(),
                 ),
             });
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        Err(e) => {
             return Err(RemoteError {
-                code: "ssh_thread_panic".to_string(),
-                message: "SSH 执行线程异常退出".to_string(),
+                code: "ssh_io_error".to_string(),
+                message: format!("SSH 进程 I/O 错误：{e}"),
                 details: None,
-                recoverable: false,
-                suggestion: Some("这可能是程序错误。请报告此问题。".to_string()),
-            });
+                recoverable: true,
+                suggestion: Some("请重试。如持续出现，请检查系统资源。".to_string()),
+            })
         }
     };
 
@@ -585,7 +705,8 @@ fn try_run_ssh(
             details: Some("输出被截断以防止内存溢出".to_string()),
             recoverable: false,
             suggestion: Some(
-                "请在远程服务器上查看 Helper 日志文件排查问题（csswitch-helper logs proxy）。".to_string()
+                "请在远程服务器上查看 Helper 日志文件排查问题（csswitch-helper logs proxy）。"
+                    .to_string(),
             ),
         });
     }
@@ -599,6 +720,60 @@ fn try_run_ssh(
     })
 }
 
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stdout) = stdout.take() {
+            let _ = stdout.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stderr) = stderr.take() {
+            let _ = stderr.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(status.map(|status| Output {
+        status,
+        stdout,
+        stderr,
+    }))
+}
+
+fn wait_with_timeout_legacy(
+    child: std::process::Child,
+    timeout: Duration,
+) -> Result<std::io::Result<Output>, std::sync::mpsc::RecvTimeoutError> {
+    match wait_with_timeout(child, timeout) {
+        Ok(Some(output)) => Ok(Ok(output)),
+        Ok(None) => Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        Err(e) => Ok(Err(e)),
+    }
+}
+
 /// 解析 helper 的 `{"ok":true,"data":...}` JSON 响应。
 fn parse_helper_response<T: DeserializeOwned>(stdout: &str) -> Result<T, RemoteError> {
     // 取最后一行非空内容（忽略 shell 登录 banner 等噪声）
@@ -609,14 +784,16 @@ fn parse_helper_response<T: DeserializeOwned>(stdout: &str) -> Result<T, RemoteE
         .unwrap_or(stdout)
         .trim();
 
-    let envelope: serde_json::Value =
-        serde_json::from_str(json_line).map_err(|e| RemoteError {
-            code: "invalid_json".to_string(),
-            message: format!("Helper 返回了无效的 JSON：{e}"),
-            details: Some(format!("原始输出（截断）：{}", &json_line[..json_line.len().min(200)])),
-            recoverable: false,
-            suggestion: Some("Helper 版本可能不兼容。请尝试重新安装 Helper。".to_string()),
-        })?;
+    let envelope: serde_json::Value = serde_json::from_str(json_line).map_err(|e| RemoteError {
+        code: "invalid_json".to_string(),
+        message: format!("Helper 返回了无效的 JSON：{e}"),
+        details: Some(format!(
+            "原始输出（截断）：{}",
+            &json_line[..json_line.len().min(200)]
+        )),
+        recoverable: false,
+        suggestion: Some("Helper 版本可能不兼容。请尝试重新安装 Helper。".to_string()),
+    })?;
 
     let ok = envelope
         .get("ok")
@@ -624,7 +801,10 @@ fn parse_helper_response<T: DeserializeOwned>(stdout: &str) -> Result<T, RemoteE
         .unwrap_or(false);
 
     if ok {
-        let data = envelope.get("data").cloned().unwrap_or(serde_json::Value::Null);
+        let data = envelope
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         serde_json::from_value(data).map_err(|e| RemoteError {
             code: "data_parse_error".to_string(),
             message: format!("Helper 返回数据格式不匹配：{e}"),
@@ -672,14 +852,21 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
             message: "SSH 认证失败，请检查用户名和密钥配置".to_string(),
             details: Some(stderr.to_string()),
             recoverable: false,
-            suggestion: Some(match &profile.auth_method {
-                RemoteAuthMethod::KeyFile { .. } => {
-                    "请确认私钥文件路径正确且已添加到远程服务器的 authorized_keys。"
+            suggestion: Some(
+                match &profile.auth_method {
+                    RemoteAuthMethod::KeyFile { .. } => {
+                        "请确认私钥文件路径正确且已添加到远程服务器的 authorized_keys。"
+                    }
+                    RemoteAuthMethod::SshAgent => {
+                        "请确认 ssh-agent 已运行且已添加对应密钥（ssh-add -l 查看）。"
+                    }
+                    RemoteAuthMethod::Recommended { .. } => {
+                        "请检查服务器地址、用户名、密码或密钥文件是否正确。"
+                    }
+                    RemoteAuthMethod::Password { .. } => "请确认服务器密码正确。",
                 }
-                RemoteAuthMethod::SshAgent => {
-                    "请确认 ssh-agent 已运行且已添加对应密钥（ssh-add -l 查看）。"
-                }
-            }.to_string()),
+                .to_string(),
+            ),
         };
     }
 
@@ -717,7 +904,9 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
             ),
             details: Some(stderr.to_string()),
             recoverable: false,
-            suggestion: Some("请点击「安装 Helper」按钮自动安装，或手动部署 Helper 到服务器。".to_string()),
+            suggestion: Some(
+                "请点击「安装 Helper」按钮自动安装，或手动部署 Helper 到服务器。".to_string(),
+            ),
         };
     }
 
@@ -733,7 +922,9 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
             message: "远程服务器磁盘空间不足".to_string(),
             details: Some(stderr.to_string()),
             recoverable: false,
-            suggestion: Some("请清理远程服务器磁盘空间，或使用 df -h 检查磁盘使用情况。".to_string()),
+            suggestion: Some(
+                "请清理远程服务器磁盘空间，或使用 df -h 检查磁盘使用情况。".to_string(),
+            ),
         };
     }
 
@@ -745,7 +936,8 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
             details: Some(stderr.to_string()),
             recoverable: false,
             suggestion: Some(
-                "请确认远程用户对 Helper 路径和日志目录有读写权限（chmod +x helper_path）。".to_string()
+                "请确认远程用户对 Helper 路径和日志目录有读写权限（chmod +x helper_path）。"
+                    .to_string(),
             ),
         };
     }
@@ -808,20 +1000,19 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
         details: Some(stderr.to_string()),
         recoverable: exit_code.map_or(false, |c| c == 255), // 255 通常为连接错误，可重试
         suggestion: Some(
-            "请在终端手动执行 SSH 命令排查问题：ssh -vvv user@host（-vvv 开启详细日志）。".to_string()
+            "请在终端手动执行 SSH 命令排查问题：ssh -vvv user@host（-vvv 开启详细日志）。"
+                .to_string(),
         ),
     }
 }
 
 /// 判断错误是否可重试（网络类错误可重试，认证/配置类不可重试）。
 fn is_recoverable_error(error: &RemoteError) -> bool {
-    error.recoverable && matches!(
-        error.code.as_str(),
-        "ssh_io_error"
-            | "ssh_connection_failed"
-            | "ssh_exit_255"
-            | "ssh_spawn_failed"
-    )
+    error.recoverable
+        && matches!(
+            error.code.as_str(),
+            "ssh_io_error" | "ssh_connection_failed" | "ssh_exit_255" | "ssh_spawn_failed"
+        )
 }
 
 // ============================================================================
@@ -850,6 +1041,7 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::RemoteSshAdvancedOptions;
     use super::*;
 
     fn sample_profile() -> RemoteHostProfile {
@@ -862,6 +1054,7 @@ mod tests {
             auth_method: RemoteAuthMethod::SshAgent,
             helper_path: "/usr/local/bin/csswitch-helper".to_string(),
             last_connected: None,
+            ssh_options: RemoteSshAdvancedOptions::default(),
         }
     }
 
@@ -883,6 +1076,10 @@ mod tests {
         let mut p = sample_profile();
         p.auth_method = RemoteAuthMethod::KeyFile {
             path: "~/.ssh/id_ed25519".to_string(),
+            save_key_password: true,
+            allow_password_fallback: true,
+            allow_verification_code: true,
+            remember_connection: true,
         };
         let args = build_ssh_args(&p, &["status".to_string()]);
         assert!(args.contains(&"-i".to_string()));
@@ -890,9 +1087,75 @@ mod tests {
     }
 
     #[test]
+    fn password_command_spec_uses_askpass_environment() {
+        let mut p = sample_profile();
+        p.auth_method = RemoteAuthMethod::Password {
+            save_password: true,
+            allow_verification_code: true,
+            remember_connection: true,
+        };
+
+        let spec = build_ssh_command_spec(&p, &["status".to_string()], AuthRuntimeOptions::test());
+
+        assert!(spec.args.contains(&"BatchMode=no".to_string()));
+        assert!(spec.args.contains(&"NumberOfPasswordPrompts=3".to_string()));
+        assert_env(&spec.env, "SSH_ASKPASS", "csswitch-ssh-askpass");
+        assert_env(&spec.env, "SSH_ASKPASS_REQUIRE", "force");
+        assert_env(&spec.env, "DISPLAY", "csswitch");
+        assert_env(&spec.env, "CSSWITCH_ASKPASS_PROFILE", "test");
+        assert_env(
+            &spec.env,
+            "CSSWITCH_ASKPASS_DIR",
+            "csswitch-askpass-session",
+        );
+    }
+
+    #[test]
+    fn key_password_command_spec_passes_key_path_to_askpass() {
+        let mut p = sample_profile();
+        p.auth_method = RemoteAuthMethod::KeyFile {
+            path: "~/.ssh/id_ed25519".to_string(),
+            save_key_password: true,
+            allow_password_fallback: false,
+            allow_verification_code: false,
+            remember_connection: false,
+        };
+
+        let spec = build_ssh_command_spec(&p, &["status".to_string()], AuthRuntimeOptions::test());
+
+        assert!(spec.args.contains(&"BatchMode=no".to_string()));
+        assert_env(&spec.env, "CSSWITCH_ASKPASS_KEY_PATH", "~/.ssh/id_ed25519");
+    }
+
+    #[test]
+    fn ssh_agent_command_spec_stays_noninteractive() {
+        let spec = build_ssh_command_spec(
+            &sample_profile(),
+            &["status".to_string()],
+            AuthRuntimeOptions::test(),
+        );
+
+        assert!(spec.args.contains(&"BatchMode=yes".to_string()));
+        assert!(spec.args.contains(&"NumberOfPasswordPrompts=0".to_string()));
+        assert!(spec.env.is_empty());
+    }
+
+    fn assert_env(env: &[(String, String)], key: &str, value: &str) {
+        assert_eq!(
+            env.iter()
+                .find(|(env_key, _)| env_key == key)
+                .map(|(_, env_value)| env_value.as_str()),
+            Some(value)
+        );
+    }
+
+    #[test]
     fn shell_quote_leaves_safe_strings_unchanged() {
         assert_eq!(shell_quote("hello-world"), "hello-world");
-        assert_eq!(shell_quote("/usr/local/bin/helper"), "/usr/local/bin/helper");
+        assert_eq!(
+            shell_quote("/usr/local/bin/helper"),
+            "/usr/local/bin/helper"
+        );
     }
 
     #[test]
@@ -934,7 +1197,11 @@ mod tests {
 
     #[test]
     fn auth_errors_are_not_recoverable() {
-        let err = map_ssh_error(&sample_profile(), "Permission denied (publickey)", Some(255));
+        let err = map_ssh_error(
+            &sample_profile(),
+            "Permission denied (publickey)",
+            Some(255),
+        );
         assert!(!err.recoverable);
         assert_eq!(err.code, "ssh_auth_failed");
     }
