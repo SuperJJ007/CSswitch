@@ -61,6 +61,8 @@ def _coerce_param(pname, string_attr, raw, prop_schema):
     if string_attr == "true":
         return raw
     typ = (prop_schema or {}).get("type")
+    if typ == "string":
+        return raw
     try:
         if typ == "integer":
             return int(raw)
