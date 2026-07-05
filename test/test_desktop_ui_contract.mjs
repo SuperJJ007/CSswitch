@@ -246,6 +246,15 @@ test("macOS one-click command keeps app and state names available under cfg", ()
   assert.match(body, /asset_root\(&app\)/);
 });
 
+test("macOS sandbox stopper keeps app handle name available under cfg", () => {
+  const m = libTauri.match(/fn stop_sandbox_inner\([\s\S]*?\n}\n\n\/\/ ----------/);
+  assert.ok(m, "stop_sandbox_inner body should be discoverable");
+  const body = m[0];
+  assert.match(body, /app: &tauri::AppHandle/);
+  assert.doesNotMatch(body, /_app: &tauri::AppHandle/);
+  assert.match(body, /asset_root\(app\)/);
+});
+
 test("remote one-click backend starts proxy and sandbox and returns access info", () => {
   const m = remoteCommands.match(/pub fn remote_one_click[\s\S]*?\n}\n\n\/\/ ==========================================================================/);
   assert.ok(m, "remote_one_click body should be discoverable");

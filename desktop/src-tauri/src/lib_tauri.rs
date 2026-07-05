@@ -403,13 +403,14 @@ fn ensure_proxy(
 /// 停沙箱。返回 Err 表示 stop 脚本非零退出（Science 可能没停干净），
 /// 调用方据此如实报告，不再无条件报「已停止」（修 P1 停止虚假成功）。
 /// 仅 macOS 有效；非 macOS 上本地沙箱不存在，直接清 state 返回 Ok。
-fn stop_sandbox_inner(_app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
+fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
     // 沙箱由脚本以 --detached 起 Science，本进程持有的是脚本 child（已退出）。
     // 真正停 Science 要调 stop 脚本（按 data-dir，绝不碰真实 8765）。
     // 修 P1（GPT 复审）：定位不到资源根 / 停止脚本时，绝不静默返回成功——detached 沙箱
     // 可能仍在跑，谎报「已停止」会让「切官方模式」误以为第三方链路已拆。此时如实报错。
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = app;
         kill_child(&mut st.sandbox);
         st.sandbox_url = None;
         return Ok(());
