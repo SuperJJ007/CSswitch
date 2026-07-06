@@ -4,6 +4,21 @@
 
 > **约定**：已修问题从 [`docs/known-issues.md`](docs/known-issues.md)「毕业」到这里（发布即定稿）；未修/进行中留在 known-issues；硬 bug 的根因证据链存在 [`findings/`](findings/)。
 
+## [0.3.5] — 2026-07-06
+
+> 主题：**API/provider 稳定性基线**。这版把 Anthropic 兼容 provider 的关键路径拆清楚，强化 Kimi / DeepSeek / 自定义 Anthropic 等路径的流式、错误与工具调用兼容性，作为后续 provider capability / matrix 工作的稳定底座。
+
+### 变更 Changed
+- **Anthropic 兼容路径抽取**：将 provider 选择策略与 Anthropic 兼容协议处理拆到独立模块，降低代理主入口复杂度，方便后续扩展和回归。
+- **provider 行为更显式**：把 relay / native / custom 等运行策略统一收口，减少不同来源切换时的隐式分支和旧状态复用风险。
+
+### 修复 Fixed
+- **Kimi 工具兼容性兜底**：过滤 Kimi 当前不支持的 server-side tool 定义，避免兼容端点因工具 schema 差异拒绝请求。
+- **流式错误与 keepalive 合同**：收紧 SSE keepalive、上游错误透传与结束帧行为，避免 provider 报错时表现成不清晰的悬挂或半截输出。
+
+### 说明 Notes
+- 验证：`test/run_all.sh` 全层通过；Anthropic 兼容与 provider policy 单测通过；桌面侧 clippy / fmt / JS 语法检查通过；DeepSeek 流式与非流式样例请求完成。Kimi 测试中遇到的失败为上游额度限制返回 429，不归类为本版代理回归。
+
 ## [0.3.4] — 2026-07-05
 
 ### 修复 Fixed
