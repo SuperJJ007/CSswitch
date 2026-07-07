@@ -16,6 +16,7 @@ mod config_legacy;
 mod lifecycle;
 mod oauth_forge;
 mod proc;
+mod runtime;
 mod scratch;
 mod templates;
 
@@ -27,6 +28,23 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::json;
 use tauri::{Manager, State};
+
+use runtime::diagnostics::{status_lights, StatusProbeInput};
+use runtime::profile::{
+    build_get_config, build_list_templates, clear_profile_key_inner, create_profile_inner,
+    delete_profile_inner, merge_and_sort_models, nonactive_probe_verdict, probe_kind_for,
+    update_profile_connection_inner, update_profile_metadata_inner, ConnectionEdit,
+};
+use runtime::provider::{
+    assert_format_supported, is_native_adapter, is_openai_adapter, key_env_for_adapter,
+    proxy_args_for, proxy_fingerprint, reject_openai_custom_anthropic_base, relay_missing_base_url,
+    relay_missing_model, should_scratch_candidate, upstream_host,
+};
+use runtime::proxy::{health_timeout_reason, should_write_back, ProxyAction};
+use runtime::science::{first_http_url, sandbox_home, settings_change_needs_teardown};
+use runtime::transaction::{
+    decide_switch, rollback_status_clause, skip_scratch_verify, SwitchOutcome,
+};
 
 const SCIENCE_BIN: &str = "/Applications/Claude Science.app/Contents/Resources/bin/claude-science";
 
@@ -43,136 +61,6 @@ struct AppState {
     sandbox: Option<Child>,
     sandbox_port: u16,
     sandbox_url: Option<String>,
-}
-
-/// key 的非加密指纹（SipHash），只用于判断「配置是否变了」。绝不打印、绝不落盘。
-fn key_fingerprint(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
-// ---------- adapter / profile 运行元信息 ----------
-/// adapter → 该 adapter 期望的 key 环境变量名（python 代理侧 PROVIDERS[...]["key_env"]）。
-fn key_env_for_adapter(adapter: &str) -> &'static str {
-    match adapter {
-        "deepseek" => "DEEPSEEK_API_KEY",
-        "qwen" => "DASHSCOPE_API_KEY",
-        "openai-custom" | "openai-responses" => "CSSWITCH_OPENAI_KEY",
-        _ => "CSSWITCH_RELAY_KEY", // relay / 兜底
-    }
-}
-
-/// 从一条 profile 派生出起代理需要的全部参数（纯函数，便于测试）。
-struct ProxyLaunch {
-    adapter: String,
-    base_url: String,
-    model: String,
-    key: String,
-    key_env: &'static str,
-    thinking_policy: &'static str,
-}
-
-fn proxy_args_for(p: &config::Profile) -> ProxyLaunch {
-    let adapter = templates::adapter_for(&p.template_id).to_string();
-    let key_env = key_env_for_adapter(&adapter);
-    ProxyLaunch {
-        adapter,
-        base_url: p.base_url.clone(),
-        model: p.model.clone(),
-        key: p.api_key.clone(),
-        key_env,
-        thinking_policy: templates::thinking_policy_for(&p.template_id),
-    }
-}
-
-fn proxy_fingerprint(p: &config::Profile, launch: &ProxyLaunch) -> u64 {
-    key_fingerprint(&format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        p.template_id,
-        p.api_format,
-        launch.adapter,
-        launch.base_url,
-        launch.model,
-        launch.thinking_policy,
-        launch.key
-    ))
-}
-
-/// 本轨支持 anthropic / openai_chat / openai_responses；其余进 schema 但激活拒绝（待轨道 2：Rust 代理）。
-fn assert_format_supported(p: &config::Profile) -> Result<(), String> {
-    match p.api_format.as_str() {
-        "anthropic" | "openai_chat" | "openai_responses" => Ok(()),
-        other => Err(format!(
-            "api_format `{other}` 暂不支持（待 Rust 代理），请选 anthropic、openai_chat 或 openai_responses。"
-        )),
-    }
-}
-
-fn looks_like_anthropic_endpoint(base_url: &str) -> bool {
-    let u = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
-    u.contains("/anthropic")
-}
-
-fn reject_openai_custom_anthropic_base(template_id: &str, base_url: &str) -> Result<(), String> {
-    if matches!(template_id, "custom-openai" | "custom-openai-responses")
-        && looks_like_anthropic_endpoint(base_url)
-    {
-        Err("这个地址看起来是 Anthropic 兼容端点。请改选「自定义 Anthropic」，或使用 OpenAI 兼容 base root（如 https://api.moonshot.cn/v1）。".to_string())
-    } else {
-        Ok(())
-    }
-}
-
-/// deepseek/qwen 走各自固定官方端点（python 侧硬编码）；其余 = relay 家族，需带 base_url。
-fn is_native_adapter(adapter: &str) -> bool {
-    adapter == "deepseek" || adapter == "qwen"
-}
-
-fn is_openai_adapter(adapter: &str) -> bool {
-    matches!(adapter, "openai-custom" | "openai-responses")
-}
-
-/// 上游主机名（供 status 上游灯做 TCP 可达性探测）。relay 家族从其 base_url 解析。
-fn upstream_host(adapter: &str, base_url: &str) -> String {
-    match adapter {
-        "deepseek" => "api.deepseek.com".to_string(),
-        "qwen" => "dashscope.aliyuncs.com".to_string(),
-        _ => parse_host(base_url).unwrap_or_default(),
-    }
-}
-
-/// 从 `http(s)://host[:port]/path` 里抽出 host。解析不出返回 None（不引 url crate）。
-fn parse_host(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let host = rest
-        .split(['/', ':', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
-    }
-}
-
-/// 判断模型 id 是否会平铺进 Science 选择器主列表（claude-{opus|sonnet|haiku}-<数字…>）。
-/// 仅用于「获取模型」结果排序（主列表项排前），非鉴权路径。
-fn is_main_list_model(id: &str) -> bool {
-    for fam in ["claude-opus-", "claude-sonnet-", "claude-haiku-"] {
-        if let Some(rest) = id.strip_prefix(fam) {
-            return rest
-                .chars()
-                .next()
-                .map(|c| c.is_ascii_digit())
-                .unwrap_or(false);
-        }
-    }
-    false
 }
 
 // ---------- 路径与日志 ----------
@@ -211,11 +99,6 @@ fn asset_root(app: &tauri::AppHandle) -> Option<PathBuf> {
         }
     }
     repo_root()
-}
-
-/// 沙箱可写工作目录（独立 HOME）：`~/.csswitch/sandbox/home`。
-fn sandbox_home() -> PathBuf {
-    config::default_dir().join("sandbox").join("home")
 }
 
 fn log_path(name: &str) -> PathBuf {
@@ -308,41 +191,6 @@ fn ere_escape(s: &str) -> String {
     out
 }
 
-/// 本次 ensure_proxy 对代理做了什么（供一键据实提示）。
-#[derive(Clone, Copy, PartialEq)]
-enum ProxyAction {
-    Reused,    // 端口+adapter+key 指纹一致且健康，原样复用
-    Restarted, // 首次起 / 换 key / 换 profile / 不健康，重起了代理
-}
-
-/// 切换事务的提交/回滚决策（纯函数，spec §7）。live 路径难做确定性单测，故把决策抽出单独测。
-#[derive(Debug, PartialEq)]
-enum SwitchOutcome {
-    Commit,           // scratch 校验过 + 正式代理探活健康 → 提交 active_id
-    RollbackToOld,    // scratch 过但正式代理起/探活失败 → 杀候选、恢复旧代理、不提交
-    AbortBeforeStart, // scratch 校验失败 → 根本没起正式代理、旧态零改动
-}
-
-/// 给定「候选 scratch 校验结果」与「正式代理探活结果」，决定切换事务走向。
-fn decide_switch(scratch_ok: bool, real_healthy: bool) -> SwitchOutcome {
-    if !scratch_ok {
-        return SwitchOutcome::AbortBeforeStart;
-    }
-    if real_healthy {
-        SwitchOutcome::Commit
-    } else {
-        SwitchOutcome::RollbackToOld
-    }
-}
-
-/// 探活结束回锁后是否可写回 `st.proxy`：generation 未被取代【且】secret 仍是本次启动的。
-/// 抽成纯函数便于确定性单测（gen 同/异 × secret 同/异 4 组合）。
-/// secret 合取防「冷启动双起、两个不同 secret、generation 却相等」的窄窗：另起若用不同 secret
-/// 重置了槽位，本次就不该拿旧 child 覆盖它（起代理前会把 `st.secret` 预置成本次 secret，故合法启动上恒真）。
-fn should_write_back(gen_captured: u64, gen_now: u64, st_secret: &str, my_secret: &str) -> bool {
-    gen_captured == gen_now && st_secret == my_secret
-}
-
 /// 确保代理在跑且健康；返回 (端口, secret, 本次动作)。幂等：已健康则复用。
 /// 读【生效 profile】派生 adapter/base_url/model/key，委托 [`start_proxy_for`]。
 fn ensure_proxy(
@@ -356,23 +204,6 @@ fn ensure_proxy(
         .cloned()
         .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
     start_proxy_for(app, state, lifecycle, &profile)
-}
-
-/// 探活超时的原因措辞（纯函数，修真机 P2）：本地 `/health` 不验上游 key，故探活超时与 key 有效性
-/// 无关。日志出现绑定失败（Address already in use / EADDRINUSE）→ 明确报端口占用；否则报「探活超时」
-/// （多为 python 依赖缺失 / 脚本异常），绝不再含糊说「或 key 无效」。
-fn health_timeout_reason(port: u16, tail: &str) -> String {
-    let occupied = tail.contains("Address already in use")
-        || tail.contains("EADDRINUSE")
-        || tail.contains("Errno 48") // macOS EADDRINUSE
-        || tail.contains("Errno 98"); // Linux EADDRINUSE
-    if occupied {
-        format!("端口 {port} 已被占用，换个端口或先停掉占用进程后重试。")
-    } else {
-        format!(
-            "代理起后探活超时（端口 {port}）：多为 python 依赖缺失或代理脚本异常，请查看代理日志。"
-        )
-    }
 }
 
 /// 用【给定 profile】（不读 active）起代理并探活；返回 (端口, secret, 动作)。
@@ -569,184 +400,6 @@ fn stop_sandbox_inner(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
     }
 }
 
-// ---------- 返回体组装（纯函数，便于测试） ----------
-/// 组装 get_config 返回体：profiles 的 key 只回掩码，全 key 绝不出后端。
-fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> {
-    let cfg = config::load_from(dir).map_err(|e| e.to_string())?;
-    // 一次性迁移提示（#9 甲）：读出后立即清盘，避免每次 get_config 重复提示。
-    let notice = cfg.pending_notice.clone();
-    if notice.is_some() {
-        config::update(dir, |c| c.pending_notice = None).map_err(|e| e.to_string())?;
-    }
-    let profiles: Vec<serde_json::Value> = cfg
-        .profiles
-        .iter()
-        .map(|p| {
-            json!({
-                "id": p.id, "name": p.name, "template_id": p.template_id, "category": p.category,
-                "api_format": p.api_format, "base_url": p.base_url, "model": p.model,
-                "key": config::mask(&p.api_key), "icon": p.icon, "icon_color": p.icon_color,
-                "website_url": p.website_url, "sort_index": p.sort_index, "notes": p.notes,
-            })
-        })
-        .collect();
-    Ok(json!({
-        "schema_version": cfg.schema_version, "active_id": cfg.active_id, "profiles": profiles,
-        "templates": build_list_templates(), "proxy_port": cfg.proxy_port,
-        "sandbox_port": cfg.sandbox_port, "mode": cfg.mode, "pending_notice": notice,
-    }))
-}
-
-/// 模板注册表交前端铺 UI（单一来源，前端不复制常量）。
-fn build_list_templates() -> Vec<serde_json::Value> {
-    templates::all()
-        .iter()
-        .map(|t| {
-            json!({
-                "id": t.id, "name": t.name, "category": t.category, "api_format": t.api_format,
-                "adapter": t.adapter, "base_url": t.base_url, "base_url_editable": t.base_url_editable,
-                "requires_model_override": t.requires_model_override,
-                "builtin_models": t.builtin_models, "icon": t.icon, "icon_color": t.icon_color,
-                "website_url": t.website_url,
-            })
-        })
-        .collect()
-}
-
-// ---------- profile CRUD 纯实现（*_inner，便于用临时 dir 单测） ----------
-fn create_profile_inner(
-    dir: &Path,
-    template_id: &str,
-    name: &str,
-    key: Option<&str>,
-    base_url_override: Option<&str>,
-    model: Option<&str>,
-) -> Result<String, String> {
-    let tpl = templates::by_id(template_id).ok_or_else(|| format!("未知模板：{template_id}"))?;
-    let id = config::new_id();
-    let base_url = base_url_override
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| tpl.base_url.to_string());
-    reject_openai_custom_anthropic_base(template_id, &base_url)?;
-    let p = config::Profile {
-        id: id.clone(),
-        name: name.to_string(),
-        template_id: template_id.to_string(),
-        category: tpl.category.to_string(),
-        api_format: tpl.api_format.to_string(),
-        base_url,
-        api_key: key.unwrap_or("").to_string(),
-        model: model.unwrap_or("").to_string(),
-        website_url: Some(tpl.website_url.to_string()),
-        icon: Some(tpl.icon.to_string()),
-        icon_color: Some(tpl.icon_color.to_string()),
-        sort_index: Some(config::now_ms()),
-        created_at: Some(config::now_ms()),
-        notes: None,
-    };
-    assert_format_supported(&p)?; // custom 选了不支持格式则拒
-                                  // 守卫（修 #9 P1-a）：relay/自定义端点必须带 model（force 前提）。
-    if relay_missing_model(tpl.adapter, &p.model) {
-        return Err("中转 / 自定义端点必须选择或填写一个模型，未创建。".to_string());
-    }
-    config::update(dir, |c| c.profiles.push(p)).map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-fn update_profile_metadata_inner(
-    dir: &Path,
-    id: &str,
-    name: &str,
-    notes: Option<&str>,
-) -> Result<(), String> {
-    // 未命中 id → Err（不静默 Ok，修 MP-1 Minor [4]）。
-    if config::load_from(dir)
-        .map_err(|e| e.to_string())?
-        .profile_by_id(id)
-        .is_none()
-    {
-        return Err(format!("找不到 profile：{id}"));
-    }
-    config::update(dir, |c| {
-        if let Some(p) = c.profile_by_id_mut(id) {
-            p.name = name.to_string();
-            p.notes = notes.map(str::to_string);
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-fn clear_profile_key_inner(dir: &Path, id: &str) -> Result<(), String> {
-    config::update(dir, |c| {
-        if let Some(p) = c.profile_by_id_mut(id) {
-            p.api_key.clear();
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    config::drop_rolling_backup(dir); // 清 key 后净化滚动备份，旧明文不可从 .bak 恢复
-    Ok(())
-}
-
-fn delete_profile_inner(dir: &Path, id: &str) -> Result<(), String> {
-    config::update(dir, |c| {
-        c.profiles.retain(|p| p.id != id);
-        if c.active_id == id {
-            c.active_id.clear(); // 删 active → 置空
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    config::drop_rolling_backup(dir);
-    Ok(())
-}
-
-fn update_profile_connection_inner(
-    dir: &Path,
-    id: &str,
-    base_url: Option<&str>,
-    api_format: Option<&str>,
-    model: Option<&str>,
-    key: Option<&str>,
-) -> Result<(), String> {
-    if let Some(fmt) = api_format {
-        let probe = config::Profile {
-            api_format: fmt.to_string(),
-            ..Default::default()
-        };
-        assert_format_supported(&probe)?;
-    }
-    // 未命中 id → Err（不静默 Ok，修 MP-1 Minor [4]）。
-    if config::load_from(dir)
-        .map_err(|e| e.to_string())?
-        .profile_by_id(id)
-        .is_none()
-    {
-        return Err(format!("找不到 profile：{id}"));
-    }
-    config::write_rolling_backup(dir).ok(); // 覆盖前留底
-    config::update(dir, |c| {
-        if let Some(p) = c.profile_by_id_mut(id) {
-            if let Some(u) = base_url {
-                p.base_url = u.to_string();
-            }
-            if let Some(f) = api_format {
-                p.api_format = f.to_string();
-            }
-            if let Some(m) = model {
-                p.model = m.to_string();
-            }
-            if let Some(k) = key {
-                if !k.is_empty() {
-                    p.api_key = k.to_string(); // 空=不改（留占位不覆盖已存 key）
-                }
-            }
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 // ---------- Tauri commands ----------
 #[tauri::command]
 fn get_config() -> Result<serde_json::Value, String> {
@@ -819,17 +472,6 @@ fn open_official() -> Result<(), String> {
 struct UiSettings {
     proxy_port: u16,
     sandbox_port: u16,
-}
-
-/// 端口变更是否需要拆掉现有链路（纯函数，P1-c）。代理/沙箱任一端口变了，正在跑的代理就绑在
-/// 旧端口、正在跑的沙箱又把旧代理 URL 烘死了，二者与新配置不一致 → 拆掉逼下次「一键开始」按新端口重建。
-fn settings_change_needs_teardown(
-    old_proxy: u16,
-    new_proxy: u16,
-    old_sandbox: u16,
-    new_sandbox: u16,
-) -> bool {
-    old_proxy != new_proxy || old_sandbox != new_sandbox
 }
 
 /// 端口设置（provider/连接改走 profile CRUD + set_active_profile）。
@@ -970,60 +612,6 @@ fn delete_profile(
     })
 }
 
-/// 非 active 连接编辑的上游校验裁决（纯函数，P2-d）：只有上游【明确】拒绝（Auth 401/403、
-/// ModelError 400/404/422）才 Some(hint) 拦下不落盘；Ok / 含糊(429/5xx) / 无响应 → None 照常落盘
-/// （best-effort：非 active 没有正在服务的链路可保护，卡在网络抖动上比放行更糟）。
-/// 非 active 连接编辑的上游校验裁决（纯函数，P2-d）：
-/// - `Ok(true)`  上游明确接受(200)，已校验；
-/// - `Ok(false)` 无法确认(429/5xx/无响应)，best-effort 落盘、标记「未校验」（激活时会再验）；
-/// - `Err(hint)` 上游明确拒绝(401/403/400/404/422)，拦下不落盘。
-///
-/// 选「如实标记后保存」：不因网络抖动/上游繁忙挡住保存，但也绝不假称已校验。
-fn nonactive_probe_verdict(outcome: &scratch::ProbeOutcome) -> Result<bool, String> {
-    match outcome {
-        scratch::ProbeOutcome::Ok => Ok(true),
-        scratch::ProbeOutcome::Auth(code) => {
-            Err(format!("上游拒绝（{code}），key/权限有误，连接未保存。"))
-        }
-        scratch::ProbeOutcome::ModelError(code) => Err(format!(
-            "上游拒绝该模型（{code}），连接未保存。请换一个模型或核对 base_url。"
-        )),
-        // 无法确认（405/429/5xx/无响应）：落盘但标记未校验，激活时再验。
-        // Unsupported(405) 并入此类：save 走 Message 探测，405 罕见（端点/base_url 异常），保守标未校验（与旧行为一致）。
-        scratch::ProbeOutcome::Ambiguous(_)
-        | scratch::ProbeOutcome::NoResponse
-        | scratch::ProbeOutcome::Unsupported(_) => Ok(false),
-    }
-}
-
-/// 是否对候选连接跑上游 scratch 校验（纯函数，修真机 P1）：空 key → 免（无从验）；非原生且空
-/// base_url → 免（relay 必须带 base_url）；原生（deepseek/qwen）即便 base_url 为空也【要】验
-/// （用各自硬编码官方端点，坏 key 才能在保存时被拦，不再顺延到激活）。
-fn should_scratch_candidate(adapter: &str, key: &str, base_url: &str) -> bool {
-    if key.is_empty() {
-        return false; // 无 key → 无从验，如实标记未校验。
-    }
-    if !is_native_adapter(adapter) && base_url.is_empty() {
-        return false; // relay 家族缺 base_url → 无从验。
-    }
-    true
-}
-
-/// 保存前守卫（纯函数，修 P2）：relay 家族（非 native）空 base_url 的候选连接不可用——
-/// 激活必失败（relay 无硬编码端点可回退）。0.3.1 起内置预设 base_url 可编辑，用户清空后
-/// 旧路径会跳过校验、静默落盘并谎报「已保存」。此处在保存时就拦下，绝不落盘。
-/// native(deepseek/qwen) 走各自硬编码官方端点，空 base_url 无妨 → 不拦。
-fn relay_missing_base_url(adapter: &str, base_url: &str) -> bool {
-    !is_native_adapter(adapter) && base_url.trim().is_empty()
-}
-
-/// 保存/激活前守卫（纯函数，修 #9 P1-a）：relay 家族（非 native）空（含纯空白）model 不可用——
-/// 无 model → launcher 不注入 CSSWITCH_RELAY_MODEL → 无 force → 退回 passthrough → Science 显示 claude。
-/// native(deepseek/qwen) 走内置映射/硬编码端点，model 可空 → 不拦。
-fn relay_missing_model(adapter: &str, model: &str) -> bool {
-    !is_native_adapter(adapter) && model.trim().is_empty()
-}
-
 /// 对候选连接做一次上游 scratch 校验（非 active 编辑用，P2-d）。起临时代理探完即杀，
 /// **绝不碰 config / AppState / 正在服务的正式代理**。返回是否【已通过上游校验】（供调用方据实措辞）：
 /// 空 key / relay 家族空 base_url → `Ok(false)`（无从预检，标记未校验）；
@@ -1077,12 +665,12 @@ fn update_profile_connection(
             .cloned()
             .ok_or_else(|| format!("找不到 profile：{id}"))?;
         // 生效【后】的候选连接（None=不改则沿用旧值），active/非 active 共用一份。
-        let edit = ConnectionEdit {
-            base_url: base_url.clone(),
-            api_format: api_format.clone(),
-            model: model.clone(),
-            key: key.clone(),
-        };
+        let edit = ConnectionEdit::new(
+            base_url.clone(),
+            api_format.clone(),
+            model.clone(),
+            key.clone(),
+        );
         edit.apply(&mut candidate);
         reject_openai_custom_anthropic_base(&candidate.template_id, &candidate.base_url)?;
         // 保存前守卫（修 P2）：relay/自定义端点清空 base_url → 不可用连接（激活必失败）。
@@ -1147,46 +735,6 @@ fn set_active_profile(
     lifecycle.with_serialized(|| {
         set_active_profile_txn(&app, &state, lifecycle.inner(), &id, skip_verify, None)
     })
-}
-
-/// active 连接编辑的内存候选值（validate-before-persist 用）：不改的字段为 None。
-/// 校验时把它套到旧 profile 的克隆上做 scratch/起正式；提交成功时用**同一套** [`ConnectionEdit::apply`]
-/// 逻辑连同 active_id 一起落盘，杜绝「先落盘后校验」导致的「盘新运行旧」（P1-4）。
-#[derive(Default)]
-struct ConnectionEdit {
-    base_url: Option<String>,
-    api_format: Option<String>,
-    model: Option<String>,
-    key: Option<String>,
-}
-
-impl ConnectionEdit {
-    /// 把非空编辑值套到目标 profile（内存候选与落盘共用同一逻辑）。
-    /// 语义与 `update_profile_connection_inner` 一致：None=不改；key 为空串=不改（留占位不覆盖已存 key）。
-    fn apply(&self, p: &mut config::Profile) {
-        if let Some(u) = &self.base_url {
-            p.base_url = u.clone();
-        }
-        if let Some(f) = &self.api_format {
-            p.api_format = f.clone();
-        }
-        if let Some(m) = &self.model {
-            p.model = m.clone();
-        }
-        if let Some(k) = &self.key {
-            if !k.is_empty() {
-                p.api_key = k.clone();
-            }
-        }
-    }
-}
-
-/// 激活/切换是否跳过 scratch 上游校验（纯函数，修真机 P1）：只有用户显式 `skip_verify` 才跳；
-/// 原生 adapter 不再豁免（旧行为 `native || skip_verify` 会让原生无效 key 提交为 active 并谎报「已切到」，
-/// 首个真实推理才 401）。`native` 参数刻意保留：记录它曾是豁免条件、现已作废。
-fn skip_scratch_verify(native: bool, skip_verify: bool) -> bool {
-    let _ = native; // native 曾是豁免条件，现已作废（保留参数以固化回归防线）。
-    skip_verify
 }
 
 /// 切换事务本体（spec §7）：scratch 校验候选 → 起正式代理探活 → 探活健康【才】提交 active_id；
@@ -1339,16 +887,6 @@ fn set_active_profile_txn(
     }
 }
 
-/// 回滚结果措辞（纯函数，P2-e）：restored=true 才说「已回滚到原配置」；恢复失败必须如实说明代理已停，
-/// 绝不谎称回滚成功（比照本项目「如实报告」铁律，掩盖代理已停会误导用户）。
-fn rollback_status_clause(restored: bool) -> &'static str {
-    if restored {
-        "已回滚到原配置（沙箱未受影响）"
-    } else {
-        "回滚未成功：代理当前已停，请重试或手动「一键开始」（沙箱未受影响）"
-    }
-}
-
 /// 切换失败回滚：按【旧 active】重起旧代理（旧 profile 仍在盘上）；best-effort，失败则代理暂停、
 /// active_id 仍为旧值，用户可重试。旧 active 为空（此前未配置生效）→ 不复活，保持代理停着。
 /// 返回是否已把旧代理恢复到位（供调用方据实措辞，修 P2-e）。
@@ -1423,38 +961,6 @@ struct FetchModelsReq {
     /// 编辑已存 profile 时传其 id（用于沿用已存 key）。
     #[serde(default)]
     profile_id: Option<String>,
-}
-
-/// live 探测结果（id + 能力）∪ builtin，去重（按 id）+ 排序（true>null>false，主列表 id 微调靠前）。
-fn merge_and_sort_models(
-    live: Vec<(String, Option<bool>)>,
-    builtin: &[&str],
-) -> Vec<serde_json::Value> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut merged: Vec<(String, Option<bool>)> = Vec::new();
-    for (id, st) in live {
-        if seen.insert(id.clone()) {
-            merged.push((id, st));
-        }
-    }
-    for b in builtin {
-        if seen.insert(b.to_string()) {
-            merged.push((b.to_string(), None));
-        }
-    }
-    merged.sort_by_key(|(id, st)| {
-        let cap = match st {
-            Some(true) => 0u8,
-            None => 1,
-            Some(false) => 2,
-        };
-        let main = if is_main_list_model(id) { 0u8 } else { 1 };
-        (cap, main)
-    });
-    merged
-        .into_iter()
-        .map(|(id, st)| json!({ "id": id, "supports_tools": st }))
-        .collect()
 }
 
 /// 解析探测用 key：新填的优先，否则沿用 profile_id 已存的（后端内部用，绝不回传前端）。
@@ -1554,26 +1060,6 @@ fn fetch_models(app: tauri::AppHandle, req: FetchModelsReq) -> Result<serde_json
                 "upstream_status": res.status
             }))
         }
-    }
-}
-
-/// 探测类型选择（纯函数，修真机 P1）：
-/// - 原生 adapter（deepseek/qwen）的 `/v1/models` 是【静态列表、不回源】，探不出坏 key，故一律用
-///   Message 探测（打 `/v1/messages` 会真发上游，坏 key → 401）。
-/// - relay：留空用 Models（`/v1/models` 回源即可验端点+鉴权）；选了具体模型用 Message 验该模型。
-fn probe_kind_for(adapter: &str, model: &str) -> scratch::ProbeKind {
-    if is_native_adapter(adapter) {
-        return scratch::ProbeKind::Message; // native /v1/models 静态，只有 Message 打上游能验 key。
-    }
-    probe_kind_for_model(model)
-}
-
-/// 选了模型 → 验具体模型（POST /v1/messages）；留空 → 验端点+鉴权（GET /v1/models）。
-fn probe_kind_for_model(model: &str) -> scratch::ProbeKind {
-    if model.trim().is_empty() {
-        scratch::ProbeKind::Models
-    } else {
-        scratch::ProbeKind::Message
     }
 }
 
@@ -1741,18 +1227,6 @@ fn one_click_login_inner(
     Ok(json!({ "url": url, "msg": msg, "action": "started" }))
 }
 
-/// 从 `claude-science url` 的 stdout 里取**第一条**合法 http(s) URL。
-fn first_http_url(stdout: &str) -> Option<String> {
-    for line in stdout.lines() {
-        let t = line.trim();
-        if t.starts_with("http://") || t.starts_with("https://") {
-            let url = t.split_whitespace().next().unwrap_or(t);
-            return Some(url.to_string());
-        }
-    }
-    None
-}
-
 /// 取沙箱 UI 链接：`<bin> url --data-dir <home>/.claude-science`，HOME 指向沙箱 HOME。
 fn sandbox_url(port: u16) -> String {
     let home = sandbox_home();
@@ -1824,23 +1298,13 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
         };
         (pport, st.secret.clone(), sport, adapter, base_url)
     };
-    let proxy = if !secret.is_empty() && proc::http_health(pport, Some(&secret), 300) {
-        "green"
-    } else {
-        "amber"
-    };
-    let sandbox = if sandbox_running_ours(sport) {
-        "green"
-    } else {
-        "amber"
-    };
     let uhost = upstream_host(&adapter, &base_url);
-    let upstream = if !uhost.is_empty() && proc::tcp_reachable(&uhost, 443, 500) {
-        "green"
-    } else {
-        "amber"
-    };
-    json!({ "proxy": proxy, "sandbox": sandbox, "upstream": upstream })
+    let lights = status_lights(StatusProbeInput {
+        proxy_ok: !secret.is_empty() && proc::http_health(pport, Some(&secret), 300),
+        sandbox_ok: sandbox_running_ours(sport),
+        upstream_ok: !uhost.is_empty() && proc::tcp_reachable(&uhost, 443, 500),
+    });
+    json!({ "proxy": lights.proxy, "sandbox": lights.sandbox, "upstream": lights.upstream })
 }
 
 #[tauri::command]
@@ -1986,534 +1450,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        assert_format_supported, build_get_config, build_list_templates, clear_profile_key_inner,
-        create_profile_inner, decide_switch, delete_profile_inner, first_http_url,
-        health_timeout_reason, is_main_list_model, key_env_for_adapter, key_fingerprint,
-        merge_and_sort_models, nonactive_probe_verdict, parse_host, probe_kind_for,
-        probe_kind_for_model, proxy_args_for, proxy_fingerprint, redact,
-        reject_openai_custom_anthropic_base, relay_missing_base_url, relay_missing_model,
-        rollback_status_clause, sandbox_home, settings_change_needs_teardown,
-        should_scratch_candidate, should_write_back, skip_scratch_verify,
-        update_profile_connection_inner, update_profile_metadata_inner, upstream_host,
-        ConnectionEdit, SwitchOutcome,
-    };
-    use crate::config;
-
-    /// 每个测试用独立临时 `.csswitch` 目录（进程 id + 线程 id + 随机后缀），互不干扰。
-    fn tmpdir_lib() -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!("csswitch-lib-test-{}", std::process::id()));
-        let d = base.join(format!(
-            "{:?}-{}",
-            std::thread::current().id(),
-            config::new_id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d.join(".csswitch")
-    }
-
-    // ---------- B2: proxy_args_for / assert_format_supported ----------
-    #[test]
-    fn proxy_args_derive_adapter_and_key_env() {
-        use crate::config::Profile;
-        let ds = Profile {
-            template_id: "deepseek".into(),
-            api_format: "anthropic".into(),
-            base_url: "https://api.deepseek.com/anthropic".into(),
-            api_key: "sk-ds".into(),
-            ..Default::default()
-        };
-        let a = proxy_args_for(&ds);
-        assert_eq!(a.adapter, "deepseek");
-        assert_eq!(a.key_env, "DEEPSEEK_API_KEY");
-
-        let glm = Profile {
-            template_id: "glm".into(),
-            api_format: "anthropic".into(),
-            base_url: "https://open.bigmodel.cn/api/anthropic".into(),
-            api_key: "gk".into(),
-            model: "glm-5".into(),
-            ..Default::default()
-        };
-        let b = proxy_args_for(&glm);
-        assert_eq!(b.adapter, "relay");
-        assert_eq!(b.key_env, "CSSWITCH_RELAY_KEY");
-        assert_eq!(b.base_url, "https://open.bigmodel.cn/api/anthropic");
-        assert_eq!(b.model, "glm-5");
-
-        let custom_openai = Profile {
-            template_id: "custom-openai".into(),
-            api_format: "openai_chat".into(),
-            base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
-            api_key: "ok".into(),
-            model: "glm-4.5".into(),
-            ..Default::default()
-        };
-        let c = proxy_args_for(&custom_openai);
-        assert_eq!(c.adapter, "openai-custom");
-        assert_eq!(c.key_env, "CSSWITCH_OPENAI_KEY");
-        assert_eq!(c.base_url, "https://open.bigmodel.cn/api/paas/v4");
-        assert_eq!(c.model, "glm-4.5");
-
-        let custom_responses = Profile {
-            template_id: "custom-openai-responses".into(),
-            api_format: "openai_responses".into(),
-            base_url: "https://api.openai.com/v1".into(),
-            api_key: "ok".into(),
-            model: "gpt-5.2".into(),
-            ..Default::default()
-        };
-        let d = proxy_args_for(&custom_responses);
-        assert_eq!(d.adapter, "openai-responses");
-        assert_eq!(d.key_env, "CSSWITCH_OPENAI_KEY");
-        assert_eq!(d.base_url, "https://api.openai.com/v1");
-        assert_eq!(d.model, "gpt-5.2");
-    }
-
-    #[test]
-    fn unsupported_api_format_is_rejected() {
-        use crate::config::Profile;
-        let p = Profile {
-            template_id: "custom".into(),
-            api_format: "gemini_native".into(),
-            base_url: "https://x/y".into(),
-            api_key: "k".into(),
-            ..Default::default()
-        };
-        assert!(assert_format_supported(&p).is_err());
-        let ok = Profile {
-            api_format: "anthropic".into(),
-            ..p.clone()
-        };
-        assert!(assert_format_supported(&ok).is_ok());
-        let ok2 = Profile {
-            api_format: "openai_chat".into(),
-            ..p
-        };
-        assert!(assert_format_supported(&ok2).is_ok());
-        let ok3 = Profile {
-            api_format: "openai_responses".into(),
-            ..ok2
-        };
-        assert!(assert_format_supported(&ok3).is_ok());
-    }
-
-    #[test]
-    fn custom_openai_rejects_anthropic_base_url() {
-        let err = reject_openai_custom_anthropic_base(
-            "custom-openai",
-            "https://api.moonshot.cn/anthropic",
-        )
-        .unwrap_err();
-        assert!(err.contains("自定义 Anthropic"));
-        assert!(
-            reject_openai_custom_anthropic_base("custom-openai", "https://api.moonshot.cn/v1",)
-                .is_ok()
-        );
-        assert!(reject_openai_custom_anthropic_base(
-            "custom-openai-responses",
-            "https://api.moonshot.cn/anthropic",
-        )
-        .is_err());
-        assert!(
-            reject_openai_custom_anthropic_base("custom", "https://api.moonshot.cn/anthropic",)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn key_env_for_adapter_maps_adapters() {
-        assert_eq!(key_env_for_adapter("deepseek"), "DEEPSEEK_API_KEY");
-        assert_eq!(key_env_for_adapter("qwen"), "DASHSCOPE_API_KEY");
-        assert_eq!(key_env_for_adapter("openai-custom"), "CSSWITCH_OPENAI_KEY");
-        assert_eq!(
-            key_env_for_adapter("openai-responses"),
-            "CSSWITCH_OPENAI_KEY"
-        );
-        assert_eq!(key_env_for_adapter("relay"), "CSSWITCH_RELAY_KEY");
-        assert_eq!(key_env_for_adapter("anything-else"), "CSSWITCH_RELAY_KEY");
-    }
-
-    #[test]
-    fn proxy_fingerprint_includes_protocol_semantics() {
-        use crate::config::Profile;
-        let mut p = Profile {
-            template_id: "kimi".into(),
-            api_format: "anthropic".into(),
-            base_url: "https://same.example/anthropic".into(),
-            api_key: "same-key".into(),
-            model: "same-model".into(),
-            ..Default::default()
-        };
-        let kimi_launch = proxy_args_for(&p);
-        let kimi_fp = proxy_fingerprint(&p, &kimi_launch);
-
-        p.template_id = "custom".into();
-        let custom_launch = proxy_args_for(&p);
-        let custom_fp = proxy_fingerprint(&p, &custom_launch);
-        assert_ne!(
-            kimi_fp, custom_fp,
-            "同 adapter/base/model/key 但模板语义不同，必须重启代理"
-        );
-    }
-
-    // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
-    #[test]
-    fn settings_teardown_when_any_port_changes() {
-        assert!(
-            !settings_change_needs_teardown(18991, 18991, 8990, 8990),
-            "端口未变 → 不拆链路"
-        );
-        assert!(
-            settings_change_needs_teardown(18991, 19000, 8990, 8990),
-            "代理端口变 → 拆（旧代理绑旧端口、沙箱烘旧 URL）"
-        );
-        assert!(
-            settings_change_needs_teardown(18991, 18991, 8990, 9000),
-            "沙箱端口变 → 拆（旧沙箱在旧端口成孤儿）"
-        );
-        assert!(
-            settings_change_needs_teardown(18991, 19000, 8990, 9000),
-            "都变 → 拆"
-        );
-    }
-
-    // ---------- P2-e: 回滚措辞如实（恢复失败不得谎称已回滚） ----------
-    #[test]
-    fn rollback_clause_tells_truth_when_restore_failed() {
-        assert!(
-            rollback_status_clause(true).contains("已回滚"),
-            "恢复成功 → 说已回滚"
-        );
-        let failed = rollback_status_clause(false);
-        assert!(
-            !failed.contains("已回滚到原配置"),
-            "恢复失败不得谎称已回滚到原配置"
-        );
-        assert!(failed.contains("代理当前已停"), "如实说明代理已停");
-    }
-
-    // ---------- P2-d: 非 active「如实标记后保存」裁决（明确拒绝才拦；200=已校验；含糊/无响应=落盘但未校验） ----------
-    #[test]
-    fn nonactive_probe_verdict_maps_outcomes() {
-        use crate::scratch::ProbeOutcome;
-        assert!(
-            nonactive_probe_verdict(&ProbeOutcome::Auth(401))
-                .unwrap_err()
-                .contains("401"),
-            "401 明确鉴权失败 → 拦下不落盘"
-        );
-        assert!(
-            nonactive_probe_verdict(&ProbeOutcome::ModelError(404))
-                .unwrap_err()
-                .contains("404"),
-            "404 模型不被接受 → 拦下不落盘"
-        );
-        assert_eq!(
-            nonactive_probe_verdict(&ProbeOutcome::Ok),
-            Ok(true),
-            "200 → 落盘且【已校验】"
-        );
-        assert_eq!(
-            nonactive_probe_verdict(&ProbeOutcome::Ambiguous(Some(429))),
-            Ok(false),
-            "含糊(429) → best-effort 落盘但【未校验】"
-        );
-        assert_eq!(
-            nonactive_probe_verdict(&ProbeOutcome::NoResponse),
-            Ok(false),
-            "无响应 → best-effort 落盘但【未校验】"
-        );
-    }
-
-    // ---------- B3: 切换事务决策（纯函数，3 分支） ----------
-    #[test]
-    fn transaction_commits_only_when_healthy() {
-        // scratch ok + real ok → 提交
-        assert_eq!(decide_switch(true, true), SwitchOutcome::Commit);
-        // scratch 校验失败 → 不起正式、不提交、旧态不动
-        assert_eq!(decide_switch(false, false), SwitchOutcome::AbortBeforeStart);
-        assert_eq!(decide_switch(false, true), SwitchOutcome::AbortBeforeStart);
-        // scratch ok 但正式起/探活失败 → 杀候选、恢复旧、不提交
-        assert_eq!(decide_switch(true, false), SwitchOutcome::RollbackToOld);
-    }
-
-    // ---------- MP-2 fix [3]: 写回门纯函数（gen 同/异 × secret 同/异 4 组合） ----------
-    #[test]
-    fn should_write_back_requires_both_gen_and_secret() {
-        // gen 同 + secret 同 → 写回（合法启动，未被取代）
-        assert!(should_write_back(5, 5, "sekret", "sekret"));
-        // gen 同 + secret 异 → 不写回（被并发另起用不同 secret 占了槽，冷启动双起窄窗）
-        assert!(!should_write_back(5, 5, "other", "sekret"));
-        // gen 异 + secret 同 → 不写回（被清 key/停/切 bump 取代）
-        assert!(!should_write_back(5, 6, "sekret", "sekret"));
-        // gen 异 + secret 异 → 不写回
-        assert!(!should_write_back(5, 6, "other", "sekret"));
-    }
-
-    // ---------- MP-2 fix [1]: 连接编辑 validate-before-persist 的字段应用逻辑（内存/落盘共用） ----------
-    #[test]
-    fn connection_edit_apply_only_changes_provided_fields() {
-        use crate::config::Profile;
-        let mut p = Profile {
-            base_url: "old-url".into(),
-            api_format: "anthropic".into(),
-            model: "old-model".into(),
-            api_key: "old-key".into(),
-            ..Default::default()
-        };
-        let edit = ConnectionEdit {
-            base_url: Some("new-url".into()),
-            api_format: None, // None = 不改
-            model: Some("new-model".into()),
-            key: Some(String::new()), // 空 key = 不改（留占位不覆盖已存 key）
-        };
-        edit.apply(&mut p);
-        assert_eq!(p.base_url, "new-url");
-        assert_eq!(p.api_format, "anthropic", "None 字段不改");
-        assert_eq!(p.model, "new-model");
-        assert_eq!(p.api_key, "old-key", "空 key 不覆盖已存 key");
-
-        // 非空 key 覆盖；其余 None 不动。
-        let edit2 = ConnectionEdit {
-            key: Some("new-key".into()),
-            ..Default::default()
-        };
-        edit2.apply(&mut p);
-        assert_eq!(p.api_key, "new-key", "非空 key 覆盖");
-        assert_eq!(p.base_url, "new-url", "None 字段不改");
-        assert_eq!(p.model, "new-model", "None 字段不改");
-    }
-
-    // ---------- B4: profile CRUD *_inner ----------
-    #[test]
-    fn create_profile_from_template_prefills() {
-        let d = tmpdir_lib();
-        let id =
-            create_profile_inner(&d, "glm", "我的 GLM", Some("gk"), None, Some("glm-5.2")).unwrap();
-        let cfg = config::load_from(&d).unwrap();
-        let p = cfg.profile_by_id(&id).unwrap();
-        assert_eq!(p.template_id, "glm");
-        assert_eq!(p.name, "我的 GLM");
-        assert_eq!(p.api_format, "anthropic");
-        assert_eq!(p.base_url, "https://open.bigmodel.cn/api/anthropic");
-        assert_eq!(p.api_key, "gk");
-        assert_eq!(cfg.active_id, "", "新建不自动生效");
-    }
-
-    #[test]
-    fn create_relay_without_model_is_rejected() {
-        // 修 #9 P1-a：后端命令层直接创建 relay/自定义端点空 model 也被拦（不变量不可绕过）。
-        let d = tmpdir_lib();
-        let e = create_profile_inner(&d, "glm", "GLM", Some("gk"), None, None);
-        assert!(e.is_err(), "relay 空 model 应拒绝创建");
-        assert!(e.unwrap_err().contains("模型"));
-        // native 不受约束（model 可空）。
-        assert!(create_profile_inner(&d, "deepseek", "DS", Some("gk"), None, None).is_ok());
-    }
-
-    #[test]
-    fn update_metadata_does_not_touch_key() {
-        let d = tmpdir_lib();
-        let id =
-            create_profile_inner(&d, "glm", "GLM", Some("secret9"), None, Some("glm-5.2")).unwrap();
-        update_profile_metadata_inner(&d, &id, "改名", Some("备注")).unwrap();
-        let cfg = config::load_from(&d).unwrap();
-        let p = cfg.profile_by_id(&id).unwrap();
-        assert_eq!(p.name, "改名");
-        assert_eq!(p.notes.as_deref(), Some("备注"));
-        assert_eq!(p.api_key, "secret9", "元数据编辑不动 key");
-    }
-
-    #[test]
-    fn clear_key_empties_key_and_drops_backup() {
-        let d = tmpdir_lib();
-        let id = create_profile_inner(&d, "glm", "GLM", Some("secretTAIL"), None, Some("glm-5.2"))
-            .unwrap();
-        config::write_rolling_backup(&d).ok();
-        clear_profile_key_inner(&d, &id).unwrap();
-        let cfg = config::load_from(&d).unwrap();
-        assert_eq!(cfg.profile_by_id(&id).unwrap().api_key, "");
-        assert!(!d.join("config.json.bak").exists(), "清 key 后净化滚动备份");
-    }
-
-    #[test]
-    fn delete_active_clears_active() {
-        let d = tmpdir_lib();
-        let id = create_profile_inner(&d, "glm", "GLM", Some("k"), None, Some("glm-5.2")).unwrap();
-        config::update(&d, |c| c.active_id = id.clone()).unwrap();
-        delete_profile_inner(&d, &id).unwrap();
-        let cfg = config::load_from(&d).unwrap();
-        assert!(cfg.profile_by_id(&id).is_none());
-        assert_eq!(cfg.active_id, "", "删 active → 置空");
-    }
-
-    #[test]
-    fn update_connection_rejects_unsupported_format() {
-        let d = tmpdir_lib();
-        let id =
-            create_profile_inner(&d, "custom", "C", None, Some("https://x/y"), Some("m")).unwrap();
-        let e = update_profile_connection_inner(
-            &d,
-            &id,
-            Some("https://x/y"),
-            Some("gemini_native"),
-            None,
-            None,
-        );
-        assert!(e.is_err());
-    }
-
-    // ---------- MP-2 Minor [4]: 未命中 id → Err（不静默 Ok） ----------
-    #[test]
-    fn update_metadata_unknown_id_errors() {
-        let d = tmpdir_lib();
-        create_profile_inner(&d, "glm", "GLM", Some("k"), None, Some("glm-5.2")).unwrap();
-        let e = update_profile_metadata_inner(&d, "no-such-id", "改名", None);
-        assert!(e.is_err(), "未命中 id 应报错，而非静默成功");
-        assert!(e.unwrap_err().contains("找不到 profile"));
-    }
-
-    #[test]
-    fn update_connection_unknown_id_errors() {
-        let d = tmpdir_lib();
-        create_profile_inner(&d, "glm", "GLM", Some("k"), None, Some("glm-5.2")).unwrap();
-        let e = update_profile_connection_inner(
-            &d,
-            "no-such-id",
-            Some("https://x/y"),
-            None,
-            None,
-            None,
-        );
-        assert!(e.is_err(), "未命中 id 应报错，而非静默成功");
-        assert!(e.unwrap_err().contains("找不到 profile"));
-    }
-
-    // ---------- B5: build_get_config / build_list_templates ----------
-    #[test]
-    fn get_config_masks_keys_and_lists_profiles() {
-        let d = tmpdir_lib();
-        let id = create_profile_inner(
-            &d,
-            "glm",
-            "GLM",
-            Some("sk-longsecret9999"),
-            None,
-            Some("glm-5.2"),
-        )
-        .unwrap();
-        let v = build_get_config(&d).unwrap();
-        assert_eq!(v["schema_version"], 2);
-        let arr = v["profiles"].as_array().unwrap();
-        let p = arr.iter().find(|p| p["id"] == id).unwrap();
-        assert!(p["key"].as_str().unwrap().ends_with("9999"));
-        assert!(
-            !p["key"].as_str().unwrap().contains("longsecret"),
-            "只回掩码"
-        );
-        assert!(
-            p.get("api_key").is_none() || p["api_key"].is_null(),
-            "全 key 不出后端"
-        );
-    }
-
-    #[test]
-    fn get_config_returns_notes_so_rename_does_not_wipe_them() {
-        // M1 回归：build_get_config 必须回传 notes，否则前端读到空、下次改名把备注静默清掉。
-        let d = tmpdir_lib();
-        let id = create_profile_inner(&d, "glm", "GLM", Some("k"), None, Some("glm-5.2")).unwrap();
-        update_profile_metadata_inner(&d, &id, "GLM", Some("我的备注")).unwrap();
-        let v = build_get_config(&d).unwrap();
-        let p = v["profiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["id"] == id)
-            .unwrap();
-        assert_eq!(p["notes"], "我的备注", "notes 必须随 get_config 回传");
-    }
-
-    #[test]
-    fn list_templates_has_eleven() {
-        let v = build_list_templates();
-        assert_eq!(v.len(), 11);
-        assert!(v.iter().any(|t| t["id"] == "custom"));
-        assert!(v.iter().any(|t| t["id"] == "custom-openai"));
-        assert!(v.iter().any(|t| t["id"] == "custom-openai-responses"));
-        assert!(v.iter().any(|t| t["id"] == "kimi"));
-        assert!(v.iter().any(|t| t["id"] == "minimax"));
-    }
-
-    // ---------- 既有纯逻辑不变量（保留） ----------
-    #[test]
-    fn first_http_url_takes_only_first_valid_url() {
-        let multi = "http://127.0.0.1:8990/setup?nonce=abc123\n\
-                     This is a single-use link, expires in 60 seconds.";
-        assert_eq!(
-            first_http_url(multi).as_deref(),
-            Some("http://127.0.0.1:8990/setup?nonce=abc123"),
-        );
-        let inline = "https://x.example/y?z=1  (single-use)";
-        assert_eq!(
-            first_http_url(inline).as_deref(),
-            Some("https://x.example/y?z=1")
-        );
-        let lead = "Open this link in your browser:\nhttp://127.0.0.1:8990/a";
-        assert_eq!(
-            first_http_url(lead).as_deref(),
-            Some("http://127.0.0.1:8990/a")
-        );
-        assert_eq!(first_http_url("no url here\nnor here"), None);
-        assert_eq!(
-            first_http_url("http://127.0.0.1:8990").as_deref(),
-            Some("http://127.0.0.1:8990")
-        );
-    }
-
-    #[test]
-    fn parse_host_extracts_host_from_relay_base_url() {
-        assert_eq!(
-            parse_host("https://byteswarm.ai/claude").as_deref(),
-            Some("byteswarm.ai")
-        );
-        assert_eq!(
-            parse_host("http://127.0.0.1:8080/v1").as_deref(),
-            Some("127.0.0.1")
-        );
-        assert_eq!(
-            parse_host("https://relay.example.com:8443").as_deref(),
-            Some("relay.example.com")
-        );
-        assert_eq!(parse_host("byteswarm.ai/claude"), None);
-        assert_eq!(parse_host(""), None);
-    }
-
-    #[test]
-    fn upstream_host_by_adapter() {
-        assert_eq!(upstream_host("deepseek", ""), "api.deepseek.com");
-        assert_eq!(upstream_host("qwen", ""), "dashscope.aliyuncs.com");
-        assert_eq!(
-            upstream_host("openai-custom", "https://open.bigmodel.cn/api/paas/v4"),
-            "open.bigmodel.cn"
-        );
-        assert_eq!(
-            upstream_host("relay", "https://open.bigmodel.cn/api/anthropic"),
-            "open.bigmodel.cn"
-        );
-        assert_eq!(upstream_host("", ""), "", "无生效配置 → 空（灯显黄）");
-    }
-
-    #[test]
-    fn main_list_model_matches_family_plus_digit() {
-        assert!(is_main_list_model("claude-opus-4-8"));
-        assert!(is_main_list_model("claude-sonnet-5"));
-        assert!(is_main_list_model("claude-haiku-4-5-20251001"));
-        assert!(!is_main_list_model("claude-3-5-sonnet-20241022"));
-        assert!(!is_main_list_model("claude-fable-5"));
-        assert!(!is_main_list_model("gpt-4o"));
-    }
+    use super::redact;
 
     #[test]
     fn redact_scrubs_secret_and_is_noop_when_empty() {
@@ -2523,139 +1460,5 @@ mod tests {
         );
         assert_eq!(redact("原样返回", ""), "原样返回");
         assert!(!redact("leak abcd1234 leak abcd1234", "abcd1234").contains("abcd1234"));
-    }
-
-    #[test]
-    fn key_fingerprint_stable_and_distinct() {
-        assert_eq!(key_fingerprint("sk-aaaa"), key_fingerprint("sk-aaaa"));
-        assert_ne!(key_fingerprint("sk-aaaa"), key_fingerprint("sk-bbbb"));
-        assert_ne!(key_fingerprint(""), key_fingerprint("x"));
-    }
-
-    #[test]
-    fn sandbox_home_is_writable_under_config_dir() {
-        let h = sandbox_home();
-        assert!(h.ends_with("sandbox/home"), "应以 sandbox/home 结尾：{h:?}");
-        assert!(
-            h.to_string_lossy().contains(".csswitch"),
-            "应在 .csswitch 下：{h:?}"
-        );
-    }
-
-    #[test]
-    fn merge_and_sort_prefers_tools_then_dedupes_builtin() {
-        let live = vec![
-            ("m-notools".to_string(), Some(false)),
-            ("m-tools".to_string(), Some(true)),
-            ("m-unknown".to_string(), None),
-        ];
-        let out = merge_and_sort_models(live, &["m-tools", "m-builtin-only"]);
-        let ids: Vec<String> = out
-            .iter()
-            .map(|v| v.get("id").unwrap().as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(ids[0], "m-tools");
-        assert!(ids.contains(&"m-builtin-only".to_string()));
-        assert_eq!(ids.iter().filter(|i| *i == "m-tools").count(), 1, "去重");
-        assert_eq!(ids.last().unwrap(), "m-notools");
-    }
-
-    #[test]
-    fn probe_kind_picks_message_when_model_set() {
-        assert!(matches!(
-            probe_kind_for_model("mimo-v2.5-pro"),
-            crate::scratch::ProbeKind::Message
-        ));
-        assert!(matches!(
-            probe_kind_for_model(""),
-            crate::scratch::ProbeKind::Models
-        ));
-    }
-
-    // ---------- 修真机 P1：native adapter 上游校验（GPT 验收报告 RM-06） ----------
-
-    #[test]
-    fn native_probe_uses_message_since_native_models_is_static() {
-        // native 的 /v1/models 是静态列表、探不出坏 key，故一律用 Message（打上游 /v1/messages）。
-        assert!(matches!(
-            probe_kind_for("deepseek", ""),
-            crate::scratch::ProbeKind::Message
-        ));
-        assert!(matches!(
-            probe_kind_for("qwen", ""),
-            crate::scratch::ProbeKind::Message
-        ));
-        // relay：空 model 用 Models（/v1/models 回源即验鉴权）；选了 model 用 Message 验该模型。
-        assert!(matches!(
-            probe_kind_for("relay", ""),
-            crate::scratch::ProbeKind::Models
-        ));
-        assert!(matches!(
-            probe_kind_for("relay", "m1"),
-            crate::scratch::ProbeKind::Message
-        ));
-    }
-
-    #[test]
-    fn native_adapter_no_longer_bypasses_upstream_verify() {
-        // 只有显式 skip_verify 才跳过；native 不再是豁免条件（旧行为的核心漏洞）。
-        assert!(
-            !skip_scratch_verify(true, false),
-            "native 不得再豁免上游校验"
-        );
-        assert!(!skip_scratch_verify(false, false));
-        assert!(skip_scratch_verify(false, true), "显式 skip_verify 才跳");
-        assert!(skip_scratch_verify(true, true));
-    }
-
-    #[test]
-    fn native_candidate_is_upstream_validated_even_without_base_url() {
-        // 非 active 编辑：native 即便 base_url 空也要验（走硬编码官方端点）。
-        assert!(should_scratch_candidate("deepseek", "sk-x", ""));
-        assert!(should_scratch_candidate("qwen", "sk-x", ""));
-        // relay 仍需 base_url；空 key 一律免验。
-        assert!(!should_scratch_candidate("relay", "sk-x", ""));
-        assert!(should_scratch_candidate("relay", "sk-x", "https://r"));
-        assert!(!should_scratch_candidate("deepseek", "", ""));
-    }
-
-    #[test]
-    fn relay_empty_base_url_is_rejected_before_save() {
-        // 修 P2：relay/自定义端点空（或纯空白）base_url → 拦下，不落盘。
-        assert!(relay_missing_base_url("relay", ""));
-        assert!(relay_missing_base_url("glm", "   "));
-        assert!(relay_missing_base_url("custom", ""));
-        // 带地址的 relay 放行。
-        assert!(!relay_missing_base_url("relay", "https://r"));
-        // native 走硬编码端点，空 base_url 无妨 → 不拦。
-        assert!(!relay_missing_base_url("deepseek", ""));
-        assert!(!relay_missing_base_url("qwen", ""));
-    }
-
-    #[test]
-    fn relay_empty_model_is_rejected() {
-        // 修 #9 P1-a：relay/自定义端点空（或纯空白）model → 拦下（无 model 则无 force → 退回 passthrough）。
-        assert!(relay_missing_model("relay", ""));
-        assert!(relay_missing_model("glm", "   "));
-        assert!(relay_missing_model("custom", ""));
-        assert!(!relay_missing_model("relay", "glm-5.2"));
-        // native 走内置映射/硬编码端点，model 可空 → 不拦。
-        assert!(!relay_missing_model("deepseek", ""));
-        assert!(!relay_missing_model("qwen", ""));
-    }
-
-    #[test]
-    fn health_timeout_reason_flags_port_conflict_and_never_blames_key() {
-        // 端口占用：明确报占用、带端口号，绝不提「key 无效」。
-        let occ = health_timeout_reason(18991, "OSError: [Errno 48] Address already in use");
-        assert!(occ.contains("18991"));
-        assert!(occ.contains("占用"), "应明确报端口占用：{occ}");
-        assert!(!occ.contains("key"), "端口占用不该扯上 key：{occ}");
-        // 其它探活失败（依赖缺失等）：本地探活与 key 有效性无关，不得说「key 无效」。
-        let generic = health_timeout_reason(18991, "ModuleNotFoundError: No module named 'x'");
-        assert!(
-            !generic.contains("key 无效"),
-            "本地探活超时与 key 有效性无关：{generic}"
-        );
     }
 }
