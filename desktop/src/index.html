@@ -21,6 +21,133 @@
         </div>
       </div>
 
+      <!-- 本地/远程模式切换（跨平台功能） -->
+      <div class="sec targets">
+        <div class="seg" id="targetSeg">
+          <button type="button" class="seg-btn active" data-target="local">本地模式</button>
+          <button type="button" class="seg-btn" data-target="remote">远程 / WSL</button>
+        </div>
+      </div>
+
+      <!-- 远程 / WSL 管理面板（仅远程 / WSL 模式显示） -->
+      <div class="sec remote-only" style="display:none">
+        <div class="hint">连接远程 Linux 服务器，或选择本机 WSL 发行版。WSL 目标无需服务器地址，但仍需要填写 Linux 用户。</div>
+        <div class="row">
+          <select id="profileSelect" style="flex:1">
+            <option value="">-- 选择目标 --</option>
+          </select>
+          <button class="btn small" id="manageProfilesBtn" title="管理远程 / WSL 目标">管理</button>
+        </div>
+        <div class="remote-health" id="remoteHealth" style="margin-top:6px">
+          <span id="remoteHealthDot" class="lt a"></span>
+          <span id="remoteHealthText" style="font-size:11px;color:var(--sub)">未连接</span>
+        </div>
+      </div>
+
+      <!-- Profile 管理弹窗（隐藏） -->
+      <div class="modal-overlay" id="profileModal" style="display:none">
+        <div class="modal-box">
+          <h3 style="margin:0 0 12px">远程 / WSL 管理</h3>
+          <div id="remoteProfileList" style="max-height:200px;overflow:auto;margin-bottom:10px"></div>
+          <div class="row" style="gap:6px">
+            <button class="btn small" id="addProfileBtn">+ 添加</button>
+            <button class="btn small" id="closeProfileModal" style="margin-left:auto">关闭</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Profile 编辑弹窗（隐藏） -->
+      <div class="modal-overlay" id="profileEditModal" style="display:none">
+        <div class="modal-box">
+          <h3 style="margin:0 0 12px" id="profileEditTitle">添加目标</h3>
+          <div class="form-fields">
+            <label>目标类型</label>
+            <div class="seg target-kind-seg" id="editProfileKindSeg">
+              <button type="button" class="seg-btn active" data-kind="ssh">SSH 服务器</button>
+              <button type="button" class="seg-btn" data-kind="wsl">本机 WSL</button>
+            </div>
+            <div class="hint" id="editProfileKindHint">SSH 连接远程 Linux 服务器；WSL 连接本机 Windows 下的 Linux 发行版。</div>
+
+            <div id="wslDistroGroup" style="display:none">
+              <label>WSL 发行版 <span style="color:var(--red)">*</span></label>
+              <div class="row">
+                <select id="editProfileDistribution" style="flex:1">
+                  <option value="">-- 选择发行版 --</option>
+                </select>
+                <button class="btn small" id="scanWslBtn" type="button">扫描</button>
+              </div>
+              <div class="hint" id="wslDistroHint">选择 `wsl.exe --list --verbose` 中的发行版。</div>
+            </div>
+
+            <label id="editProfileNameLabel">名称</label>
+            <input type="text" id="editProfileName" placeholder="我的服务器" />
+
+            <div id="sshHostGroup">
+              <label>服务器地址 <span style="color:var(--red)">*</span></label>
+              <input type="text" id="editProfileHost" placeholder="192.168.1.100 或 server.com" />
+            </div>
+
+            <div id="sshPortGroup">
+              <label>SSH 端口</label>
+              <input type="number" id="editProfilePort" value="22" min="1" max="65535" />
+            </div>
+
+            <label>用户名 <span style="color:var(--red)">*</span></label>
+            <input type="text" id="editProfileUsername" placeholder="root" />
+
+            <label>登录方式</label>
+            <select id="editProfileAuth">
+              <option value="recommended">推荐登录</option>
+              <option value="password">用密码</option>
+              <option value="key_file">密钥文件</option>
+              <option value="saved_keys">电脑里的密钥</option>
+            </select>
+
+            <div id="passwordGroup" style="display:none">
+              <label>服务器密码 <span style="color:var(--red)">*</span></label>
+              <input type="password" id="editProfilePassword" placeholder="请输入服务器密码" autocomplete="off" />
+              <label class="check-row">
+                <input type="checkbox" id="editProfileRememberPassword" checked />
+                <span>记住这台服务器密码</span>
+              </label>
+            </div>
+
+            <div id="keyFileGroup" style="display:none">
+              <label>密钥路径 <span style="color:var(--red)">*</span></label>
+              <input type="text" id="editProfileKeyPath" placeholder="~/.ssh/id_ed25519" />
+            </div>
+
+            <label>Helper 路径</label>
+            <input type="text" id="editProfileHelperPath" value="~/.csswitch/bin/csswitch-helper" />
+          </div>
+          <div class="row" style="gap:6px;margin-top:12px">
+            <button class="btn small" id="testProfileBtn">测试连接</button>
+            <button class="btn hero" id="saveProfileBtn" style="height:32px;font-size:12px;flex:1">保存</button>
+            <button class="btn small" id="cancelProfileEditBtn">取消</button>
+          </div>
+          <div id="profileEditMsg" style="font-size:11px;margin-top:8px"></div>
+        </div>
+      </div>
+
+      <div class="modal-overlay" id="authPromptModal" style="display:none">
+        <div class="modal-box auth-prompt-box">
+          <h3 style="margin:0 0 12px" id="authPromptTitle">请输入登录信息</h3>
+          <div class="form-fields">
+            <label id="authPromptLabel">登录信息</label>
+            <input type="password" id="authPromptInput" autocomplete="off" />
+          </div>
+          <label class="check-row" id="authPromptRememberRow">
+            <input type="checkbox" id="authPromptRemember" />
+            <span>保存到系统</span>
+          </label>
+          <div class="row" style="gap:6px;margin-top:12px">
+            <button class="btn hero" id="authPromptSubmitBtn" style="height:32px;font-size:12px;flex:1">继续</button>
+            <button class="btn small" id="authPromptCancelBtn">取消</button>
+          </div>
+          <div id="authPromptMsg" style="font-size:11px;margin-top:8px"></div>
+        </div>
+      </div>
+
       <div class="sec official-only">
         <div class="hint">官方模式：用你自己真实的 Claude Science 与订阅，本工具不插手你的官方登录。</div>
       </div>

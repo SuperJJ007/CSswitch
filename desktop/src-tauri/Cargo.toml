@@ -1,31 +1,50 @@
 [package]
 name = "desktop"
 version = "0.3.6"
-description = "CSSwitch 菜单栏 app（进程管家 + 配置面板）"
+description = "CSSwitch 菜单栏 app（进程管家 + 配置面板 + 远程服务器管理）"
 authors = ["CSSwitch"]
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+default-run = "csswitch"
 
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "csswitch"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "csswitch-helper"
+path = "src/bin/csswitch-helper.rs"
+
+[[bin]]
+name = "csswitch-ssh-askpass"
+path = "src/bin/csswitch-ssh-askpass.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+desktop = ["tauri", "tauri-build", "tauri-plugin-opener"]
+
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
+tauri = { version = "2", features = [], optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rand = "0.8"
+dirs = "5"
+# P1-5 修复：文件锁，防止并发写入 remote-hosts.json 时数据丢失
+fs2 = "0.4"
+# P1-8 修复：health check 缓存，减少频繁 SSH 连接
+lazy_static = "1.4"
 # 虚拟 OAuth 伪造器（Rust 原生，去 node 依赖 —— 见 src/oauth_forge.rs）。
-# 纯 RustCrypto，全部编进二进制，不引外部运行时。与 .mjs 的 v2 GCM 格式字节兼容
-# （由 oauth_forge.rs 内 tests 的 node↔rust 双向对拍单测保证）。
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+keyring = "4.1.3"

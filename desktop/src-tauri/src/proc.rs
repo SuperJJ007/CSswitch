@@ -1,11 +1,18 @@
-//! 进程管家用到的纯 std 辅助：探活、依赖定位、一次性 secret 生成、上游可达性。
-//! 无第三方依赖，便于单测；有状态的子进程编排放在 lib.rs（持 Child 句柄）。
+//! 进程管家用到的辅助：探活、依赖定位、一次性 secret 生成、上游可达性。
+//! 跨平台适配：`/dev/urandom` 改用 `rand::OsRng`，文件可执行判断用 `fs_ext::is_executable`。
+//! 有状态的子进程编排放在 lib.rs（持 Child 句柄）。
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+// Command/Stdio 仅在 Unix 的 which_via_login_shell() 中使用，
+// Windows 上该函数被 #[cfg(unix)] 跳过，但保留 import 避免 Linux 编译报错。
+#[allow(unused_imports)]
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+use rand::rngs::OsRng;
+use rand::RngCore;
 
 /// 对本地回环代理做 HTTP 探活：`GET /<secret>/health`，响应状态行含 200 即视为健康。
 /// 代理带 path-secret 鉴权时必须带上 secret，否则会拿到 403。
@@ -182,8 +189,12 @@ pub fn which(name: &str) -> Option<PathBuf> {
             return Some(hit);
         }
     }
-    // 2) GUI/.app 最小 PATH 兜底：扫常见安装目录。
-    find_in_dirs(name, common_bin_dirs())
+    // 2) GUI/.app 最小 PATH 兜底：扫常见安装目录（仅 Unix）。
+    #[cfg(unix)]
+    if let Some(hit) = find_in_dirs(name, common_bin_dirs()) {
+        return Some(hit);
+    }
+    None
 }
 
 /// 在给定目录序列里找可执行文件（第一个命中即返回）。
@@ -197,9 +208,11 @@ fn find_in_dirs(name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<P
     None
 }
 
-/// macOS 上 node/python 等的常见安装目录（不含系统最小 PATH 已覆盖的 `/usr/bin` 等）：
+/// Unix 上 node/python 等的常见安装目录（不含系统最小 PATH 已覆盖的 `/usr/bin` 等）：
 /// Homebrew(Apple Silicon / Intel)、MacPorts、volta、asdf、`~/.local/bin`，
 /// 以及 nvm 各版本 `~/.nvm/versions/node/<ver>/bin`（目录枚举）。
+/// Windows 上不需要此项（PATH 已包含常见安装位置或被远程模式替代）。
+#[cfg(unix)]
 fn common_bin_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![
         PathBuf::from("/opt/homebrew/bin"), // Homebrew（Apple Silicon）
@@ -222,11 +235,13 @@ fn common_bin_dirs() -> Vec<PathBuf> {
 }
 
 /// [`which`] 找不到时的最后兜底：用登录 shell 解析用户的**真实 PATH**。
+/// 仅 Unix 平台可用（依赖 zsh）。Windows 上由远程模式替代本地查找。
 ///
 /// GUI/.app 从访达启动只有最小 PATH，且用户可能用 fnm / nvm / asdf 等在 `.zshrc`
 /// 里配置的版本管理器（[`common_bin_dirs`] 的静态枚举覆盖不到）。这里跑
 /// `zsh -lic 'command -v <name>'`（登录 + 交互 shell，会 source 用户 rc）拿其真实
 /// 解析路径。用独立线程 + `recv_timeout` 兜底，病态 rc 不会卡死调用方。
+#[cfg(unix)]
 pub fn which_via_login_shell(name: &str) -> Option<PathBuf> {
     // name 出自本代码（"node"/"python3"），仍做白名单，杜绝拼进 shell 的注入面。
     if name.is_empty()
@@ -278,27 +293,32 @@ pub fn which_via_login_shell(name: &str) -> Option<PathBuf> {
 }
 
 /// 定位可执行文件（含登录 shell 兜底）：[`which`]（PATH + 常见安装目录）未命中时，
-/// 再用 [`which_via_login_shell`] 解析用户真实 PATH。node / python3 都走这个，覆盖
-/// 「GUI 最小 PATH + 版本管理器」这类多位客户反馈的「已装 node 却报缺依赖」（修 #2）。
+/// 在 Unix 上再用 [`which_via_login_shell`] 解析用户真实 PATH。
+/// Windows 上仅走 `which()`（PATH 搜索），因为无 zsh 登录 shell 且远程模式为主要场景。
+/// node / python3 都走这个，覆盖「GUI 最小 PATH + 版本管理器」问题（修 #2）。
 pub fn find_exe(name: &str) -> Option<PathBuf> {
-    which(name).or_else(|| which_via_login_shell(name))
+    let hit = which(name);
+    #[cfg(unix)]
+    let hit = hit.or_else(|| which_via_login_shell(name));
+    hit
 }
 
+/// 判断路径是否为可执行文件。
+/// 跨平台：Unix 检查执行权限位 `0o111`，Windows 仅检查是否为文件（扩展名判断由调用方负责）。
 fn is_exec(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(p) {
-        Ok(md) => md.is_file() && (md.permissions().mode() & 0o111 != 0),
+        Ok(md) => crate::fs_ext::is_executable(&md),
         Err(_) => false,
     }
 }
 
-/// 生成一次性 path-secret：从 /dev/urandom 取 16 字节，hex 编码为 32 字符。
-/// 失败关闭：urandom 不可用时返回 Err，绝不退回可猜的弱 secret（宁可起代理失败）。
+/// 生成一次性 path-secret。
+/// 使用操作系统加密级随机源（Unix: `/dev/urandom`；Windows: `BCryptGenRandom`）取 16 字节，
+/// hex 编码为 32 字符。失败关闭，绝不退回可猜的弱 secret（宁可起代理失败）。
+/// 跨平台：用 `rand::OsRng` 替代直接读 `/dev/urandom`，Windows 下对应 `BCryptGenRandom`。
 pub fn gen_secret() -> std::io::Result<String> {
-    use std::fs::File;
     let mut b = [0u8; 16];
-    let mut f = File::open("/dev/urandom")?;
-    f.read_exact(&mut b)?;
+    OsRng.fill_bytes(&mut b);
     Ok(hex(&b))
 }
 
@@ -322,12 +342,15 @@ mod tests {
         assert!(!http_health(59999, None, 300));
     }
 
+    /// PATH 中找 sh（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn get_body_none_when_nothing_listening() {
         // 没人监听 → 连不上 → None（与 http_health 一致的失败关闭语义）。
         assert!(http_get_body(59998, Some("secret"), "/v1/models", 300).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn which_finds_sh() {
         let sh = which("sh");
@@ -340,6 +363,8 @@ mod tests {
         assert!(which("definitely-not-a-real-binary-xyzzy").is_none());
     }
 
+    /// 在常见目录找 sh（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn find_in_dirs_locates_exec() {
         // /bin/sh 几乎肯定存在且可执行。
@@ -353,6 +378,8 @@ mod tests {
         assert!(find_in_dirs("definitely-not-xyzzy", vec![PathBuf::from("/bin")]).is_none());
     }
 
+    /// 登录 shell 解析可执行文件（仅 Unix，依赖 zsh）。
+    #[cfg(unix)]
     #[test]
     fn login_shell_resolves_sh_when_zsh_present() {
         // 环境无 zsh 则跳过（CI 容器可能没有）。
@@ -365,6 +392,8 @@ mod tests {
         assert!(p.is_absolute() && is_exec(&p));
     }
 
+    /// 登录 shell 拒绝恶意名称（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn login_shell_rejects_bad_names_without_spawning() {
         // 白名单：带 shell 元字符的名字直接拒（防注入），空名亦拒。
@@ -373,11 +402,15 @@ mod tests {
         assert!(which_via_login_shell("").is_none());
     }
 
+    /// find_exe 应能找到 sh（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn find_exe_finds_sh() {
         assert!(find_exe("sh").is_some());
     }
 
+    /// 常见 bin 目录覆盖 Homebrew 和版本管理器（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn common_bin_dirs_covers_homebrew_and_home_managers() {
         let dirs = common_bin_dirs();

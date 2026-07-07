@@ -1,0 +1,344 @@
+//! 远程服务器 Profile 的本地持久化存储。
+//!
+//! Profile 文件位置：`~/.csswitch/remote-hosts.json`
+//!
+//! 格式：JSON 数组 `[RemoteHostProfile]`。
+//! 支持 CRUD（Create/Read/Update/Delete）操作 + 校验。
+
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use super::types::{RemoteAuthMethod, RemoteHostProfile, RemoteTargetKind};
+
+lazy_static::lazy_static! {
+    static ref PROFILE_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+/// 返回远程 Profile 文件的完整路径：`~/.csswitch/remote-hosts.json`。
+/// 跨平台：使用 `dirs::home_dir()` 获取用户主目录。
+pub fn profiles_path() -> PathBuf {
+    crate::config::default_dir().join("remote-hosts.json")
+}
+
+// ============================================================================
+// CRUD 操作
+// ============================================================================
+
+/// 从 `remote-hosts.json` 读取所有远程 Profile。
+/// 文件不存在时返回空 Vec（首次使用）。
+pub fn load_profiles() -> Result<Vec<RemoteHostProfile>, String> {
+    let path = profiles_path();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("无法读取远程服务器配置 {}：{e}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let profiles: Vec<RemoteHostProfile> = serde_json::from_str(&raw)
+        .map_err(|e| format!("远程服务器配置格式错误 {}：{e}", path.display()))?;
+    for profile in &profiles {
+        validate_profile(profile)?;
+    }
+    Ok(profiles)
+}
+
+/// 将 Profile 列表写入 `remote-hosts.json`（安全写入：symlink 防护 + 原子 rename）。
+/// 父目录不存在时自动创建。
+/// 审核 P1-5 修复：增加 symlink 防护，对齐 `config.rs` 的安全标准。
+/// P0-3 修复：保存后设置文件权限为 0600，防止其他用户读取 SSH 配置。
+/// P1-5 修复：使用文件锁防止并发写入时数据丢失。
+pub fn save_profiles(profiles: &[RemoteHostProfile]) -> Result<(), String> {
+    for profile in profiles {
+        validate_profile(profile)?;
+    }
+    let path = profiles_path();
+    // 拒绝符号链接目标（防止写入重定向到非预期文件）。
+    crate::config::assert_not_symlink(&path).map_err(|e| format!("远程配置路径安全拒绝：{e}"))?;
+    if let Some(parent) = path.parent() {
+        crate::config::assert_not_symlink(parent)
+            .map_err(|e| format!("远程配置父目录安全拒绝：{e}"))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("无法创建远程配置目录 {}：{e}", parent.display()))?;
+    }
+
+    // P1-5 修复：使用文件锁防止并发写入
+    // 锁文件放在与目标文件相同目录，使用 .lock 后缀
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("无法创建锁文件 {}：{e}", lock_path.display()))?;
+
+    // 尝试获取排他锁，超时 5 秒
+    let lock_acquired = {
+        use fs2::FileExt;
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+
+        loop {
+            match lock_file.try_lock_exclusive() {
+                Ok(_) => break true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() >= timeout {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(format!("文件锁操作失败：{e}"));
+                }
+            }
+        }
+    };
+
+    if !lock_acquired {
+        return Err("获取文件锁超时（5秒）。可能有其他操作正在保存配置，请稍后重试。".to_string());
+    }
+
+    // 在锁保护下执行写入操作
+    let result = (|| {
+        let json =
+            serde_json::to_vec_pretty(profiles).map_err(|e| format!("序列化远程配置失败：{e}"))?;
+        // 原子写入：pid+thread 随机化临时文件名（避免并发冲突）
+        let tmp = path.with_file_name(format!(
+            ".remote-hosts.json.tmp.{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&tmp, &json).map_err(|e| format!("写入远程配置临时文件失败：{e}"))?;
+
+        // P0-3 修复：在 rename 前先设置临时文件权限为 0600
+        // 这样 rename 后目标文件继承正确的权限
+        crate::fs_ext::set_file_permissions(&tmp, 0o600)
+            .map_err(|e| format!("设置远程配置文件权限失败：{e}"))?;
+
+        fs::rename(&tmp, &path).map_err(|e| format!("替换远程配置文件失败：{e}"))?;
+
+        // 双重保险：rename 后再次确认权限（某些文件系统可能不保留权限）
+        crate::fs_ext::set_file_permissions(&path, 0o600)
+            .map_err(|e| format!("确认远程配置文件权限失败：{e}"))?;
+
+        Ok(())
+    })();
+
+    // 释放锁（文件关闭时自动释放，这里显式 unlock 以便错误处理）
+    drop(lock_file); // 显式关闭文件释放锁
+
+    result
+}
+
+/// 插入或更新一个 Profile（按 `id` 匹配）。
+/// 不存在则插入到列表头部（最近使用的排前面）。
+pub fn upsert_profile(profile: RemoteHostProfile) -> Result<RemoteHostProfile, String> {
+    validate_profile(&profile)?;
+    let _guard = PROFILE_STORE_LOCK
+        .lock()
+        .map_err(|_| "远程配置锁异常".to_string())?;
+    let mut profiles = load_profiles()?;
+    if let Some(existing) = profiles.iter_mut().find(|p| p.id == profile.id) {
+        *existing = profile.clone();
+    } else {
+        profiles.insert(0, profile.clone());
+    }
+    save_profiles(&profiles)?;
+    Ok(profile)
+}
+
+/// 删除指定 `id` 的 Profile。返回 true 表示成功删除，false 表示未找到。
+pub fn delete_profile(id: &str) -> Result<bool, String> {
+    let _guard = PROFILE_STORE_LOCK
+        .lock()
+        .map_err(|_| "远程配置锁异常".to_string())?;
+    let mut profiles = load_profiles()?;
+    let before = profiles.len();
+    profiles.retain(|p| p.id != id);
+    if profiles.len() == before {
+        return Ok(false);
+    }
+    save_profiles(&profiles)?;
+    Ok(true)
+}
+
+// ============================================================================
+// 校验
+// ============================================================================
+
+/// 校验 Profile 的各字段是否合法。
+/// - host：非空
+/// - port：1-65535
+/// - username：非空
+/// - helper_path：非空且格式为绝对路径（以 `/` 或 `~` 开头）
+/// - KeyFile 路径：非空（如果 auth_method 为 KeyFile）
+pub fn validate_profile(profile: &RemoteHostProfile) -> Result<(), String> {
+    if profile.id.trim().is_empty() {
+        return Err("远程服务器 Profile ID 不得为空".into());
+    }
+    match profile.kind {
+        RemoteTargetKind::Ssh => {
+            if profile.host.trim().is_empty() {
+                return Err("远程服务器地址不得为空".into());
+            }
+            if profile.port == 0 {
+                return Err("远程 SSH 端口不得为 0".into());
+            }
+        }
+        RemoteTargetKind::Wsl => {
+            if profile
+                .distribution
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err("WSL 发行版不得为空".into());
+            }
+        }
+    }
+    if profile.username.trim().is_empty() {
+        return Err("远程目标用户名不得为空".into());
+    }
+    if profile.helper_path.trim().is_empty() {
+        return Err("Helper 路径不得为空".into());
+    }
+    // 校验 helper_path 格式：应该是绝对路径或以 ~ 开头
+    let hp = profile.helper_path.trim();
+    if !hp.starts_with('/') && !hp.starts_with('~') {
+        return Err(format!("Helper 路径应为绝对路径或以 ~ 开头：{hp}"));
+    }
+    if let RemoteAuthMethod::KeyFile { path, .. } = &profile.auth_method {
+        if path.trim().is_empty() {
+            return Err("选择私钥文件认证时，密钥路径不得为空".into());
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::super::types::RemoteSshAdvancedOptions;
+    use super::*;
+
+    fn sample_profile(id: &str) -> RemoteHostProfile {
+        RemoteHostProfile {
+            id: id.to_string(),
+            name: "测试服务器".to_string(),
+            kind: super::super::types::RemoteTargetKind::Ssh,
+            host: "192.168.1.100".to_string(),
+            port: 22,
+            distribution: None,
+            username: "testuser".to_string(),
+            auth_method: RemoteAuthMethod::SshAgent,
+            helper_path: "~/.csswitch/bin/csswitch-helper".to_string(),
+            last_connected: None,
+            ssh_options: RemoteSshAdvancedOptions::default(),
+            transient_password: None,
+        }
+    }
+
+    fn tmp_path() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("csswitch-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d.join("remote-hosts.json")
+    }
+
+    #[test]
+    fn test_crud_roundtrip() {
+        let p = tmp_path();
+        // 初始为空
+        // (实际调用 load_profiles 使用的是 profiles_path()，我们不 override，改为测试 core logic)
+        let profile = sample_profile("test-01");
+        validate_profile(&profile).unwrap();
+        // core logic: save, load, upsert, delete
+        let single = vec![profile.clone()];
+        let json = serde_json::to_vec_pretty(&single).unwrap();
+        fs::write(&p, &json).unwrap();
+        let loaded: Vec<RemoteHostProfile> =
+            serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "test-01");
+
+        // Delete
+        let loaded: Vec<RemoteHostProfile> =
+            serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        let remaining: Vec<_> = loaded.into_iter().filter(|pr| pr.id != "test-01").collect();
+        let json = serde_json::to_vec_pretty(&remaining).unwrap();
+        fs::write(&p, &json).unwrap();
+        let loaded: Vec<RemoteHostProfile> =
+            serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        assert_eq!(loaded.len(), 0);
+
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_validation_accepts_wsl_without_host_or_port() {
+        let mut p = sample_profile("wsl-1");
+        p.kind = RemoteTargetKind::Wsl;
+        p.name = "Ubuntu".to_string();
+        p.host = String::new();
+        p.port = 0;
+        p.distribution = Some("Ubuntu".to_string());
+        p.username = "zhawei".to_string();
+        validate_profile(&p).unwrap();
+    }
+
+    #[test]
+    fn test_validation_rejects_wsl_without_distribution() {
+        let mut p = sample_profile("wsl-2");
+        p.kind = RemoteTargetKind::Wsl;
+        p.host = String::new();
+        p.port = 0;
+        p.distribution = None;
+        assert!(validate_profile(&p).is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_empty_host() {
+        let mut p = sample_profile("t1");
+        p.host = "".to_string();
+        assert!(validate_profile(&p).is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_empty_username() {
+        let mut p = sample_profile("t2");
+        p.username = "".to_string();
+        assert!(validate_profile(&p).is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_port() {
+        let mut p = sample_profile("t3");
+        p.port = 0;
+        assert!(validate_profile(&p).is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_relative_helper_path() {
+        let mut p = sample_profile("t4");
+        p.helper_path = "csswitch-helper".to_string();
+        assert!(validate_profile(&p).is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_empty_keyfile_path() {
+        let mut p = sample_profile("t5");
+        p.auth_method = RemoteAuthMethod::KeyFile {
+            path: "".to_string(),
+            save_key_password: true,
+            allow_password_fallback: true,
+            allow_verification_code: true,
+            remember_connection: true,
+        };
+        assert!(validate_profile(&p).is_err());
+    }
+}

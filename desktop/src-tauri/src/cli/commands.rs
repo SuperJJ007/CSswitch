@@ -1,0 +1,1302 @@
+//! Helper CLI 的命令实现。
+//!
+//! 每个命令返回 `CliEnvelope`，由 `mod.rs` 中的 `dispatch()` 函数调用。
+//! 管理远程服务器上的 `csswitch_proxy.py` 代理进程、`~/.csswitch/config.json` 配置、
+//! Claude Science 沙箱和日志文件。
+
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use serde_json::{json, Value};
+
+use super::types::CliEnvelope;
+
+const BUNDLED_PROXY: &str = include_str!(concat!(
+    env!("CSSWITCH_BUNDLED_PROXY_DIR"),
+    "/csswitch_proxy.py"
+));
+const BUNDLED_DSML_SHIM: &str =
+    include_str!(concat!(env!("CSSWITCH_BUNDLED_PROXY_DIR"), "/dsml_shim.py"));
+const BUNDLED_PROVIDER_POLICY: &str = include_str!(concat!(
+    env!("CSSWITCH_BUNDLED_PROXY_DIR"),
+    "/provider_policy.py"
+));
+const BUNDLED_ANTHROPIC_COMPAT: &str = include_str!(concat!(
+    env!("CSSWITCH_BUNDLED_PROXY_DIR"),
+    "/anthropic_compat.py"
+));
+const MANAGED_PROXY_HINT: &str = "~/.csswitch/proxy/csswitch_proxy.py";
+const REAL_SCIENCE_PORT: u16 = 8765;
+
+fn validate_managed_port(port: u16) -> Result<(), CliEnvelope> {
+    if port == 0 {
+        return Err(CliEnvelope::err("invalid_port", "端口不能为 0。"));
+    }
+    if port == REAL_SCIENCE_PORT {
+        return Err(CliEnvelope::err(
+            "reserved_port",
+            "端口 8765 是真实 Science 实例保留端口，不能用。",
+        ));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// 路径工具
+// ============================================================================
+
+/// Helper 操作日志。
+use super::logger;
+
+/// 获取 `~/.csswitch` 目录路径（供 proc_manager 等外部模块使用，故 pub）。
+pub fn config_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".csswitch")
+}
+
+/// 获取 `~/.csswitch/config.json` 路径。
+fn config_path() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+fn managed_proxy_path() -> PathBuf {
+    config_dir().join("proxy").join("csswitch_proxy.py")
+}
+
+fn managed_proxy_file(name: &str) -> PathBuf {
+    config_dir().join("proxy").join(name)
+}
+
+fn write_managed_proxy_file(path: &Path, desired: &[u8]) -> Result<(), String> {
+    let needs_write = match fs::read(path) {
+        Ok(existing) => existing != desired,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => return Err(format!("读取 {} 失败：{e}", path.display())),
+    };
+    if needs_write {
+        fs::write(path, desired).map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_managed_proxy_script() -> Result<PathBuf, String> {
+    let main = managed_proxy_path();
+    let parent = main
+        .parent()
+        .ok_or_else(|| format!("代理脚本路径无父目录：{MANAGED_PROXY_HINT}"))?;
+    fs::create_dir_all(parent).map_err(|e| format!("创建 ~/.csswitch/proxy 失败：{e}"))?;
+
+    let shim = managed_proxy_file("dsml_shim.py");
+    let provider_policy = managed_proxy_file("provider_policy.py");
+    let anthropic_compat = managed_proxy_file("anthropic_compat.py");
+    write_managed_proxy_file(&shim, BUNDLED_DSML_SHIM.as_bytes())?;
+    write_managed_proxy_file(&provider_policy, BUNDLED_PROVIDER_POLICY.as_bytes())?;
+    write_managed_proxy_file(&anthropic_compat, BUNDLED_ANTHROPIC_COMPAT.as_bytes())?;
+    write_managed_proxy_file(&main, BUNDLED_PROXY.as_bytes())?;
+    Ok(main)
+}
+
+/// 获取 `~/.csswitch/logs/` 目录路径。
+pub fn logs_dir() -> PathBuf {
+    config_dir().join("logs")
+}
+
+/// 定位 `proxy/csswitch_proxy.py`：
+/// 1. `CSSWITCH_PROXY_DIR` 环境变量
+/// 2. `~/.csswitch/proxy/`（统一管理目录，缺失或过期时由 helper 内置副本自愈）
+fn proxy_script_path() -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var("CSSWITCH_PROXY_DIR") {
+        let p = PathBuf::from(&dir).join("csswitch_proxy.py");
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    ensure_managed_proxy_script()
+}
+
+// ============================================================================
+// 辅助函数
+// ============================================================================
+
+struct ProxyLaunch {
+    adapter: String,
+    key: String,
+    key_env: &'static str,
+    base_url: String,
+    model: String,
+    thinking_policy: &'static str,
+}
+
+fn key_env_for_adapter(adapter: &str) -> &'static str {
+    match adapter {
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "qwen" => "DASHSCOPE_API_KEY",
+        "openai-custom" | "openai-responses" => "CSSWITCH_OPENAI_KEY",
+        _ => "CSSWITCH_RELAY_KEY",
+    }
+}
+
+fn is_native_adapter(adapter: &str) -> bool {
+    matches!(adapter, "deepseek" | "qwen")
+}
+
+fn is_openai_adapter(adapter: &str) -> bool {
+    matches!(adapter, "openai-custom" | "openai-responses")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_adapters_use_openai_key_env() {
+        assert_eq!(key_env_for_adapter("openai-custom"), "CSSWITCH_OPENAI_KEY");
+        assert_eq!(
+            key_env_for_adapter("openai-responses"),
+            "CSSWITCH_OPENAI_KEY"
+        );
+    }
+}
+
+/// 从 `~/.csswitch/config.json` 读取 active Profile，并派生代理启动参数。
+fn proxy_launch_from_config(provider: &str) -> Result<Option<ProxyLaunch>, String> {
+    let cfg = crate::config::load_from(&config_dir()).map_err(|e| format!("读配置失败：{e}"))?;
+    let Some(profile) = cfg.active_profile() else {
+        return Ok(None);
+    };
+    let adapter = crate::templates::adapter_for(&profile.template_id).to_string();
+    if provider != adapter && provider != profile.template_id {
+        return Err(format!(
+            "当前生效 Profile 是 {}，不能作为 {provider} 启动。",
+            profile.template_id
+        ));
+    }
+    if profile.api_key.trim().is_empty() {
+        return Ok(None);
+    }
+    if !is_native_adapter(&adapter) {
+        if profile.base_url.trim().is_empty()
+            || !(profile.base_url.starts_with("http://")
+                || profile.base_url.starts_with("https://"))
+        {
+            return Err("当前配置需要 http(s):// 开头的 base_url。".to_string());
+        }
+        if profile.model.trim().is_empty() {
+            return Err("当前配置需要选择或填写模型。".to_string());
+        }
+    }
+
+    Ok(Some(ProxyLaunch {
+        key_env: key_env_for_adapter(&adapter),
+        adapter,
+        key: profile.api_key.trim().to_string(),
+        base_url: profile.base_url.clone(),
+        model: profile.model.clone(),
+        thinking_policy: crate::templates::thinking_policy_for(&profile.template_id),
+    }))
+}
+
+/// 通过 HTTP GET /health 探活本地代理。
+fn proxy_health(port: u16, secret: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let addr = format!("127.0.0.1:{port}");
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &addr.parse().unwrap(),
+        std::time::Duration::from_millis(500),
+    ) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let req =
+        format!("GET /{secret}/health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 256];
+    let Ok(n) = stream.read(&mut buf) else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    // 严格解析 HTTP 状态码（审核 P2-7）：精确匹配第二段 "200"，避免 reason phrase 中的误判。
+    head.lines()
+        .next()
+        .map_or(false, |line| line.split_whitespace().nth(1) == Some("200"))
+}
+
+// ============================================================================
+// 命令实现
+// ============================================================================
+
+/// `status` — 返回 Helper 版本、能力列表、代理/沙箱运行状态。
+/// 无状态实现：通过 TCP 端口探活检测实际运行状态。
+pub fn cmd_status() -> CliEnvelope {
+    let capabilities: Vec<&str> = vec![
+        "proxy",
+        "sandbox",
+        "config",
+        "logs",
+        "doctor",
+        "verify",
+        "proxy-bundle-v2",
+    ];
+    // 从配置读端口然后 TCP 探活，不依赖内存中的 PID
+    let port = get_configured_port();
+    let proxy_running = is_port_open(port);
+    CliEnvelope::ok(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "platform": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "capabilities": capabilities,
+        "proxy_running": proxy_running,
+        "sandbox_running": sandbox_is_running(),
+    }))
+}
+
+/// `config get` — 读取 `~/.csswitch/config.json` 并返回（key 已掩码）。
+pub fn cmd_config_get() -> CliEnvelope {
+    let path = config_path();
+    if !path.exists() {
+        return CliEnvelope::ok(json!({
+            "provider": "deepseek",
+            "proxy_port": 18991,
+            "sandbox_port": 8990,
+            "mode": "proxy",
+            "keys": {}
+        }));
+    }
+    match fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(mut cfg) => {
+                // 掩码所有 provider key（只保留末 4 位）
+                if let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_object_mut()) {
+                    for (_name, prov) in providers.iter_mut() {
+                        if let Some(key) = prov.get("key").and_then(|k| k.as_str()) {
+                            let masked = if key.len() > 4 {
+                                format!("{}{}", "•".repeat(key.len() - 4), &key[key.len() - 4..])
+                            } else {
+                                "••••".to_string()
+                            };
+                            prov["key"] = json!(masked);
+                        }
+                    }
+                }
+                CliEnvelope::ok(cfg)
+            }
+            Err(e) => CliEnvelope::err("config_parse_error", &format!("配置文件格式错误：{e}")),
+        },
+        Err(e) => CliEnvelope::err("config_read_error", &format!("无法读取配置文件：{e}")),
+    }
+}
+
+/// `config set <json>` — 写入 `~/.csswitch/config.json`。
+/// 审查 C1 修复：使用 `config.rs` 的安全写入路径（symlink 拒绝 + 0600 + 原子写）。
+pub fn cmd_config_set(json_str: &str) -> CliEnvelope {
+    let v: Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => return CliEnvelope::err("config_parse_error", &format!("JSON 解析失败：{e}")),
+    };
+    // 构建 Config 对象并走安全写入路径（复用 config.rs 的 save_to 函数）
+    let cfg: crate::config::Config = match serde_json::from_value(v) {
+        Ok(c) => c,
+        Err(e) => return CliEnvelope::err("config_parse_error", &format!("配置格式错误：{e}")),
+    };
+    let dir = config_dir();
+    if let Err(e) = crate::config::save_to(&dir, &cfg) {
+        return CliEnvelope::err("config_write_error", &format!("写入配置失败：{e}"));
+    }
+    CliEnvelope::ok_empty()
+}
+
+/// `config save-key <provider> <key>` — 保存 provider key。
+/// 审查 C1 修复：使用 `config.rs` 的 update 函数走安全读写路径。
+pub fn cmd_config_save_key(provider: &str, key: &str) -> CliEnvelope {
+    let dir = config_dir();
+    let result = crate::config::update(&dir, |cfg| {
+        if let Some(p) = cfg.active_profile_mut() {
+            if p.template_id == provider
+                || crate::templates::adapter_for(&p.template_id) == provider
+            {
+                p.api_key = key.to_string();
+            }
+        }
+    });
+    if let Err(e) = result {
+        return CliEnvelope::err("config_write_error", &format!("保存 key 失败：{e}"));
+    }
+    // 返回掩码后的 key
+    let masked = if key.len() > 4 {
+        format!("{}{}", "•".repeat(key.len() - 4), &key[key.len() - 4..])
+    } else {
+        "••••".to_string()
+    };
+    CliEnvelope::ok(json!({"masked": masked}))
+}
+
+/// `proxy start <provider> <port> <secret>` — 启动代理进程。
+pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
+    if let Err(err) = validate_managed_port(port) {
+        return err;
+    }
+
+    // 检查是否已在运行（通过 TCP 端口探活）
+    if is_port_open(port) {
+        if proxy_health(port, secret) {
+            return CliEnvelope::err(
+                "proxy_already_running",
+                &format!("代理已在端口 {} 上运行", port),
+            );
+        }
+        let _ = stop_recorded_proxy(port);
+        if !clear_unhealthy_proxy_port(port) {
+            return CliEnvelope::err_with_hint(
+                "port_in_use",
+                &format!("端口 {port} 上已有进程，但不是当前可用的 CSSwitch 代理。"),
+                "请先停止占用该端口的进程，或在高级设置中换一个代理端口。",
+            );
+        }
+    }
+
+    // 获取需要注入的 active Profile 连接信息
+    let launch = match proxy_launch_from_config(provider) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return CliEnvelope::err_with_hint(
+                "key_not_found",
+                &format!("配置中未找到 {provider} 的 API key"),
+                "请先在客户端面板填写并保存 API Key。",
+            )
+        }
+        Err(e) => return CliEnvelope::err("config_read_error", &e),
+    };
+
+    // 定位 python3
+    let python = match find_cmd("python3") {
+        Some(p) => p,
+        None => {
+            // 尝试 python
+            match find_cmd("python") {
+                Some(p) => p,
+                None => return CliEnvelope::err_with_hint(
+                    "python_not_found",
+                    "远程服务器上未找到 Python 3。",
+                    "请在服务器上安装 Python 3.8+（apt install python3 或 yum install python3）。",
+                ),
+            }
+        }
+    };
+
+    let script = match proxy_script_path() {
+        Ok(p) => p,
+        Err(e) => return CliEnvelope::err("proxy_script_not_found", &e),
+    };
+
+    // 启代理子进程
+    let proxy_log = logs_dir().join("proxy.log");
+    if let Some(parent) = proxy_log.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return CliEnvelope::err("proxy_log_error", &format!("创建代理日志目录失败：{e}"));
+        }
+    }
+    let log_file = match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&proxy_log)
+    {
+        Ok(file) => file,
+        Err(e) => return CliEnvelope::err("proxy_log_error", &format!("打开 proxy.log 失败：{e}")),
+    };
+    let log_file_for_stderr = match log_file.try_clone() {
+        Ok(file) => file,
+        Err(e) => {
+            return CliEnvelope::err("proxy_log_error", &format!("复制 proxy.log 句柄失败：{e}"))
+        }
+    };
+
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script)
+        .arg("--provider")
+        .arg(&launch.adapter)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--auth-token")
+        .arg(secret)
+        .env(launch.key_env, &launch.key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_for_stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    if !is_native_adapter(&launch.adapter) {
+        if is_openai_adapter(&launch.adapter) {
+            cmd.env("CSSWITCH_OPENAI_BASE_URL", &launch.base_url);
+            if !launch.model.is_empty() {
+                cmd.env("CSSWITCH_OPENAI_MODEL", &launch.model);
+            }
+        } else {
+            cmd.env("CSSWITCH_RELAY_BASE_URL", &launch.base_url);
+            if !launch.model.is_empty() {
+                cmd.env("CSSWITCH_RELAY_MODEL", &launch.model);
+            }
+            if !launch.thinking_policy.is_empty() {
+                cmd.env("CSSWITCH_RELAY_THINKING", launch.thinking_policy);
+            }
+        }
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let pid = child.id();
+            for _ in 0..20 {
+                if proxy_health(port, secret) {
+                    let _ = save_proxy_secret(secret);
+                    super::proc_manager::record_proxy_start(pid, port, secret);
+                    super::logger::info(&format!("proxy started pid={pid} port={port}"));
+                    return CliEnvelope::ok(json!({
+                        "port": port,
+                        "pid": pid,
+                        "message": "代理已启动",
+                    }));
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let detail = fs::read_to_string(&proxy_log)
+                            .ok()
+                            .and_then(|content| {
+                                let tail = content
+                                    .lines()
+                                    .rev()
+                                    .take(20)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                (!tail.trim().is_empty()).then_some(tail)
+                            })
+                            .unwrap_or_else(|| format!("代理进程退出码 {:?}", status.code()));
+                        return CliEnvelope::err_with_hint(
+                            "proxy_start_failed",
+                            &format!("代理启动后立即退出：{detail}"),
+                            "请查看 helper 的 proxy.log，确认 Python、端口和 provider 配置是否正常。",
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return CliEnvelope::err(
+                            "proxy_start_failed",
+                            &format!("检查代理进程状态失败：{e}"),
+                        )
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let _ = terminate_pid(pid);
+            CliEnvelope::err_with_hint(
+                "proxy_start_timeout",
+                &format!("代理启动后未通过健康检查，端口 {port} 未就绪。"),
+                "请查看 helper 的 proxy.log，确认代理是否能监听端口。",
+            )
+        }
+        Err(e) => {
+            let hint = if e.to_string().contains("AddrInUse")
+                || e.to_string().contains("address in use")
+            {
+                format!("端口 {port} 已被占用。请更改端口或停止占用程序。")
+            } else {
+                format!("启动代理失败：{e}")
+            };
+            CliEnvelope::err_with_hint("proxy_start_failed", &format!("启动代理失败：{e}"), &hint)
+        }
+    }
+}
+
+/// `proxy status` — 返回代理运行状态。
+/// 无状态实现：通过 TCP 端口探活检测代理是否在运行（不依赖内存中的 PID）。
+pub fn cmd_proxy_status() -> CliEnvelope {
+    // 从配置读取端口（默认 18991），然后 TCP 探活。
+    let port = get_configured_port();
+    let running = is_port_open(port);
+
+    if running {
+        // 通过 /health 端点进一步确认是代理服务（使用持久化的随机 secret）
+        let healthy = load_proxy_secret()
+            .map(|s| proxy_health(port, &s))
+            .unwrap_or(false);
+        CliEnvelope::ok(json!({
+            "running": true,
+            "port": port,
+            "healthy": healthy,
+        }))
+    } else {
+        CliEnvelope::ok(json!({
+            "running": false,
+            "healthy": false,
+            "message": "代理未在运行。请使用 `proxy start` 启动。",
+        }))
+    }
+}
+
+/// `proxy stop` — 停止代理进程。
+/// 无状态实现：通过 `fuser` / `lsof` 找到占用端口的进程并 kill。
+pub fn cmd_proxy_stop() -> CliEnvelope {
+    let port = get_configured_port();
+    let stopped_recorded = stop_recorded_proxy(port);
+
+    // 先检查端口是否有进程
+    if !is_port_open(port) {
+        return CliEnvelope::ok(json!({
+            "message": if stopped_recorded { "已停止记录中的代理进程。" } else { "端口上没有运行中的代理。" },
+            "port": port,
+            "stopped": true,
+        }));
+    }
+
+    let stopped = clear_unhealthy_proxy_port(port) || stopped_recorded;
+    if stopped {
+        super::proc_manager::record_proxy_stop();
+        super::logger::info(&format!("proxy stopped on port {port}"));
+    } else {
+        return CliEnvelope::err_with_hint(
+            "proxy_stop_failed",
+            &format!("端口 {port} 可能未被完全停止。"),
+            "请手动检查该端口上的进程，确认旧代理已停止后再重试。",
+        );
+    }
+    CliEnvelope::ok(json!({
+        "message": format!("端口 {port} 上的代理已停止"),
+        "port": port,
+        "stopped": stopped,
+    }))
+}
+
+// ============================================================================
+// 内部工具函数
+// ============================================================================
+
+fn pid_running(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn wait_pid_exit(pid: u32) -> bool {
+    for _ in 0..10 {
+        if !pid_running(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+fn terminate_pid(pid: u32) -> bool {
+    if !pid_running(pid) {
+        return true;
+    }
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output();
+    if wait_pid_exit(pid) {
+        return true;
+    }
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .output();
+    wait_pid_exit(pid)
+}
+
+fn pid_looks_like_recorded_proxy(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .map(|cmdline| cmdline.contains("csswitch_proxy.py") || cmdline.contains("csswitch_proxy"))
+        .unwrap_or(false)
+}
+
+fn stop_recorded_proxy(port: u16) -> bool {
+    let manager = super::proc_manager::ProcessManager::new("proxy");
+    let Some(record) = manager.read_pid() else {
+        return false;
+    };
+    if record.port != port && !record.command.contains("csswitch_proxy") {
+        return false;
+    }
+    if !pid_looks_like_recorded_proxy(record.pid) {
+        manager.cleanup();
+        return false;
+    }
+    let stopped = terminate_pid(record.pid);
+    if stopped {
+        manager.cleanup();
+    }
+    stopped
+}
+
+fn clear_unhealthy_proxy_port(port: u16) -> bool {
+    let _term = Command::new("fuser")
+        .args(["-TERM", &format!("{port}/tcp")])
+        .output();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    if is_port_open(port) {
+        let _kill = Command::new("fuser")
+            .args(["-k", &format!("{port}/tcp")])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    if is_port_open(port) {
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("lsof -ti:{port} | xargs -r kill 2>/dev/null; true"))
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    !is_port_open(port)
+}
+
+/// 获取持久化 proxy secret 的文件路径。
+fn secret_file() -> PathBuf {
+    config_dir().join("proxy.secret")
+}
+
+/// 从 `~/.csswitch/proxy.secret` 加载上次代理启动时保存的 secret。
+fn load_proxy_secret() -> Result<String, String> {
+    let p = secret_file();
+    if p.exists() {
+        std::fs::read_to_string(&p)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| format!("读 secret 文件失败：{e}"))
+    } else {
+        Err("secret 文件不存在".to_string())
+    }
+}
+
+/// 将代理 secret 持久化到文件以便后续 `proxy status` 检测健康状态。
+/// 审核 P0-1 修复：不再硬编码弱 secret，每次启动由调用方传入随机生成的 secret。
+fn save_proxy_secret(secret: &str) -> Result<(), String> {
+    let _ = std::fs::create_dir_all(&config_dir());
+    std::fs::write(secret_file(), secret).map_err(|e| format!("写 secret 文件失败：{e}"))
+}
+
+/// 从配置文件读取代理端口，无配置时返回默认值 18991。
+fn get_configured_u16(key: &str, default: u16) -> u16 {
+    let cfg = config_path();
+    if cfg.exists() {
+        if let Ok(raw) = std::fs::read_to_string(&cfg) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(value) = v[key].as_u64() {
+                    return value as u16;
+                }
+            }
+        }
+    }
+    default
+}
+
+/// 从配置文件读取代理端口，无配置时返回默认值 18991。
+fn get_configured_port() -> u16 {
+    get_configured_u16("proxy_port", 18991)
+}
+
+/// 从配置文件读取沙箱端口，无配置时返回默认值 8990。
+fn get_configured_sandbox_port() -> u16 {
+    get_configured_u16("sandbox_port", 8990)
+}
+
+/// 检查 TCP 端口是否有进程在监听。
+fn is_port_open(port: u16) -> bool {
+    use std::net::TcpStream;
+    TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+fn sandbox_process_found_for(data_dir: &Path) -> bool {
+    let pattern = data_dir.to_string_lossy().to_string();
+    Command::new("pgrep")
+        .args(["-f", &pattern])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+fn sandbox_process_found() -> bool {
+    let (_, data_dir) = sandbox_paths();
+    sandbox_process_found_for(&data_dir)
+}
+
+fn sandbox_paths() -> (PathBuf, PathBuf) {
+    let sandbox_home = config_dir().join("sandbox").join("home");
+    let data_dir = sandbox_home.join(".claude-science");
+    (sandbox_home, data_dir)
+}
+
+fn command_output_error(command: &str, out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("{command} 退出码 {:?}", out.status.code())
+}
+
+fn tail_file(path: &Path, max_chars: usize) -> String {
+    let mut content = String::new();
+    if let Ok(mut file) = fs::File::open(path) {
+        let _ = file.read_to_string(&mut content);
+    }
+    if content.chars().count() <= max_chars {
+        return content.trim().to_string();
+    }
+    let mut tail = content.chars().rev().take(max_chars).collect::<Vec<_>>();
+    tail.reverse();
+    tail.into_iter().collect::<String>().trim().to_string()
+}
+
+fn matching_sandbox_pids(data_dir: &Path) -> Vec<u32> {
+    let pattern = data_dir.to_string_lossy().to_string();
+    let Ok(out) = Command::new("pgrep").args(["-f", &pattern]).output() else {
+        return Vec::new();
+    };
+    let current_pid = std::process::id();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != current_pid)
+        .filter(|pid| {
+            fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|raw| {
+                    let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+                    cmdline.contains("claude-science")
+                        && cmdline.contains("serve")
+                        && cmdline.contains(pattern.as_str())
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn wait_sandbox_pids_exit(data_dir: &Path, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if matching_sandbox_pids(data_dir).is_empty() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    matching_sandbox_pids(data_dir).is_empty()
+}
+
+fn terminate_sandbox_processes(data_dir: &Path) -> bool {
+    let pids = matching_sandbox_pids(data_dir);
+    if pids.is_empty() {
+        return false;
+    }
+    for pid in &pids {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output();
+    }
+    if wait_sandbox_pids_exit(data_dir, 12) {
+        return true;
+    }
+    for pid in matching_sandbox_pids(data_dir) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output();
+    }
+    wait_sandbox_pids_exit(data_dir, 8)
+}
+
+fn sandbox_daemon_running(bin: &str, sandbox_home: &Path, data_dir: &Path) -> Result<bool, String> {
+    match Command::new(bin)
+        .args(["status", "--data-dir"])
+        .arg(data_dir)
+        .env("HOME", sandbox_home)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            serde_json::from_str::<Value>(&stdout)
+                .map(|v| v.get("running").and_then(|r| r.as_bool()).unwrap_or(false))
+                .map_err(|e| {
+                    let trimmed = stdout.trim();
+                    if trimmed.is_empty() {
+                        format!("claude-science status 返回空输出：{e}")
+                    } else {
+                        format!("claude-science status 返回无法解析的输出：{trimmed}")
+                    }
+                })
+        }
+        Ok(out) => Err(command_output_error("claude-science status", &out)),
+        Err(e) => Err(format!("无法执行 claude-science status：{e}")),
+    }
+}
+
+fn wait_for_sandbox_ready(
+    bin: &str,
+    sandbox_home: &Path,
+    data_dir: &Path,
+    port: u16,
+    log_path: &Path,
+) -> Result<String, String> {
+    let url = sandbox_fresh_url(bin, sandbox_home, data_dir)?;
+    for _ in 0..60 {
+        if crate::proc::http_health(port, None, 400) {
+            return Ok(url);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    let tail = tail_file(log_path, 2000);
+    if tail.is_empty() {
+        Err(format!(
+            "已拿到 Science 登录链接，但端口 {port} 的 /health 一直未就绪"
+        ))
+    } else {
+        Err(format!(
+            "已拿到 Science 登录链接，但端口 {port} 的 /health 一直未就绪\n--- sandbox.log ---\n{tail}"
+        ))
+    }
+}
+
+fn sandbox_is_running() -> bool {
+    let port = get_configured_sandbox_port();
+    let (_, data_dir) = sandbox_paths();
+    crate::proc::http_health(port, None, 400) && sandbox_process_found_for(&data_dir)
+}
+
+/// `sandbox status` — 检查 Claude Science 沙箱是否在运行。
+/// 通过轮询 `claude-science status` 和端口探活双重确认。
+pub fn cmd_sandbox_status() -> CliEnvelope {
+    let port = get_configured_sandbox_port();
+    let port_healthy = crate::proc::http_health(port, None, 400);
+    let process_found = sandbox_process_found();
+    let (sandbox_home, data_dir) = sandbox_paths();
+    let (daemon_running, status_error) = match find_cmd("claude-science") {
+        Some(bin) => match sandbox_daemon_running(&bin, &sandbox_home, &data_dir) {
+            Ok(running) => (running, None),
+            Err(e) => (false, Some(e)),
+        },
+        None => (false, Some("未找到 claude-science 命令".to_string())),
+    };
+    let running = port_healthy && process_found;
+
+    if running {
+        CliEnvelope::ok(json!({
+            "running": true,
+            "port": port,
+            "daemon_running": daemon_running,
+            "port_healthy": port_healthy,
+            "process_found": process_found,
+            "message": format!("Science 沙箱正在端口 {} 上运行", port),
+        }))
+    } else {
+        CliEnvelope::ok(json!({
+            "running": false,
+            "port": port,
+            "daemon_running": daemon_running,
+            "port_healthy": port_healthy,
+            "process_found": process_found,
+            "status_error": status_error,
+            "message": "沙箱未运行。请使用 `claude-science serve --port <port>` 或在客户端配置后通过一键开始启动。",
+        }))
+    }
+}
+
+/// `sandbox start <port> <proxy_url>` — 启动 Claude Science 沙箱。
+/// 用 `ANTHROPIC_BASE_URL` 环境变量指向代理，以独立 data-dir 运行。
+/// 注入虚拟 OAuth 凭证使 Science 认为已登录，仅监听回环地址，外部访问走 SSH 端口转发。
+pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
+    if let Err(err) = validate_managed_port(port) {
+        return err;
+    }
+
+    let bin = match find_cmd("claude-science") {
+        Some(b) => b,
+        None => {
+            return CliEnvelope::err_with_hint(
+                "science_not_found",
+                "未找到 claude-science 命令",
+                "请在服务器上安装 Claude Science 并确保其在 PATH 中。",
+            )
+        }
+    };
+
+    // 使用独立 data-dir 避免与已有实例冲突
+    let (sandbox_home, data_dir) = sandbox_paths();
+
+    // 确保运行时目录存在
+    let _ = std::fs::create_dir_all(&data_dir);
+
+    if is_port_open(port) || sandbox_process_found_for(&data_dir) {
+        let _ = Command::new(&bin)
+            .args(["stop", "--data-dir"])
+            .arg(&data_dir)
+            .env("HOME", &sandbox_home)
+            .output();
+        terminate_sandbox_processes(&data_dir);
+        for _ in 0..20 {
+            if !is_port_open(port) && !sandbox_process_found_for(&data_dir) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if is_port_open(port) {
+            return CliEnvelope::err_with_hint(
+                "port_in_use",
+                &format!("端口 {port} 已被占用，无法启动 Science 沙箱。"),
+                "请先停止占用该端口的进程，或在高级设置里更换沙箱端口。",
+            );
+        }
+    }
+
+    // 注入虚拟 OAuth 凭证，让 Science 认为已登录（否则启动后会因找不到登录态报错）
+    if let Err(e) = crate::oauth_forge::ensure_virtual_login(
+        &data_dir,
+        "virtual@localhost.invalid",
+        &sandbox_home,
+    ) {
+        super::logger::warn(&format!("OAuth 虚拟登录失败（沙箱启动后可能无凭证）: {e}"));
+    }
+
+    // https_proxy 只保留 host:port（剥掉 /secret 路径）。
+    // 对齐 launch-virtual-sandbox.sh：CONNECT 隧道不经过 path 路由，
+    // 代理的 do_CONNECT 对 Anthropic 域名秒回 403，operon 秒判 logged-out。
+    let proxy_hostport = match proxy_url.find("://") {
+        Some(i) => {
+            let after = &proxy_url[i + 3..];
+            match after.find('/') {
+                Some(j) => format!("http://{}", &after[..j]),
+                None => proxy_url.to_string(),
+            }
+        }
+        None => proxy_url.to_string(),
+    };
+
+    let sandbox_log = logs_dir().join("sandbox.log");
+    if let Some(parent) = sandbox_log.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return CliEnvelope::err("sandbox_log_error", &format!("创建沙箱日志目录失败：{e}"));
+        }
+    }
+    let log_file = match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&sandbox_log)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            return CliEnvelope::err("sandbox_log_error", &format!("打开 sandbox.log 失败：{e}"))
+        }
+    };
+    let log_file_for_stderr = match log_file.try_clone() {
+        Ok(file) => file,
+        Err(e) => {
+            return CliEnvelope::err(
+                "sandbox_log_error",
+                &format!("复制 sandbox.log 句柄失败：{e}"),
+            )
+        }
+    };
+
+    match std::process::Command::new(&bin)
+        .args(["serve", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--no-browser")
+        .arg("--no-auto-update")
+        .arg("--detached")
+        .env("HOME", &sandbox_home)
+        .env("ANTHROPIC_BASE_URL", proxy_url)
+        .env("https_proxy", &proxy_hostport)
+        .env("HTTPS_PROXY", &proxy_hostport)
+        .env("no_proxy", "127.0.0.1,localhost,::1")
+        .env("NO_PROXY", "127.0.0.1,localhost,::1")
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_for_stderr))
+        .spawn()
+    {
+        Ok(_child) => {
+            match wait_for_sandbox_ready(&bin, &sandbox_home, &data_dir, port, &sandbox_log) {
+                Ok(url) => CliEnvelope::ok(json!({
+                    "message": format!("沙箱已启动，端口 {}", port),
+                    "port": port,
+                    "url": url,
+                })),
+                Err(e) => {
+                    let _ = Command::new(&bin)
+                        .args(["stop", "--data-dir"])
+                        .arg(&data_dir)
+                        .env("HOME", &sandbox_home)
+                        .output();
+                    terminate_sandbox_processes(&data_dir);
+                    CliEnvelope::err_with_hint(
+                        "sandbox_start_timeout",
+                        &format!("沙箱启动后未就绪：{e}"),
+                        "请查看 helper 的 sandbox.log，确认 claude-science 是否启动成功。",
+                    )
+                }
+            }
+        }
+        Err(e) => CliEnvelope::err_with_hint(
+            "sandbox_start_failed",
+            &format!("启动沙箱失败：{e}"),
+            &format!("请检查端口 {} 是否被占用。", port),
+        ),
+    }
+}
+
+fn sandbox_fresh_url(bin: &str, sandbox_home: &Path, data_dir: &Path) -> Result<String, String> {
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match Command::new(bin)
+            .args(["url", "--data-dir"])
+            .arg(data_dir)
+            .env("HOME", sandbox_home)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Some(url) = stdout
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| line.starts_with("http"))
+                {
+                    return Ok(url.to_string());
+                }
+                last_error = "claude-science url 未返回可用 URL".to_string();
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                last_error = if stderr.is_empty() {
+                    format!("claude-science url 退出码 {:?}", out.status.code())
+                } else {
+                    stderr
+                };
+            }
+            Err(e) => {
+                last_error = format!("无法执行 claude-science url：{e}");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err(last_error)
+}
+
+/// `sandbox stop` — 停止 Claude Science 沙箱。
+pub fn cmd_sandbox_stop() -> CliEnvelope {
+    let (sandbox_home, data_dir) = sandbox_paths();
+    if !sandbox_is_running() && !sandbox_process_found_for(&data_dir) {
+        return CliEnvelope::ok(json!({
+            "message": "沙箱未运行。",
+            "stopped": false,
+        }));
+    }
+
+    let bin = match find_cmd("claude-science") {
+        Some(b) => b,
+        None => return CliEnvelope::err("science_not_found", "未找到 claude-science 命令"),
+    };
+
+    match std::process::Command::new(&bin)
+        .args(["stop", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", &sandbox_home)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            terminate_sandbox_processes(&data_dir);
+            CliEnvelope::ok_empty()
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if terminate_sandbox_processes(&data_dir) {
+                CliEnvelope::ok(json!({
+                    "message": format!("claude-science stop 未能通过控制 socket 停止沙箱，已清理残留进程：{stderr}"),
+                    "stopped": true,
+                }))
+            } else {
+                CliEnvelope::err("sandbox_stop_failed", &format!("停止沙箱失败：{stderr}"))
+            }
+        }
+        Err(e) => {
+            if terminate_sandbox_processes(&data_dir) {
+                CliEnvelope::ok(json!({
+                    "message": format!("无法执行停止命令，已清理残留进程：{e}"),
+                    "stopped": true,
+                }))
+            } else {
+                CliEnvelope::err("sandbox_stop_failed", &format!("无法执行停止命令：{e}"))
+            }
+        }
+    }
+}
+
+/// `logs <name> [lines]` — 返回日志。
+pub fn cmd_logs(name: &str, lines: Option<usize>) -> CliEnvelope {
+    let log_path = logs_dir().join(format!("{name}.log"));
+    if !log_path.exists() {
+        return CliEnvelope::ok(json!({"content": "", "exists": false}));
+    }
+    match fs::read_to_string(&log_path) {
+        Ok(content) => {
+            let lines_count = lines.unwrap_or(100);
+            let tail: String = content
+                .lines()
+                .rev()
+                .take(lines_count)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            CliEnvelope::ok(json!({"content": tail, "exists": true}))
+        }
+        Err(e) => CliEnvelope::err("log_read_error", &format!("无法读取日志：{e}")),
+    }
+}
+
+/// `doctor` — 诊断命令。
+pub fn cmd_doctor() -> CliEnvelope {
+    let mut checks: Vec<Value> = Vec::new();
+
+    // 检查 python3
+    let python = find_cmd("python3").or_else(|| find_cmd("python"));
+    checks.push(json!({
+        "name": "Python 3",
+        "ok": python.is_some(),
+        "detail": python.as_deref().unwrap_or("未找到"),
+    }));
+
+    // 检查代理脚本
+    let script = proxy_script_path();
+    checks.push(json!({
+        "name": "代理脚本 csswitch_proxy.py",
+        "ok": script.is_ok(),
+        "detail": script.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|e| e.clone()),
+    }));
+
+    // 检查配置目录
+    let cfg = config_path();
+    checks.push(json!({
+        "name": "配置文件 config.json",
+        "ok": cfg.exists(),
+        "detail": cfg.display().to_string(),
+    }));
+
+    // 检查代理运行状态（通过端口探活）
+    let port = get_configured_port();
+    let proxy_running = is_port_open(port);
+    checks.push(json!({
+        "name": "代理运行状态",
+        "ok": proxy_running,
+        "detail": if proxy_running { format!("端口 {}", port) } else { "未运行".to_string() },
+    }));
+
+    CliEnvelope::ok(json!({"checks": checks}))
+}
+
+/// `verify <port> <secret>` — 通过代理发送最小请求验证 key 有效性。
+pub fn cmd_verify(port: u16, secret: &str) -> CliEnvelope {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let addr = format!("127.0.0.1:{port}");
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&addr.parse().unwrap(), std::time::Duration::from_secs(5))
+    else {
+        return CliEnvelope::err("proxy_not_reachable", &format!("无法连接到代理端口 {port}"));
+    };
+
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let body = json!({
+        "model": "claude-opus-4-8",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+    let req = format!(
+        "POST /{secret}/v1/messages HTTP/1.0\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body_str}",
+        body_str.len()
+    );
+
+    if stream.write_all(req.as_bytes()).is_err() {
+        return CliEnvelope::err("proxy_io_error", "发送验证请求失败");
+    }
+
+    let mut buf = vec![0u8; 4096];
+    let Ok(n) = stream.read(&mut buf) else {
+        return CliEnvelope::err("proxy_no_response", "代理未响应验证请求");
+    };
+
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let status_line = head.lines().next().unwrap_or("");
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok());
+
+    match code {
+        Some(200) => CliEnvelope::ok(json!({"ok": true, "hint": "key 有效，上游已接受。"})),
+        Some(c @ (401 | 403)) => CliEnvelope::ok(
+            json!({"ok": false, "hint": format!("上游拒绝（{c}），key 可能无效或无权限。")}),
+        ),
+        Some(c) => CliEnvelope::ok(
+            json!({"ok": false, "hint": format!("上游返回 {c}，可能是 key 无效或上游异常。")}),
+        ),
+        None => CliEnvelope::err("proxy_invalid_response", "代理返回了无效的 HTTP 响应"),
+    }
+}
+
+// ============================================================================
+// 工具函数
+// ============================================================================
+
+/// 简易 which：在 PATH 中查找可执行文件。
+fn find_cmd(name: &str) -> Option<String> {
+    let mut dirs_to_check: Vec<PathBuf> = Vec::new();
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            if !dir.is_empty() {
+                dirs_to_check.push(PathBuf::from(dir));
+            }
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        dirs_to_check.push(home.join(".local").join("bin"));
+        dirs_to_check.push(home.join("bin"));
+        dirs_to_check.push(home.join("miniconda3").join("bin"));
+        dirs_to_check.push(home.join("anaconda3").join("bin"));
+    }
+    dirs_to_check.push(PathBuf::from("/opt/conda/bin"));
+
+    for dir in dirs_to_check {
+        let full = dir.join(name);
+        if full.is_file() {
+            return Some(full.display().to_string());
+        }
+    }
+    None
+}

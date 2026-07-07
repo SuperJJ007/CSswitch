@@ -130,3 +130,54 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
 .btn:focus-visible,.hero:focus-visible,.chip:focus-visible,.abtn:focus-visible,
 .seg-btn:focus-visible,input:focus-visible,select:focus-visible,.link:focus-visible{
   outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---- 远程服务器管理 ---- */
+.remote-only{display:none !important}
+.panel.target-remote .remote-only{
+  display:block !important;
+  width:100%;
+  box-sizing:border-box;
+}
+.panel.target-remote .local-only{display:none !important}
+
+/* 远程 Profile 列表项 */
+.profile-item{display:flex;align-items:center;justify-content:space-between;
+  padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;
+  font-size:12px}
+.profile-item:hover{background:var(--field)}
+.profile-item .pi-name{font-weight:600;color:var(--ink)}
+.profile-item .pi-detail{color:var(--sub);font-size:10.5px}
+.profile-item .pi-actions{display:flex;gap:4px}
+.profile-item .pi-act{font-size:10px;color:var(--sub);cursor:pointer;padding:2px 6px;
+  border:1px solid var(--line);border-radius:4px}
+.profile-item .pi-act:hover{color:var(--accent);border-color:var(--accent)}
+.profile-item .pi-act.del:hover{color:var(--red);border-color:var(--red)}
+
+/* Modal 弹窗 */
+.modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;
+  background:rgba(0,0,0,.45);z-index:100;display:flex;align-items:center;justify-content:center}
+.modal-box{background:var(--panel);border-radius:14px;padding:18px;width:300px;
+  max-height:90vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.25)}
+.auth-prompt-box{width:280px}
+
+/* 表单字段（Profile 编辑弹窗） */
+.form-fields label{display:block;font-size:11px;color:var(--sub);margin:8px 0 4px}
+.form-fields input,.form-fields select{width:100%;height:32px;border:1px solid var(--line);
+  background:var(--field);border-radius:8px;padding:0 10px;font-size:13px;color:var(--ink);
+  outline:none;font-family:inherit}
+.form-fields input:focus,.form-fields select:focus{border-color:var(--accent)}
+.check-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:var(--sub)}
+.check-row input{width:14px;height:14px;margin:0;accent-color:var(--accent)}
+
+/* 连接状态动画 */
+.pulsing{animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* Toast 通知 */
+.toast{position:fixed;top:20px;right:20px;z-index:200;padding:10px 16px;
+  border-radius:8px;font-size:12.5px;color:#fff;opacity:0;transition:opacity .3s;
+  pointer-events:none;max-width:280px;word-break:break-all}
+.toast.show{opacity:1}
+.toast-info{background:var(--accent)}
+.toast-error{background:var(--red)}
+.toast-ok{background:var(--green)}

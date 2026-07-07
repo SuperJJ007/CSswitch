@@ -18,9 +18,14 @@
 //! 与 `.mjs` 的 v2 GCM 格式**字节兼容**，由本文件 `tests` 的 node↔rust 双向对拍单测钉死。
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+// 跨平台文件权限抽象（仅 macOS 编译此模块，但保持导入一致）。
+use crate::fs_ext::{set_file_permissions, OpenOptionsExt, PermissionsExt};
+// 替代 /dev/urandom 的跨平台随机数生成。
+use rand::rngs::OsRng;
+use rand::RngCore;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -57,10 +62,10 @@ pub enum LoginAction {
 }
 
 // ---------- 随机与编码 ----------
+/// 生成 n 字节加密级随机数。跨平台：使用 `OsRng`（Unix: `/dev/urandom`；Windows: `BCryptGenRandom`）。
 fn rand_bytes(n: usize) -> std::io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open("/dev/urandom")?;
     let mut b = vec![0u8; n];
-    f.read_exact(&mut b)?;
+    OsRng.fill_bytes(&mut b);
     Ok(b)
 }
 
@@ -197,13 +202,14 @@ fn safe_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
             .map_err(|e| format!("写临时文件失败：{e}"))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| format!("rename 失败：{e}"))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(|e| format!("chmod 失败：{e}"))?;
+    // 跨平台：Unix 设置 mode 权限，Windows 为 no-op。
+    set_file_permissions(path, mode).map_err(|e| format!("chmod 失败：{e}"))?;
     Ok(())
 }
 
+/// 尽力设置文件权限（跨平台：Unix 有效，Windows no-op）。
 fn chmod_best_effort(p: &Path, mode: u32) {
-    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
+    let _ = set_file_permissions(p, mode);
 }
 
 // ---------- 主流程 ----------
@@ -767,6 +773,8 @@ mod tests {
         );
     }
 
+    /// 测试铁律：沙箱根经符号链接落入真实树应被拒绝（仅 Unix，依赖 symlink）。
+    #[cfg(unix)]
     #[test]
     fn forge_rejects_symlink_into_real_science_tree() {
         // 铁律回归：把沙箱根的祖先预置成指向【真实 Science 目录】的符号链接——此时沙箱根
@@ -803,6 +811,8 @@ mod tests {
         }
     }
 
+    /// 测试 P1：符号链接逃出沙箱根应被拒绝（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn forge_rejects_symlink_escaping_sandbox_root() {
         // P1 回归：把沙箱内的 auth_dir 预置成指向沙箱外目录的符号链接，伪造器必须
