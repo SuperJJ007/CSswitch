@@ -22,7 +22,7 @@ mod templates;
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -66,9 +66,23 @@ struct AppState {
     sandbox_url: Option<String>,
 }
 
+type SharedAppState = Arc<Mutex<AppState>>;
+type SharedLifecycle = Arc<lifecycle::Lifecycle>;
+
 /// 取锁并从 poison 中恢复：某线程持锁时 panic 不应把整个 app 卡死。
 fn lock(m: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+async fn run_blocking<T>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
 fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
@@ -80,7 +94,7 @@ fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
 /// 读【生效 profile】派生 adapter/base_url/model/key，委托 [`start_proxy_for`]。
 fn ensure_proxy(
     app: &tauri::AppHandle,
-    state: &State<'_, Mutex<AppState>>,
+    state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
 ) -> Result<(u16, String, ProxyAction), String> {
     let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
@@ -102,7 +116,7 @@ fn ensure_proxy(
 /// 本函数**绝不取串行器锁**（调用方命令才取），故与命令层的 `with_serialized` 不会自死锁。
 fn start_proxy_for(
     app: &tauri::AppHandle,
-    state: &State<'_, Mutex<AppState>>,
+    state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
     profile: &config::Profile,
 ) -> Result<(u16, String, ProxyAction), String> {
@@ -259,10 +273,21 @@ fn list_templates() -> Vec<serde_json::Value> {
 
 /// 切换运行模式（"proxy" 第三方 / "official" 官方）。切官方要先拆第三方链路成功再落盘。
 #[tauri::command]
-fn set_mode(
+async fn set_mode(
     app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+    mode: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || set_mode_inner(app, state, lifecycle, mode)).await
+}
+
+fn set_mode_inner(
+    app: tauri::AppHandle,
+    state: SharedAppState,
+    lifecycle: SharedLifecycle,
     mode: String,
 ) -> Result<(), String> {
     if mode != "proxy" && mode != "official" {
@@ -324,10 +349,21 @@ struct UiSettings {
 /// 与新端口不一致；此处把这条陈旧链路拆掉（只停我们的沙箱、绝不碰 8765），逼下次「一键开始」按新端口重建，
 /// 杜绝「复用旧沙箱指向死端口、UI 却报沿用不变」。
 #[tauri::command]
-fn set_settings(
+async fn set_settings(
     app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+    cfg: UiSettings,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || set_settings_inner(app, state, lifecycle, cfg)).await
+}
+
+fn set_settings_inner(
+    app: tauri::AppHandle,
+    state: SharedAppState,
+    lifecycle: SharedLifecycle,
     cfg: UiSettings,
 ) -> Result<(), String> {
     if cfg.proxy_port == 8765 || cfg.sandbox_port == 8765 {
@@ -377,7 +413,7 @@ fn set_settings(
 // ---------- profile CRUD 命令（薄包装 *_inner，统一经串行器） ----------
 #[tauri::command]
 fn create_profile(
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    lifecycle: State<'_, SharedLifecycle>,
     template_id: String,
     name: String,
     key: Option<String>,
@@ -398,7 +434,7 @@ fn create_profile(
 
 #[tauri::command]
 fn update_profile_metadata(
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    lifecycle: State<'_, SharedLifecycle>,
     id: String,
     name: String,
     notes: Option<String>,
@@ -412,8 +448,8 @@ fn update_profile_metadata(
 /// （不再拿旧 key 服务，比照 spec §8.2 运行态撤销）。
 #[tauri::command]
 fn clear_profile_key(
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
     id: String,
 ) -> Result<(), String> {
     lifecycle.with_serialized(|| {
@@ -424,7 +460,7 @@ fn clear_profile_key(
         clear_profile_key_inner(&dir, &id)?;
         if was_active {
             lifecycle.bump_generation();
-            let mut st = lock(&state);
+            let mut st = lock(state.inner());
             kill_child(&mut st.proxy);
             st.provider.clear();
             st.key_fp = 0;
@@ -436,8 +472,8 @@ fn clear_profile_key(
 /// 删 profile：经串行器；删的是【生效】profile → active 置空（inner 内）+ bump + 停代理。
 #[tauri::command]
 fn delete_profile(
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
     id: String,
 ) -> Result<(), String> {
     lifecycle.with_serialized(|| {
@@ -448,7 +484,7 @@ fn delete_profile(
         delete_profile_inner(&dir, &id)?;
         if was_active {
             lifecycle.bump_generation();
-            let mut st = lock(&state);
+            let mut st = lock(state.inner());
             kill_child(&mut st.proxy);
             st.provider.clear();
             st.key_fp = 0;
@@ -491,10 +527,31 @@ fn scratch_validate_candidate(
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-fn update_profile_connection(
+async fn update_profile_connection(
     app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+    id: String,
+    base_url: Option<String>,
+    api_format: Option<String>,
+    model: Option<String>,
+    key: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || {
+        update_profile_connection_inner_cmd(
+            app, state, lifecycle, id, base_url, api_format, model, key,
+        )
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_profile_connection_inner_cmd(
+    app: tauri::AppHandle,
+    state: SharedAppState,
+    lifecycle: SharedLifecycle,
     id: String,
     base_url: Option<String>,
     api_format: Option<String>,
@@ -538,7 +595,7 @@ fn update_profile_connection(
             // 切换事务（校验→起正式→健康），探活健康【才】连同落盘；失败则磁盘连接零改动、
             // 仍跑旧连接（杜绝「盘新运行旧」，修 P1-4）。
             let v =
-                set_active_profile_txn(&app, &state, lifecycle.inner(), &id, false, Some(&edit))?;
+                set_active_profile_txn(&app, &state, lifecycle.as_ref(), &id, false, Some(&edit))?;
             // 连接编辑：committed:false（scratch 分类失败）也如实作为错误上抛（磁盘未改、代理仍跑旧的）。
             if v.get("committed").and_then(|b| b.as_bool()) == Some(false) {
                 let hint = v
@@ -570,15 +627,27 @@ fn update_profile_connection(
 
 /// 一键切生效 profile：经串行器走 [`set_active_profile_txn`] 切换事务。
 #[tauri::command]
-fn set_active_profile(
+async fn set_active_profile(
     app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+    id: String,
+    skip_verify: bool,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || set_active_profile_inner_cmd(app, state, lifecycle, id, skip_verify)).await
+}
+
+fn set_active_profile_inner_cmd(
+    app: tauri::AppHandle,
+    state: SharedAppState,
+    lifecycle: SharedLifecycle,
     id: String,
     skip_verify: bool,
 ) -> Result<serde_json::Value, String> {
     lifecycle.with_serialized(|| {
-        set_active_profile_txn(&app, &state, lifecycle.inner(), &id, skip_verify, None)
+        set_active_profile_txn(&app, &state, lifecycle.as_ref(), &id, skip_verify, None)
     })
 }
 
@@ -587,7 +656,7 @@ fn set_active_profile(
 /// 不变，沙箱链路不断，停沙箱只会扩大失败面）。**本函数不取串行器锁**（调用方命令已持有）。
 fn set_active_profile_txn(
     app: &tauri::AppHandle,
-    state: &State<'_, Mutex<AppState>>,
+    state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
     id: &str,
     skip_verify: bool,
@@ -737,7 +806,7 @@ fn set_active_profile_txn(
 /// 返回是否已把旧代理恢复到位（供调用方据实措辞，修 P2-e）。
 fn restore_proxy_for_active(
     app: &tauri::AppHandle,
-    state: &State<'_, Mutex<AppState>>,
+    state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
     cfg: &config::Config,
     old_active: &str,
@@ -755,29 +824,49 @@ fn restore_proxy_for_active(
 }
 
 #[tauri::command]
-fn start_proxy(
+async fn start_proxy(
     app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || start_proxy_inner_cmd(app, state, lifecycle)).await
+}
+
+fn start_proxy_inner_cmd(
+    app: tauri::AppHandle,
+    state: SharedAppState,
+    lifecycle: SharedLifecycle,
 ) -> Result<serde_json::Value, String> {
     // 经串行器：与切换/连接编辑/清 key/删/停等 ensure_proxy 竞争串行化，防陈旧读起旧配置代理
     // 又写回运行态（修 P1-a，比照 spec §8.1「ensure_proxy 都经一把 app 级 mutex」）。
     lifecycle.with_serialized(|| {
-        let (port, _secret, _action) = ensure_proxy(&app, &state, lifecycle.inner())?;
+        let (port, _secret, _action) = ensure_proxy(&app, &state, lifecycle.as_ref())?;
         Ok(json!({ "port": port }))
     })
 }
 
 /// 「存 key 即验证」：确保代理在跑，再经代理向上游发一个最小请求，据状态码判断 key 是否可用。
 #[tauri::command]
-fn verify_key(
+async fn verify_key(
     app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || verify_key_inner_cmd(app, state, lifecycle)).await
+}
+
+fn verify_key_inner_cmd(
+    app: tauri::AppHandle,
+    state: SharedAppState,
+    lifecycle: SharedLifecycle,
 ) -> Result<serde_json::Value, String> {
     // 经串行器（修 P1-a）：ensure_proxy 与其它生命周期操作不并发交叠。
     lifecycle.with_serialized(|| {
-        let (port, secret, _action) = ensure_proxy(&app, &state, lifecycle.inner())?;
+        let (port, secret, _action) = ensure_proxy(&app, &state, lifecycle.as_ref())?;
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}"#;
         match proc::http_post_status(port, Some(&secret), "/v1/messages", body, 15000) {
             Some(200) => Ok(json!({ "ok": true, "hint": "key 有效，上游已接受。" })),
@@ -825,7 +914,17 @@ fn resolve_probe_key(profile_id: Option<&str>, candidate: &str) -> Result<String
 /// 「获取可用模型」——纯 scratch 探测：只用临时代理探候选 base_url/key 的 /v1/models，
 /// 绝不写 config、不改 AppState、不碰正在服务 Science 的正式代理。
 #[tauri::command]
-fn fetch_models(app: tauri::AppHandle, req: FetchModelsReq) -> Result<serde_json::Value, String> {
+async fn fetch_models(
+    app: tauri::AppHandle,
+    req: FetchModelsReq,
+) -> Result<serde_json::Value, String> {
+    run_blocking(move || fetch_models_inner_cmd(app, req)).await
+}
+
+fn fetch_models_inner_cmd(
+    app: tauri::AppHandle,
+    req: FetchModelsReq,
+) -> Result<serde_json::Value, String> {
     let tid = req.template_id.trim();
     let tpl = templates::by_id(tid).ok_or_else(|| format!("未知模板：{tid}"))?;
     let base_url = if tpl.base_url_editable {
@@ -909,10 +1008,20 @@ fn fetch_models(app: tauri::AppHandle, req: FetchModelsReq) -> Result<serde_json
 }
 
 #[tauri::command]
-fn stop_all(
+async fn stop_all(
     app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || stop_all_inner_cmd(app, state, lifecycle)).await
+}
+
+fn stop_all_inner_cmd(
+    app: tauri::AppHandle,
+    state: SharedAppState,
+    lifecycle: SharedLifecycle,
 ) -> Result<(), String> {
     lifecycle.with_serialized(|| {
         lifecycle.bump_generation(); // 作废任何在途启动（防被停后又拿旧 key 复活）
@@ -927,18 +1036,28 @@ fn stop_all(
 }
 
 #[tauri::command]
-fn one_click_login(
+async fn one_click_login(
     app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
-    lifecycle: State<'_, lifecycle::Lifecycle>,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
 ) -> Result<serde_json::Value, String> {
-    lifecycle.with_serialized(|| one_click_login_inner(app, state, lifecycle.inner()))
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || one_click_login_cmd(app, state, lifecycle)).await
+}
+
+fn one_click_login_cmd(
+    app: tauri::AppHandle,
+    state: SharedAppState,
+    lifecycle: SharedLifecycle,
+) -> Result<serde_json::Value, String> {
+    lifecycle.with_serialized(|| one_click_login_inner(app, state, lifecycle.as_ref()))
 }
 
 /// 一键开始本体（经串行器）：确保代理在跑且健康 → 幂等虚拟登录 → 起沙箱 → 打开 UI。
 fn one_click_login_inner(
     app: tauri::AppHandle,
-    state: State<'_, Mutex<AppState>>,
+    state: SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
 ) -> Result<serde_json::Value, String> {
     // 1~3. 确保代理在跑且健康（内部已查生效 profile、key、探活）。带回本次是复用还是重启。
@@ -1073,12 +1192,12 @@ fn one_click_login_inner(
 }
 
 #[tauri::command]
-fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
+fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
     // 只在锁内取值，锁外做短超时探活。这里是高频 UI 状态灯，
     // 不能反复调用外部 `claude-science status`，否则前端轮询会卡住主线程。
     // 沙箱强身份确认保留在 one_click_login 的启动/复用边界。
     let (pport, secret, sport, adapter, base_url) = {
-        let st = lock(&state);
+        let st = lock(state.inner());
         let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
         let pport = if st.proxy_port != 0 {
             st.proxy_port
@@ -1110,14 +1229,18 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
 }
 
 #[tauri::command]
-fn open_url(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
-    let url = { lock(&state).sandbox_url.clone() };
+fn open_url(state: State<'_, SharedAppState>) -> Result<(), String> {
+    let url = { lock(state.inner()).sandbox_url.clone() };
     let url = url.ok_or("还没有沙箱 URL，请先「一键开始」。")?;
     open_in_browser(&url)
 }
 
 #[tauri::command]
-fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
+async fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
+    run_blocking(move || run_doctor_inner_cmd(app)).await
+}
+
+fn run_doctor_inner_cmd(app: tauri::AppHandle) -> Result<String, String> {
     let root = asset_root(&app).ok_or("找不到 scripts/doctor.sh（打包资源或仓库根均未命中）。")?;
     let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
     let doctor = root.join("scripts/doctor.sh");
@@ -1180,10 +1303,10 @@ fn open_logs() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn quit_app(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<(), String> {
+fn quit_app(app: tauri::AppHandle, state: State<'_, SharedAppState>) -> Result<(), String> {
     // 默认：退 app 停代理、保留沙箱运行（spec §5.1）。
     {
-        let mut st = lock(&state);
+        let mut st = lock(state.inner());
         kill_child(&mut st.proxy);
         st.secret.clear();
     }
@@ -1196,8 +1319,8 @@ fn quit_app(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(Mutex::new(AppState::default()))
-        .manage(lifecycle::Lifecycle::new())
+        .manage(Arc::new(Mutex::new(AppState::default())))
+        .manage(Arc::new(lifecycle::Lifecycle::new()))
         .invoke_handler(tauri::generate_handler![
             get_config,
             list_templates,
@@ -1237,8 +1360,8 @@ pub fn run() {
                 let handle = app.handle().clone();
                 win.on_window_event(move |ev| {
                     if let tauri::WindowEvent::CloseRequested { .. } = ev {
-                        let state = handle.state::<Mutex<AppState>>();
-                        let mut st = lock(&state);
+                        let state = handle.state::<SharedAppState>();
+                        let mut st = lock(state.inner());
                         kill_child(&mut st.proxy);
                         st.secret.clear();
                     }
