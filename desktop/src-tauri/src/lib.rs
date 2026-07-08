@@ -1074,7 +1074,9 @@ fn one_click_login_inner(
 
 #[tauri::command]
 fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
-    // 只在锁内取值，锁外做阻塞探活。
+    // 只在锁内取值，锁外做短超时探活。这里是高频 UI 状态灯，
+    // 不能反复调用外部 `claude-science status`，否则前端轮询会卡住主线程。
+    // 沙箱强身份确认保留在 one_click_login 的启动/复用边界。
     let (pport, secret, sport, adapter, base_url) = {
         let st = lock(&state);
         let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
@@ -1100,9 +1102,9 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
     };
     let uhost = upstream_host(&adapter, &base_url);
     let lights = status_lights(StatusProbeInput {
-        proxy_ok: !secret.is_empty() && proc::http_health(pport, Some(&secret), 300),
-        sandbox_ok: sandbox_running_ours(sport),
-        upstream_ok: !uhost.is_empty() && proc::tcp_reachable(&uhost, 443, 500),
+        proxy_ok: !secret.is_empty() && proc::http_health(pport, Some(&secret), 150),
+        sandbox_ok: proc::http_health(sport, None, 150),
+        upstream_ok: !uhost.is_empty() && proc::tcp_reachable(&uhost, 443, 250),
     });
     json!({ "proxy": lights.proxy, "sandbox": lights.sandbox, "upstream": lights.upstream })
 }
