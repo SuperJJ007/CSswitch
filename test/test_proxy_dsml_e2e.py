@@ -80,7 +80,7 @@ def start_dsml_upstream():
                 c, _ = srv.accept()
             except OSError:
                 return
-            req = c.recv(65536)
+            req = _read_http_request(c)
             is_stream = b'"stream": true' in req or b'"stream":true' in req
             if is_stream:
                 sse = _build_sse()
@@ -96,6 +96,54 @@ def start_dsml_upstream():
 
     threading.Thread(target=serve, daemon=True).start()
     return f"http://127.0.0.1:{port}/up", srv
+
+
+def _read_http_request(sock):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return data
+        data += chunk
+
+    head, sep, body = data.partition(b"\r\n\r\n")
+    content_length = 0
+    for line in head.split(b"\r\n"):
+        name, colon, value = line.partition(b":")
+        if colon and name.strip().lower() == b"content-length":
+            try:
+                content_length = int(value.strip())
+            except ValueError:
+                content_length = 0
+            break
+
+    while len(body) < content_length:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+    return head + sep + body
+
+
+class _ChunkedSocket:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def recv(self, _size):
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+class HttpRequestReader(unittest.TestCase):
+    def test_reads_body_split_after_headers(self):
+        body = b'{"stream": true, "messages":["large enough to split"]}'
+        head = (b"POST /up HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
+        sock = _ChunkedSocket([head[:17], head[17:], body[:9], body[9:]])
+        req = _read_http_request(sock)
+        self.assertEqual(req, head + body)
 
 
 def raw_post(host, port, path, body):

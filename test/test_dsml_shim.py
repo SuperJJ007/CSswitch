@@ -110,6 +110,14 @@ class ParamTyping(unittest.TestCase):
         blk = wrap_typed(P2, "calc", [("n", ' string="true"', "42")])
         self.assertEqual(ds.parse_dsml_tool_calls(blk, NUM)[0]["input"]["n"], "42")
 
+    def test_schema_string_stays_string_without_string_attr(self):
+        # DeepSeek can omit string="true" on string parameters. Schema type string
+        # must win over the JSON fallback, or numeric-looking text is coerced and
+        # the whole tool call gets discarded by validation.
+        blk = wrap_typed(P2, "web_search", [("query", "", "42")])
+        self.assertEqual(ds.parse_dsml_tool_calls(blk, WS),
+                         [{"name": "web_search", "input": {"query": "42"}}])
+
     def test_missing_string_attr_falls_back_json_then_str(self):
         blk = wrap_typed(P2, "calc", [("f", "", "3.5")])
         # f 是 number → 3.5；无 schema 属性的 json 兜底另测
