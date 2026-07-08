@@ -42,15 +42,31 @@ pub(crate) fn proxy_args_for(p: &config::Profile) -> ProxyLaunch {
 }
 
 pub(crate) fn proxy_fingerprint(p: &config::Profile, launch: &ProxyLaunch) -> u64 {
+    proxy_fingerprint_with_runtime(
+        p,
+        launch,
+        gateway_kind_for_adapter(&launch.adapter),
+        current_shim_mode_for_adapter(&launch.adapter),
+    )
+}
+
+pub(crate) fn proxy_fingerprint_with_runtime(
+    p: &config::Profile,
+    launch: &ProxyLaunch,
+    gateway_kind: &str,
+    shim_mode: &str,
+) -> u64 {
     key_fingerprint(&format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         p.template_id,
         p.api_format,
         launch.adapter,
         launch.base_url,
         launch.model,
         launch.thinking_policy,
-        launch.key
+        launch.key,
+        gateway_kind,
+        shim_mode
     ))
 }
 
@@ -89,6 +105,28 @@ pub(crate) fn is_native_adapter(adapter: &str) -> bool {
 
 pub(crate) fn is_openai_adapter(adapter: &str) -> bool {
     matches!(adapter, "openai-custom" | "openai-responses")
+}
+
+pub(crate) fn gateway_kind_for_adapter(_adapter: &str) -> &'static str {
+    "python"
+}
+
+pub(crate) fn normalize_shim_mode(adapter: &str, raw: Option<&str>) -> &'static str {
+    if adapter != "deepseek" {
+        return "off";
+    }
+    match raw.unwrap_or("").trim() {
+        "detect" => "detect",
+        "rewrite" => "rewrite",
+        _ => "off",
+    }
+}
+
+pub(crate) fn current_shim_mode_for_adapter(adapter: &str) -> &'static str {
+    normalize_shim_mode(
+        adapter,
+        std::env::var("CSSWITCH_TOOLUSE_SHIM").ok().as_deref(),
+    )
 }
 
 /// 上游主机名（供 status 上游灯做 TCP 可达性探测）。relay 家族从其 base_url 解析。
@@ -141,9 +179,10 @@ pub(crate) fn relay_missing_model(adapter: &str, model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_format_supported, key_env_for_adapter, key_fingerprint, parse_host, proxy_args_for,
-        proxy_fingerprint, reject_openai_custom_anthropic_base, relay_missing_base_url,
-        relay_missing_model, should_scratch_candidate, upstream_host,
+        assert_format_supported, gateway_kind_for_adapter, key_env_for_adapter, key_fingerprint,
+        normalize_shim_mode, parse_host, proxy_args_for, proxy_fingerprint,
+        proxy_fingerprint_with_runtime, reject_openai_custom_anthropic_base,
+        relay_missing_base_url, relay_missing_model, should_scratch_candidate, upstream_host,
     };
     use crate::config::Profile;
 
@@ -289,6 +328,24 @@ mod tests {
     }
 
     #[test]
+    fn proxy_fingerprint_includes_gateway_and_shim_identity() {
+        let p = Profile {
+            template_id: "deepseek".into(),
+            api_format: "anthropic".into(),
+            base_url: "https://api.deepseek.com/anthropic".into(),
+            api_key: "same-key".into(),
+            model: "same-model".into(),
+            ..Default::default()
+        };
+        let launch = proxy_args_for(&p);
+        let python_off = proxy_fingerprint_with_runtime(&p, &launch, "python", "off");
+        let rust_off = proxy_fingerprint_with_runtime(&p, &launch, "rust", "off");
+        let python_detect = proxy_fingerprint_with_runtime(&p, &launch, "python", "detect");
+        assert_ne!(python_off, rust_off, "gateway 切换必须阻止误复用");
+        assert_ne!(python_off, python_detect, "shim 切换必须阻止误复用");
+    }
+
+    #[test]
     fn parse_host_extracts_host_from_relay_base_url() {
         assert_eq!(
             parse_host("https://byteswarm.ai/claude").as_deref(),
@@ -319,6 +376,17 @@ mod tests {
             "open.bigmodel.cn"
         );
         assert_eq!(upstream_host("", ""), "", "无生效配置 -> 空（灯显黄）");
+    }
+
+    #[test]
+    fn runtime_identity_contract_defaults_to_python_and_deepseek_only_shim() {
+        assert_eq!(gateway_kind_for_adapter("deepseek"), "python");
+        assert_eq!(gateway_kind_for_adapter("openai-custom"), "python");
+        assert_eq!(normalize_shim_mode("deepseek", Some("detect")), "detect");
+        assert_eq!(normalize_shim_mode("deepseek", Some("rewrite")), "rewrite");
+        assert_eq!(normalize_shim_mode("deepseek", Some("bad")), "off");
+        assert_eq!(normalize_shim_mode("relay", Some("rewrite")), "off");
+        assert_eq!(normalize_shim_mode("qwen", Some("detect")), "off");
     }
 
     #[test]

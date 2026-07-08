@@ -3,8 +3,8 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::runtime::provider::{
-    assert_format_supported, is_native_adapter, reject_openai_custom_anthropic_base,
-    relay_missing_model,
+    assert_format_supported, is_native_adapter, is_openai_adapter,
+    reject_openai_custom_anthropic_base, relay_missing_model,
 };
 use crate::{config, scratch, templates};
 
@@ -23,6 +23,71 @@ pub(crate) fn is_main_list_model(id: &str) -> bool {
     false
 }
 
+fn build_capabilities(
+    adapter: &str,
+    api_format: &str,
+    model_required: bool,
+    thinking_policy: &str,
+) -> serde_json::Value {
+    let model_discovery = if is_native_adapter(adapter) {
+        "builtin_static"
+    } else if is_openai_adapter(adapter) || matches!(api_format, "openai_chat" | "openai_responses")
+    {
+        "openai_models_or_manual"
+    } else {
+        "anthropic_models_or_manual"
+    };
+    let tools_hint = match api_format {
+        "openai_chat" | "openai_responses" => "translated",
+        "anthropic" if is_native_adapter(adapter) => "native",
+        "anthropic" => "passthrough",
+        _ => "unknown",
+    };
+    json!({
+        "base_url_required": !is_native_adapter(adapter),
+        "model_required": model_required,
+        "model_discovery": model_discovery,
+        "supports_thinking_policy": !thinking_policy.is_empty(),
+        "thinking_policy": thinking_policy,
+        "supports_tools_hint": tools_hint,
+    })
+}
+
+pub(crate) fn template_capabilities(t: &templates::Template) -> serde_json::Value {
+    build_capabilities(
+        t.adapter,
+        t.api_format,
+        t.requires_model_override,
+        t.thinking_policy,
+    )
+}
+
+pub(crate) fn profile_capabilities(p: &config::Profile) -> serde_json::Value {
+    match templates::by_id(&p.template_id) {
+        Some(t) => {
+            let api_format = if p.api_format.trim().is_empty() {
+                t.api_format
+            } else {
+                &p.api_format
+            };
+            build_capabilities(
+                t.adapter,
+                api_format,
+                t.requires_model_override,
+                t.thinking_policy,
+            )
+        }
+        None => {
+            let api_format = if p.api_format.trim().is_empty() {
+                "anthropic"
+            } else {
+                &p.api_format
+            };
+            build_capabilities("relay", api_format, true, "")
+        }
+    }
+}
+
 /// 组装 get_config 返回体：profiles 的 key 只回掩码，全 key 绝不出后端。
 pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> {
     let cfg = config::load_from(dir).map_err(|e| e.to_string())?;
@@ -35,10 +100,12 @@ pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> 
         .profiles
         .iter()
         .map(|p| {
+            let key_masked = config::mask(&p.api_key);
             json!({
                 "id": p.id, "name": p.name, "template_id": p.template_id, "category": p.category,
                 "api_format": p.api_format, "base_url": p.base_url, "model": p.model,
-                "key": config::mask(&p.api_key), "icon": p.icon, "icon_color": p.icon_color,
+                "key": key_masked.clone(), "has_key": !p.api_key.is_empty(), "key_masked": key_masked,
+                "capabilities": profile_capabilities(p), "icon": p.icon, "icon_color": p.icon_color,
                 "website_url": p.website_url, "sort_index": p.sort_index, "notes": p.notes,
             })
         })
@@ -60,7 +127,7 @@ pub(crate) fn build_list_templates() -> Vec<serde_json::Value> {
                 "adapter": t.adapter, "base_url": t.base_url, "base_url_editable": t.base_url_editable,
                 "requires_model_override": t.requires_model_override,
                 "builtin_models": t.builtin_models, "icon": t.icon, "icon_color": t.icon_color,
-                "website_url": t.website_url,
+                "website_url": t.website_url, "capabilities": template_capabilities(t),
             })
         })
         .collect()
@@ -325,8 +392,8 @@ mod tests {
     use super::{
         build_get_config, build_list_templates, clear_profile_key_inner, create_profile_inner,
         delete_profile_inner, is_main_list_model, merge_and_sort_models, nonactive_probe_verdict,
-        probe_kind_for, probe_kind_for_model, update_profile_connection_inner,
-        update_profile_metadata_inner, ConnectionEdit,
+        probe_kind_for, probe_kind_for_model, profile_capabilities, template_capabilities,
+        update_profile_connection_inner, update_profile_metadata_inner, ConnectionEdit,
     };
     use crate::config;
 
@@ -539,6 +606,13 @@ mod tests {
             p.get("api_key").is_none() || p["api_key"].is_null(),
             "全 key 不出后端"
         );
+        assert_eq!(p["has_key"], true);
+        assert_eq!(p["key_masked"], p["key"], "保留旧 key 字段并补新掩码字段");
+        assert_eq!(p["capabilities"]["model_required"], true);
+        assert_eq!(
+            p["capabilities"]["model_discovery"],
+            "anthropic_models_or_manual"
+        );
     }
 
     #[test]
@@ -566,6 +640,50 @@ mod tests {
         assert!(v.iter().any(|t| t["id"] == "custom-openai-responses"));
         assert!(v.iter().any(|t| t["id"] == "kimi"));
         assert!(v.iter().any(|t| t["id"] == "minimax"));
+        let qwen = v.iter().find(|t| t["id"] == "qwen").unwrap();
+        assert_eq!(qwen["capabilities"]["model_discovery"], "builtin_static");
+        assert_eq!(qwen["capabilities"]["supports_tools_hint"], "translated");
+        let custom = v.iter().find(|t| t["id"] == "custom-openai").unwrap();
+        assert_eq!(
+            custom["capabilities"]["model_discovery"],
+            "openai_models_or_manual"
+        );
+        assert_eq!(custom["capabilities"]["base_url_required"], true);
+    }
+
+    #[test]
+    fn capabilities_are_derived_from_template_contract() {
+        let ds = template_capabilities(crate::templates::by_id("deepseek").unwrap());
+        assert_eq!(ds["base_url_required"], false);
+        assert_eq!(ds["model_required"], false);
+        assert_eq!(ds["model_discovery"], "builtin_static");
+
+        let relay = template_capabilities(crate::templates::by_id("glm").unwrap());
+        assert_eq!(relay["base_url_required"], true);
+        assert_eq!(relay["model_required"], true);
+        assert_eq!(relay["model_discovery"], "anthropic_models_or_manual");
+        assert_eq!(relay["thinking_policy"], "adaptive");
+
+        let p = config::Profile {
+            template_id: "custom-openai-responses".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            profile_capabilities(&p)["model_discovery"],
+            "openai_models_or_manual"
+        );
+    }
+
+    #[test]
+    fn profile_capabilities_follow_profile_api_format_when_present() {
+        let p = config::Profile {
+            template_id: "custom".into(),
+            api_format: "openai_responses".into(),
+            ..Default::default()
+        };
+        let caps = profile_capabilities(&p);
+        assert_eq!(caps["model_discovery"], "openai_models_or_manual");
+        assert_eq!(caps["supports_tools_hint"], "translated");
     }
 
     #[test]
