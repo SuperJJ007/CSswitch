@@ -1,10 +1,13 @@
 import json
 import pathlib
+import sys
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "catalog" / "capabilities.v1.json"
+sys.path.insert(0, str(ROOT / "proxy"))
+import provider_policy as pp
 
 SECTIONS = [
     "providers",
@@ -54,12 +57,26 @@ ALLOWED_ACTIONS = {
 }
 
 REQUIRED_RULE_IDS = {
+    "provider.relay.force-model-shell",
+    "provider.kimi.relay-thinking-enabled",
+    "provider.dashscope.responses-tools-cap",
     "tool.kimi.web_search.server-tool-filter",
     "tool.relay.input-schema-normalize",
+    "tool.deepseek.forced-tool-choice-disable-thinking",
     "tool.dashscope.responses.web_search-drop",
     "mcp.hosted-anthropic.hcls-boundary",
     "science.version.0_1_15_dev.route-diff",
     "transport.connect.anthropic-fastfail-401",
+}
+
+PROXY_RULE_ID_CONSTANTS = {
+    pp.RULE_PROVIDER_RELAY_FORCE_MODEL_SHELL,
+    pp.RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED,
+    pp.RULE_PROVIDER_DASHSCOPE_RESPONSES_TOOLS_CAP,
+    pp.RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER,
+    pp.RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE,
+    pp.RULE_TOOL_DEEPSEEK_FORCED_TOOL_CHOICE_DISABLE_THINKING,
+    pp.RULE_TOOL_DASHSCOPE_RESPONSES_WEB_SEARCH_DROP,
 }
 
 
@@ -105,6 +122,15 @@ class CapabilityCatalogSchema(unittest.TestCase):
         ]
         self.assertEqual(len(ids), len(set(ids)), "catalog rule ids must be unique")
         self.assertTrue(REQUIRED_RULE_IDS.issubset(set(ids)))
+
+    def test_proxy_observability_rule_ids_are_cataloged(self):
+        data = load_catalog()
+        ids = {
+            entry["id"]
+            for section in SECTIONS
+            for entry in data[section]
+        }
+        self.assertTrue(PROXY_RULE_ID_CONSTANTS.issubset(ids))
 
 
 if __name__ == "__main__":

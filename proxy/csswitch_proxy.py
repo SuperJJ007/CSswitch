@@ -406,7 +406,12 @@ def map_responses_tools(tools):
 
 
 def anthropic_to_openai_responses(req):
-    return responses_compat.anthropic_to_openai(
+    out, _metadata = anthropic_to_openai_responses_with_metadata(req)
+    return out
+
+
+def anthropic_to_openai_responses_with_metadata(req):
+    return responses_compat.anthropic_to_openai_with_metadata(
         req,
         _provider_state(req),
         _is_dashscope_responses(),
@@ -610,9 +615,10 @@ class H(BaseHTTPRequestHandler):
         upstream_body, ctx = anthropic_compat.transform_request(areq, state)
         stream = bool(upstream_body.get("stream"))
         n_tools = len(upstream_body.get("tools") or [])
+        rules = ",".join(ctx.rule_ids) if ctx.rule_ids else "-"
         log(f"POST /v1/messages  {ctx.src_model}->{ctx.target_model} stream={stream} "
             f"tools={n_tools} msgs={len(upstream_body.get('messages') or [])}  "
-            f"(入站鉴权已剥离, 直连 {runtime.prov_name})")
+            f"rules={rules}  (入站鉴权已剥离, 直连 {runtime.prov_name})")
         # 鉴权头按 provider 的 auth_style（deepseek x-api-key / relay both）。KEY 只驻内存、不入日志。
         headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
         headers.update(_upstream_auth_headers(runtime))
@@ -715,15 +721,17 @@ class H(BaseHTTPRequestHandler):
         runtime = runtime or current_runtime()
         model_id = areq.get("model", "claude-sonnet-5")
         stream = bool(areq.get("stream"))
+        metadata = {"rule_ids": ()}
         if runtime.prov.get("api_format") == "openai_responses":
-            oreq = anthropic_to_openai_responses(areq)
+            oreq, metadata = anthropic_to_openai_responses_with_metadata(areq)
             msg_count = len(oreq.get("input") or [])
         else:
             oreq = anthropic_to_openai(areq)
             msg_count = len(oreq.get("messages") or [])
         n_tools = len(oreq.get("tools", []))
+        rules = ",".join(metadata.get("rule_ids") or ()) or "-"
         log(f"POST /v1/messages  {model_id}->{oreq['model']} stream={stream} tools={n_tools} "
-            f"msgs={msg_count}  (入站鉴权已剥离, {runtime.prov_name})")
+            f"msgs={msg_count} rules={rules}  (入站鉴权已剥离, {runtime.prov_name})")
         headers = {"Authorization": f"Bearer {runtime.key}", "Content-Type": "application/json"}
         data = json.dumps(oreq).encode()
         try:

@@ -21,6 +21,7 @@ class Ctx:
     nonce: str
     shim_mode: str
     provider: str
+    rule_ids: tuple = ()
 
 
 def _normalize_relay_input_schema(schema):
@@ -53,7 +54,12 @@ def _degrade_missing_tool_choice(upstream):
         upstream["tool_choice"] = {"type": "auto"}
 
 
-def _normalize_relay_tools(upstream):
+def _append_rule_id(rule_ids, rule_id):
+    if rule_ids is not None and rule_id not in rule_ids:
+        rule_ids.append(rule_id)
+
+
+def _normalize_relay_tools(upstream, rule_ids=None):
     """Normalize Anthropic-compatible relay tool schemas before outbound.
 
     Some Anthropic-compatible relay providers reject Claude Science's empty or loose
@@ -74,6 +80,7 @@ def _normalize_relay_tools(upstream):
         clean = dict(tool)
         clean["input_schema"] = _normalize_relay_input_schema(tool.get("input_schema"))
         normalized.append(clean)
+    _append_rule_id(rule_ids, provider_policy.RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE)
     if normalized:
         upstream["tools"] = normalized
     else:
@@ -81,7 +88,7 @@ def _normalize_relay_tools(upstream):
     _degrade_missing_tool_choice(upstream)
 
 
-def _filter_upstream_tools(upstream, target_model, provider):
+def _filter_upstream_tools(upstream, target_model, provider, rule_ids=None):
     """Provider-specific tool compatibility before sending to upstream.
 
     Kimi's Anthropic endpoint treats a tool named ``web_search`` as its own server tool and
@@ -91,12 +98,13 @@ def _filter_upstream_tools(upstream, target_model, provider):
     """
     if provider != "relay":
         return
-    _normalize_relay_tools(upstream)
+    _normalize_relay_tools(upstream, rule_ids)
     if "kimi" in (target_model or "").lower():
         tools = upstream.get("tools")
         if isinstance(tools, list):
             filtered = [t for t in tools if not (isinstance(t, dict) and t.get("name") == "web_search")]
             if len(filtered) != len(tools):
+                _append_rule_id(rule_ids, provider_policy.RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER)
                 if filtered:
                     upstream["tools"] = filtered
                 else:
@@ -109,18 +117,33 @@ def transform_request(body, state):
     等价于旧 _handle_anthropic 的 :695-702 + :714-718。"""
     src = body.get("model", "?")
     target = provider_policy.resolve_model(src, state)
+    rule_ids = []
+    if state.prov_name == "relay" and state.policy.force_model_override and state.relay_force_model:
+        _append_rule_id(rule_ids, provider_policy.RULE_PROVIDER_RELAY_FORCE_MODEL_SHELL)
+    if (
+        state.prov_name == "relay"
+        and state.relay_thinking == "enabled"
+        and "kimi" in (target or "").lower()
+    ):
+        _append_rule_id(rule_ids, provider_policy.RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED)
     upstream = dict(body)
     upstream["model"] = target
     if upstream.get("max_tokens"):
         upstream["max_tokens"] = provider_policy.clamp_max_tokens(
             upstream["max_tokens"], target, state)
-    provider_policy.normalize_thinking(upstream, state.prov_name, state.relay_thinking)
-    _filter_upstream_tools(upstream, target, state.prov_name)
+    provider_policy.normalize_thinking(
+        upstream,
+        state.prov_name,
+        state.relay_thinking,
+        rule_ids=rule_ids,
+    )
+    _filter_upstream_tools(upstream, target, state.prov_name, rule_ids)
     known_tools = {t["name"]: (t.get("input_schema") or {})
                    for t in (body.get("tools") or [])
                    if isinstance(t, dict) and t.get("name")}
     ctx = Ctx(src_model=src, target_model=target, known_tools=known_tools,
-              nonce=state.nonce_factory(), shim_mode=state.shim_mode, provider=state.prov_name)
+              nonce=state.nonce_factory(), shim_mode=state.shim_mode,
+              provider=state.prov_name, rule_ids=tuple(rule_ids))
     return upstream, ctx
 
 
@@ -276,7 +299,10 @@ class _KimiServerToolFilter:
         return self._rewrite_frame(frame, b"\n\n")
 
     def stats(self):
-        return {"dropped_kimi_server_tool_blocks": self._dropped}
+        out = {"dropped_kimi_server_tool_blocks": self._dropped}
+        if self._dropped:
+            out["rule_ids"] = [provider_policy.RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER]
+        return out
 
 
 class _PipelineFilter:
@@ -298,7 +324,14 @@ class _PipelineFilter:
     def stats(self):
         out = {}
         for f in self._filters:
-            out.update(f.stats())
+            stats = f.stats()
+            if "rule_ids" in stats:
+                seen = out.setdefault("rule_ids", [])
+                for rule_id in stats["rule_ids"]:
+                    if rule_id not in seen:
+                        seen.append(rule_id)
+                stats = {k: v for k, v in stats.items() if k != "rule_ids"}
+            out.update(stats)
         return out
 
 

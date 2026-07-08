@@ -92,6 +92,12 @@ class TransformRequest(unittest.TestCase):
         self.assertEqual(up["model"], "kimi-k2.7-code")
         self.assertEqual([t["name"] for t in up["tools"]], ["bash"])
         self.assertEqual(set(ctx.known_tools), {"web_search", "bash"})
+        self.assertEqual(ctx.rule_ids, (
+            pp.RULE_PROVIDER_RELAY_FORCE_MODEL_SHELL,
+            pp.RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED,
+            pp.RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE,
+            pp.RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER,
+        ))
 
     def test_non_kimi_relay_keeps_web_search_tool(self):
         st = _state(dict(cs.PROVIDERS["relay"]), "relay",
@@ -126,6 +132,7 @@ class TransformRequest(unittest.TestCase):
         self.assertEqual(schemas["bad_props"], {"type": "object", "properties": {}})
         self.assertEqual(schemas["not_dict"], {"type": "object", "properties": {}})
         self.assertEqual(set(ctx.known_tools), {"empty", "props_only", "bad_props", "not_dict"})
+        self.assertIn(pp.RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE, ctx.rule_ids)
         self.assertEqual(body["tools"][0]["input_schema"], {}, "不应原地改调用者请求体")
 
     def test_relay_tool_choice_for_removed_tool_degrades_to_auto(self):
@@ -238,6 +245,7 @@ class MakeStreamRewriter(unittest.TestCase):
         self.assertIn(b'"index":2', out)
         self.assertIn(b'"text":"OK"', out)
         self.assertEqual(f.stats()["dropped_kimi_server_tool_blocks"], 2)
+        self.assertEqual(f.stats()["rule_ids"], [pp.RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER])
 
     def test_rewrite_filter_synthesizes_tool_use(self):
         f = ac.make_stream_rewriter(

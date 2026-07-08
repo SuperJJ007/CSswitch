@@ -10,6 +10,16 @@ from typing import Callable
 
 _DATE_SUFFIX = re.compile(r"-\d{8}$")
 
+RULE_PROVIDER_RELAY_FORCE_MODEL_SHELL = "provider.relay.force-model-shell"
+RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED = "provider.kimi.relay-thinking-enabled"
+RULE_PROVIDER_DASHSCOPE_RESPONSES_TOOLS_CAP = "provider.dashscope.responses-tools-cap"
+RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER = "tool.kimi.web_search.server-tool-filter"
+RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE = "tool.relay.input-schema-normalize"
+RULE_TOOL_DEEPSEEK_FORCED_TOOL_CHOICE_DISABLE_THINKING = (
+    "tool.deepseek.forced-tool-choice-disable-thinking"
+)
+RULE_TOOL_DASHSCOPE_RESPONSES_WEB_SEARCH_DROP = "tool.dashscope.responses.web_search-drop"
+
 
 @dataclass(frozen=True)
 class Policy:
@@ -99,7 +109,12 @@ def _enabled_budget(max_tokens):
     return default
 
 
-def normalize_thinking(body, prov_name, relay_thinking=None):
+def _append_rule_id(rule_ids, rule_id):
+    if rule_ids is not None and rule_id not in rule_ids:
+        rule_ids.append(rule_id)
+
+
+def normalize_thinking(body, prov_name, relay_thinking=None, rule_ids=None):
     """thinking 归一化（纯函数，签名与语义与旧 csswitch_proxy 版一致）。
       (A) 强制 tool_choice(any/tool) → disabled：仅 deepseek。
       (B) relay 的 thinking 策略：enabled（如 Kimi）/ adaptive|None（默认，如 MiniMax）。
@@ -109,6 +124,7 @@ def normalize_thinking(body, prov_name, relay_thinking=None):
     tc = body.get("tool_choice")
     forcing = isinstance(tc, dict) and tc.get("type") in ("any", "tool")
     if forcing and prov_name == "deepseek":
+        _append_rule_id(rule_ids, RULE_TOOL_DEEPSEEK_FORCED_TOOL_CHOICE_DISABLE_THINKING)
         body["thinking"] = {"type": "disabled"}
         return body
     if prov_name == "relay" and relay_thinking == "enabled":

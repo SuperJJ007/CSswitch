@@ -103,7 +103,12 @@ class ClampMaxTokens(unittest.TestCase):
 class ThinkingNormalization(unittest.TestCase):
     def test_deepseek_forced_tool_choice_disables_thinking(self):
         body = {"tool_choice": {"type": "any"}, "thinking": {"type": "auto"}}
-        self.assertEqual(pp.normalize_thinking(body, "deepseek")["thinking"], {"type": "disabled"})
+        rule_ids = []
+        self.assertEqual(
+            pp.normalize_thinking(body, "deepseek", rule_ids=rule_ids)["thinking"],
+            {"type": "disabled"},
+        )
+        self.assertEqual(rule_ids, [pp.RULE_TOOL_DEEPSEEK_FORCED_TOOL_CHOICE_DISABLE_THINKING])
 
     def test_relay_forced_tool_choice_not_disabled(self):
         body = {"tool_choice": {"type": "tool", "name": "x"}, "thinking": {"type": "auto"}}

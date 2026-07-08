@@ -91,7 +91,7 @@ class ResponsesMapping(unittest.TestCase):
         old_url = cs.PROV.get("url")
         cs.PROV["url"] = "https://dashscope.aliyuncs.com/compatible-mode/v1/responses"
         try:
-            out = cs.anthropic_to_openai_responses({
+            out, metadata = cs.anthropic_to_openai_responses_with_metadata({
                 "model": "claude-opus-4-8",
                 "messages": [{"role": "user", "content": "hi"}],
                 "max_tokens": 999999,
@@ -101,12 +101,13 @@ class ResponsesMapping(unittest.TestCase):
             cs.PROV["url"] = old_url
         self.assertEqual(out["max_output_tokens"], 8192)
         self.assertEqual(out["tool_choice"], "auto")
+        self.assertEqual(metadata["rule_ids"], ("provider.dashscope.responses-tools-cap",))
 
     def test_dashscope_responses_drops_incompatible_web_search_tool(self):
         old_url = cs.PROV.get("url")
         cs.PROV["url"] = "https://dashscope.aliyuncs.com/compatible-mode/v1/responses"
         try:
-            out = cs.anthropic_to_openai_responses({
+            out, metadata = cs.anthropic_to_openai_responses_with_metadata({
                 "model": "claude-opus-4-8",
                 "messages": [{"role": "user", "content": "hi"}],
                 "tools": [
@@ -118,6 +119,7 @@ class ResponsesMapping(unittest.TestCase):
             cs.PROV["url"] = old_url
         self.assertEqual([t["name"] for t in out["tools"]], ["lookup"])
         self.assertEqual(out["tools"][0]["parameters"]["type"], "object")
+        self.assertEqual(metadata["rule_ids"], ("tool.dashscope.responses.web_search-drop",))
 
     def test_non_dashscope_responses_keeps_web_search_tool(self):
         out = cs.anthropic_to_openai_responses({

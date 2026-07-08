@@ -9,6 +9,11 @@ import json
 import provider_policy
 
 
+def _append_rule_id(rule_ids, rule_id):
+    if rule_ids is not None and rule_id not in rule_ids:
+        rule_ids.append(rule_id)
+
+
 def map_tool_choice(tc, tools):
     has_tools = bool(tools)
     if isinstance(tc, str):
@@ -26,11 +31,12 @@ def map_tool_choice(tc, tools):
     return None
 
 
-def max_output_tokens(req, model, state, has_tools, is_dashscope=False):
+def max_output_tokens(req, model, state, has_tools, is_dashscope=False, rule_ids=None):
     value = provider_policy.clamp_max_tokens(req.get("max_tokens"), model, state)
     if not value:
         return value
     if has_tools and is_dashscope:
+        _append_rule_id(rule_ids, provider_policy.RULE_PROVIDER_DASHSCOPE_RESPONSES_TOOLS_CAP)
         return min(int(value), 8192)
     return value
 
@@ -55,13 +61,14 @@ def normalize_tool_parameters(schema):
     return out
 
 
-def map_tools(tools, is_dashscope=False):
+def map_tools(tools, is_dashscope=False, rule_ids=None):
     out = []
     for t in tools or []:
         name = t.get("name")
         if not name:
             continue
         if is_dashscope and name == "web_search":
+            _append_rule_id(rule_ids, provider_policy.RULE_TOOL_DASHSCOPE_RESPONSES_WEB_SEARCH_DROP)
             continue
         out.append({
             "type": "function",
@@ -83,6 +90,12 @@ def _as_text(value):
 
 
 def anthropic_to_openai(req, state, is_dashscope=False):
+    out, _metadata = anthropic_to_openai_with_metadata(req, state, is_dashscope)
+    return out
+
+
+def anthropic_to_openai_with_metadata(req, state, is_dashscope=False):
+    rule_ids = []
     sys_prompt = req.get("system")
     if isinstance(sys_prompt, list):
         sys_prompt = "\n".join(b.get("text", "") for b in sys_prompt if isinstance(b, dict))
@@ -129,8 +142,15 @@ def anthropic_to_openai(req, state, is_dashscope=False):
     }
     if sys_prompt:
         out["instructions"] = sys_prompt
-    tools = map_tools(req.get("tools"), is_dashscope)
-    token_limit = max_output_tokens(req, out["model"], state, bool(tools), is_dashscope)
+    tools = map_tools(req.get("tools"), is_dashscope, rule_ids)
+    token_limit = max_output_tokens(
+        req,
+        out["model"],
+        state,
+        bool(tools),
+        is_dashscope,
+        rule_ids,
+    )
     if token_limit:
         out["max_output_tokens"] = token_limit
     if req.get("temperature") is not None:
@@ -142,7 +162,7 @@ def anthropic_to_openai(req, state, is_dashscope=False):
     tcm = map_tool_choice(req.get("tool_choice"), tools)
     if tcm is not None:
         out["tool_choice"] = tcm
-    return out
+    return out, {"rule_ids": tuple(rule_ids)}
 
 
 def output_text(item):
