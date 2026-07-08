@@ -386,7 +386,7 @@ class BuildModelsResponse(unittest.TestCase):
         cs.PROV_NAME = "relay"
         cs.RELAY_FORCE_MODEL = None
         saved_fetch = cs.fetch_relay_models
-        cs.fetch_relay_models = lambda: [{"type": "model", "id": "glm-4.6"}]
+        cs.fetch_relay_models = lambda runtime=None: [{"type": "model", "id": "glm-4.6"}]
         try:
             code, body = cs.build_models_response()
         finally:

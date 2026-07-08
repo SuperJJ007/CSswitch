@@ -35,6 +35,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import dsml_shim
@@ -178,6 +179,36 @@ RELAY_THINKING = None
 # （byteswarm 实测），故所有上游请求统一带一个非 bot 的 UA。
 UPSTREAM_UA = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSSwitch)"
 
+
+@dataclass(frozen=True)
+class RuntimeState:
+    prov: dict
+    prov_name: str
+    key: str
+    auth_secret: str
+    relay_models: list
+    relay_force_model: str
+    relay_thinking: str
+    shim_mode: str
+
+
+def current_runtime():
+    """Snapshot mutable module runtime into one object for request handling.
+
+    Tests still patch the legacy globals directly; this thin boundary keeps those tests
+    working while reducing how far global state leaks through the request path.
+    """
+    return RuntimeState(
+        prov=PROV,
+        prov_name=PROV_NAME,
+        key=KEY,
+        auth_secret=AUTH_SECRET,
+        relay_models=RELAY_MODELS,
+        relay_force_model=RELAY_FORCE_MODEL,
+        relay_thinking=RELAY_THINKING,
+        shim_mode=SHIM_MODE,
+    )
+
 # ---------- #3: targeted fast-fail（沙箱「Switching organization」卡死修复） ----------
 # 沙箱 Science 启动时会对 claude.ai/api/oauth/profile 发【阻塞式】请求解析组织；
 # 在到不了 claude.ai 的网络上超时重试 → UI 卡在 "Switching organization"。
@@ -222,16 +253,17 @@ def load_key(prov, args):
     return None
 
 
-def _provider_state(areq):
+def _provider_state(areq, runtime=None):
     """从模块全局一次性组装 ProviderState（骨架侧），传给 compat / policy。
     nonce_factory 捕获 areq，保留旧 id(areq) 派生（字节级等价）。"""
+    runtime = runtime or current_runtime()
     return provider_policy.ProviderState(
-        policy=provider_policy.policy_from_prov(PROV),
-        prov_name=PROV_NAME,
-        relay_force_model=RELAY_FORCE_MODEL,
-        relay_models=RELAY_MODELS,
-        relay_thinking=RELAY_THINKING,
-        shim_mode=SHIM_MODE,
+        policy=provider_policy.policy_from_prov(runtime.prov),
+        prov_name=runtime.prov_name,
+        relay_force_model=runtime.relay_force_model,
+        relay_models=runtime.relay_models,
+        relay_thinking=runtime.relay_thinking,
+        shim_mode=runtime.shim_mode,
         nonce_factory=lambda: f"{id(areq) & 0xffffff:x}",
     )
 
@@ -344,52 +376,55 @@ def openai_endpoint(base, suffix):
     return root + suffix
 
 
-def _upstream_auth_headers():
+def _upstream_auth_headers(runtime=None):
     """上游鉴权头：按当前 provider 的 auth_style 装 x-api-key / bearer / both。
     deepseek 未设 → 默认 x-api-key（保持原状）；relay = both。"""
-    style = PROV.get("auth_style", "x-api-key")
+    runtime = runtime or current_runtime()
+    style = runtime.prov.get("auth_style", "x-api-key")
     h = {}
     if style in ("x-api-key", "both"):
-        h["x-api-key"] = KEY
+        h["x-api-key"] = runtime.key
     if style in ("bearer", "both"):
-        h["Authorization"] = f"Bearer {KEY}"
+        h["Authorization"] = f"Bearer {runtime.key}"
     return h
 
 
-def fetch_relay_models():
+def fetch_relay_models(runtime=None):
     """回源拉上游模型列表，归一化成 Science 可消费的模型列表。relay 会刷新
     RELAY_MODELS 缓存（供 resolve_model 贴合）；openai-custom 仅用于模型发现。返回 list（可空）。"""
     global RELAY_MODELS
-    murl = PROV.get("models_url")
+    runtime = runtime or current_runtime()
+    murl = runtime.prov.get("models_url")
     if not murl:
         return []
-    headers = dict(_upstream_auth_headers())
-    if PROV_NAME == "relay":
+    headers = dict(_upstream_auth_headers(runtime))
+    if runtime.prov_name == "relay":
         headers["anthropic-version"] = "2023-06-01"
     raw = http_get_json(murl, headers)
     out, ids = model_discovery.normalize_models_response(raw)
-    if ids and PROV_NAME == "relay":
+    if ids and runtime.prov_name == "relay":
         RELAY_MODELS = ids
     return out
 
 
-def build_models_response():
+def build_models_response(runtime=None):
     """装配 /v1/models 响应，返回 (状态码, body dict)。协议锁定（修评审 P2-2）：
       - relay/openai-custom 回源成功 → (200, {data:[…含 supports_tools…]})。
       - 回源 HTTPError → (上游同状态码, {error_kind:"upstream", upstream_status, message})，
         绝不吞成 200+静态（否则掩盖坏 key）。builtin 兜底交 Rust 命令决定。
       - 网络异常 → (502, {error_kind:"network", upstream_status:None, message})。
       - 非 relay（无 models_url，deepseek/qwen）→ (200, {静态选择器列表})，行为不变。"""
-    if PROV.get("models_url"):
-        if RELAY_FORCE_MODEL:
+    runtime = runtime or current_runtime()
+    if runtime.prov.get("models_url"):
+        if runtime.relay_force_model:
             # force（Science 常驻代理）：只返回一个壳，Science 主列表显示真实模型名。
             # 出站由 resolve_model 的 force 分支覆盖，无需 model_map。app 的 fetch_models
             # 不设 RELAY_FORCE_MODEL，故仍走下面回源拿真实 id 供用户选（两个消费者切分）。
-            log(f"GET /v1/models -> {PROV_NAME}(force 借壳): {RELAY_FORCE_MODEL}")
-            return model_discovery.force_shell_response(RELAY_FORCE_MODEL)
+            log(f"GET /v1/models -> {runtime.prov_name}(force 借壳): {runtime.relay_force_model}")
+            return model_discovery.force_shell_response(runtime.relay_force_model)
         try:
-            data = fetch_relay_models()
-            log(f"GET /v1/models -> {PROV_NAME}(回源): {len(data)} 个模型")
+            data = fetch_relay_models(runtime)
+            log(f"GET /v1/models -> {runtime.prov_name}(回源): {len(data)} 个模型")
             return model_discovery.live_models_response(data)
         except urllib.error.HTTPError as e:
             detail = ""
@@ -397,14 +432,14 @@ def build_models_response():
                 detail = e.read().decode("utf-8", "replace")[:200]
             except Exception:
                 pass
-            log(f"GET /v1/models -> {PROV_NAME} 回源 HTTP {e.code}（保留状态码，不回静态）")
+            log(f"GET /v1/models -> {runtime.prov_name} 回源 HTTP {e.code}（保留状态码，不回静态）")
             return e.code, {"error_kind": "upstream", "upstream_status": e.code,
                             "message": f"upstream {e.code}: {detail}"}
         except Exception as e:
-            log(f"GET /v1/models -> {PROV_NAME} 回源网络异常，本地回 502: {e}")
+            log(f"GET /v1/models -> {runtime.prov_name} 回源网络异常，本地回 502: {e}")
             return 502, {"error_kind": "network", "upstream_status": None, "message": str(e)}
     # 非 relay：静态选择器列表（deepseek/qwen）。
-    return model_discovery.static_models_response(PROV["models"])
+    return model_discovery.static_models_response(runtime.prov["models"])
 
 
 # ---------- Anthropic -> OpenAI 翻译（qwen 路径） ----------
@@ -425,7 +460,7 @@ def responses_max_output_tokens(req, model, state, has_tools):
 
 
 def _is_dashscope_responses():
-    return responses_compat.is_dashscope_responses(PROV)
+    return responses_compat.is_dashscope_responses(current_runtime().prov)
 
 
 def normalize_responses_tool_parameters(schema):
@@ -487,9 +522,10 @@ class H(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _auth_ok(self):
-        if not AUTH_SECRET:
+        runtime = current_runtime()
+        if not runtime.auth_secret:
             return True
-        prefix = "/" + AUTH_SECRET
+        prefix = "/" + runtime.auth_secret
         if self.path == prefix or self.path.startswith(prefix + "/"):
             self.path = self.path[len(prefix):] or "/"
             return True
@@ -505,11 +541,12 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._auth_ok():
             return
+        runtime = current_runtime()
         if self.path.startswith("/v1/models"):
-            code, body = build_models_response()
+            code, body = build_models_response(runtime)
             self._send_json(code, body)
         elif self.path.startswith("/health"):
-            self._send_json(200, {"status": "ok", "provider": PROV_NAME})
+            self._send_json(200, {"status": "ok", "provider": runtime.prov_name})
         else:
             self._send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": self.path}})
 
@@ -552,10 +589,11 @@ class H(BaseHTTPRequestHandler):
                                "n_tools": len(areq.get("tools") or [])}, _f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
-        if PROV["mode"] == "anthropic":
-            self._handle_anthropic(areq)
+        runtime = current_runtime()
+        if runtime.prov["mode"] == "anthropic":
+            self._handle_anthropic(areq, runtime)
         else:
-            self._handle_openai(areq)
+            self._handle_openai(areq, runtime)
 
     # ---- HTTP CONNECT 隧道：Anthropic 域名 fast-fail、其余透传（修 #3） ----
     def do_CONNECT(self):
@@ -632,17 +670,18 @@ class H(BaseHTTPRequestHandler):
                     return
 
     # ---- DeepSeek：Anthropic 原生透传（改模型名+换鉴权+夹 max_tokens+重试） ----
-    def _handle_anthropic(self, areq):
-        state = _provider_state(areq)
+    def _handle_anthropic(self, areq, runtime=None):
+        runtime = runtime or current_runtime()
+        state = _provider_state(areq, runtime)
         upstream_body, ctx = anthropic_compat.transform_request(areq, state)
         stream = bool(upstream_body.get("stream"))
         n_tools = len(upstream_body.get("tools") or [])
         log(f"POST /v1/messages  {ctx.src_model}->{ctx.target_model} stream={stream} "
             f"tools={n_tools} msgs={len(upstream_body.get('messages') or [])}  "
-            f"(入站鉴权已剥离, 直连 {PROV_NAME})")
+            f"(入站鉴权已剥离, 直连 {runtime.prov_name})")
         # 鉴权头按 provider 的 auth_style（deepseek x-api-key / relay both）。KEY 只驻内存、不入日志。
         headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
-        headers.update(_upstream_auth_headers())
+        headers.update(_upstream_auth_headers(runtime))
         data = json.dumps(upstream_body).encode()
         headers_sent = False
         try:
@@ -665,7 +704,7 @@ class H(BaseHTTPRequestHandler):
                         self.wfile.write(hex(len(b))[2:].encode() + b"\r\n" + b + b"\r\n")
                         self.wfile.flush()
 
-                r, first, _ct = _open_stream_with_keepalive(_wc, PROV["url"], data, headers)
+                r, first, _ct = _open_stream_with_keepalive(_wc, runtime.prov["url"], data, headers)
                 with r:
                     # off / 无工具 → None（骨架直接透传，零开销）；detect / rewrite → 统一 filter。
                     f = anthropic_compat.make_stream_rewriter(ctx)
@@ -693,16 +732,16 @@ class H(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 st = f.stats() if f is not None else {}
                 if st.get("synthesized"):
-                    log(f"  <- {PROV_NAME} 流式 DSML 改写 OK（合成 tool_use×{st['tool_n']}）")
+                    log(f"  <- {runtime.prov_name} 流式 DSML 改写 OK（合成 tool_use×{st['tool_n']}）")
                 elif st.get("found"):
-                    log(f"  <- {PROV_NAME} 流式透传 OK（!! detect：本响应含 DSML 泄漏，未改写）")
+                    log(f"  <- {runtime.prov_name} 流式透传 OK（!! detect：本响应含 DSML 泄漏，未改写）")
                 else:
-                    log(f"  <- {PROV_NAME} 流式透传 OK")
+                    log(f"  <- {runtime.prov_name} 流式透传 OK")
             else:
-                body_bytes, ct = http_post(PROV["url"], data, headers)
+                body_bytes, ct = http_post(runtime.prov["url"], data, headers)
                 body_bytes, stats = anthropic_compat.rewrite_nonstream(body_bytes, ctx)
                 if stats.get("rewritten"):
-                    log(f"  <- {PROV_NAME} 非流式 DSML 改写 OK（展开 tool_use）")
+                    log(f"  <- {runtime.prov_name} 非流式 DSML 改写 OK（展开 tool_use）")
                 elif stats.get("found"):
                     log(f"  !! detect：非流式响应含 DSML 泄漏，未改写")
                 self.send_response(200)
@@ -712,7 +751,7 @@ class H(BaseHTTPRequestHandler):
                 headers_sent = True
                 self.wfile.write(body_bytes)
                 if "rewritten" not in stats:
-                    log(f"  <- {PROV_NAME} 非流式透传 OK")
+                    log(f"  <- {runtime.prov_name} 非流式透传 OK")
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:400]
             log(f"  !! 上游 HTTP {e.code}: {detail}")
@@ -738,10 +777,11 @@ class H(BaseHTTPRequestHandler):
                     "type": "api_error", "message": str(e)}})
 
     # ---- Qwen：翻译到 OpenAI，非流式取全再按需 SSE 回放 ----
-    def _handle_openai(self, areq):
+    def _handle_openai(self, areq, runtime=None):
+        runtime = runtime or current_runtime()
         model_id = areq.get("model", "claude-sonnet-5")
         stream = bool(areq.get("stream"))
-        if PROV.get("api_format") == "openai_responses":
+        if runtime.prov.get("api_format") == "openai_responses":
             oreq = anthropic_to_openai_responses(areq)
             msg_count = len(oreq.get("input") or [])
         else:
@@ -749,13 +789,13 @@ class H(BaseHTTPRequestHandler):
             msg_count = len(oreq.get("messages") or [])
         n_tools = len(oreq.get("tools", []))
         log(f"POST /v1/messages  {model_id}->{oreq['model']} stream={stream} tools={n_tools} "
-            f"msgs={msg_count}  (入站鉴权已剥离, {PROV_NAME})")
-        headers = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
+            f"msgs={msg_count}  (入站鉴权已剥离, {runtime.prov_name})")
+        headers = {"Authorization": f"Bearer {runtime.key}", "Content-Type": "application/json"}
         data = json.dumps(oreq).encode()
         try:
-            raw, _ct = http_post(PROV["url"], data, headers)
+            raw, _ct = http_post(runtime.prov["url"], data, headers)
             oresp = json.loads(raw)
-            if PROV.get("api_format") == "openai_responses":
+            if runtime.prov.get("api_format") == "openai_responses":
                 aresp = openai_responses_to_anthropic(oresp, model_id)
             else:
                 aresp = openai_to_anthropic(oresp, model_id)
@@ -763,7 +803,7 @@ class H(BaseHTTPRequestHandler):
                 self._replay_as_sse(aresp)
             else:
                 self._send_json(200, aresp)
-            log(f"  <- {PROV_NAME} OK (blocks={len(aresp['content'])} stop={aresp['stop_reason']})")
+            log(f"  <- {runtime.prov_name} OK (blocks={len(aresp['content'])} stop={aresp['stop_reason']})")
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:400]
             log(f"  !! 上游 HTTP {e.code}: {detail}")
