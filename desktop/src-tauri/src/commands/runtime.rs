@@ -7,6 +7,9 @@ use serde_json::json;
 use tauri::State;
 
 use crate::runtime::diagnostics::{status_lights, StatusProbeInput};
+use crate::runtime::operation::{
+    self, OperationKind, OperationStage, OperationTrace, POLL_INTERVAL_MS,
+};
 use crate::runtime::profile::merge_and_sort_models;
 use crate::runtime::provider::{
     assert_format_supported, is_native_adapter, is_openai_adapter, key_env_for_adapter,
@@ -35,13 +38,14 @@ fn ensure_proxy(
     app: &tauri::AppHandle,
     state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
+    trace: Option<&OperationTrace>,
 ) -> Result<(u16, String, ProxyAction), String> {
     let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
     let profile = cfg
         .active_profile()
         .cloned()
         .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
-    start_proxy_for(app, state, lifecycle, &profile)
+    start_proxy_for(app, state, lifecycle, &profile, trace)
 }
 
 /// 用【给定 profile】（不读 active）起代理并探活；返回 (端口, secret, 动作)。
@@ -58,6 +62,7 @@ pub(crate) fn start_proxy_for(
     state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
     profile: &config::Profile,
+    trace: Option<&OperationTrace>,
 ) -> Result<(u16, String, ProxyAction), String> {
     assert_format_supported(profile)?;
     let launch = proxy_args_for(profile);
@@ -106,8 +111,18 @@ pub(crate) fn start_proxy_for(
             && st.proxy_port == port
             && st.provider == launch.adapter
             && st.key_fp == key_fp
-            && proc::http_health(port, Some(&st.secret), 500)
+            && proc::http_health(
+                port,
+                Some(&st.secret),
+                operation::PROXY_REUSE_HEALTH_TIMEOUT_MS,
+            )
         {
+            if let Some(t) = trace {
+                t.stage(
+                    OperationStage::ProxyHealth,
+                    format!("reused port={port} adapter={}", launch.adapter),
+                );
+            }
             return Ok((port, st.secret.clone(), ProxyAction::Reused));
         }
         // 端口要让给新进程 → 先杀掉旧占用者（st.proxy）与同端口孤儿；期间 st.proxy=None。
@@ -125,6 +140,12 @@ pub(crate) fn start_proxy_for(
         let logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(&py);
+        if let Some(t) = trace {
+            t.stage(
+                OperationStage::ProxySpawn,
+                format!("port={port} adapter={}", launch.adapter),
+            );
+        }
         cmd.arg(&script)
             .arg("--provider")
             .arg(&launch.adapter)
@@ -160,12 +181,18 @@ pub(crate) fn start_proxy_for(
 
     // 探活最多 ~4s（AppState 锁外，不阻塞 status 等命令）。
     let mut ok = false;
-    for _ in 0..40 {
-        std::thread::sleep(Duration::from_millis(100));
-        if proc::http_health(port, Some(&secret), 400) {
+    for _ in 0..(operation::PROXY_HEALTH_BUDGET_MS / POLL_INTERVAL_MS) {
+        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        if proc::http_health(port, Some(&secret), operation::LOCAL_HEALTH_TIMEOUT_MS) {
             ok = true;
             break;
         }
+    }
+    if let Some(t) = trace {
+        t.stage(
+            OperationStage::ProxyHealth,
+            if ok { "ready" } else { "not_ready" },
+        );
     }
     if !ok {
         // 探活失败：杀掉自己刚起的 child（它从未写入 st.proxy，绝不留孤儿）。
@@ -356,7 +383,10 @@ fn start_proxy_inner_cmd(
     // 经串行器：与切换/连接编辑/清 key/删/停等 ensure_proxy 竞争串行化，防陈旧读起旧配置代理
     // 又写回运行态（修 P1-a，比照 spec §8.1「ensure_proxy 都经一把 app 级 mutex」）。
     lifecycle.with_serialized(|| {
-        let (port, _secret, _action) = ensure_proxy(&app, &state, lifecycle.as_ref())?;
+        let trace = OperationTrace::start(OperationKind::StartProxy, "command=start_proxy");
+        let (port, _secret, _action) =
+            ensure_proxy(&app, &state, lifecycle.as_ref(), Some(&trace))?;
+        trace.finish(format!("ok port={port}"));
         Ok(json!({ "port": port }))
     })
 }
@@ -380,18 +410,39 @@ fn verify_key_inner_cmd(
 ) -> Result<serde_json::Value, String> {
     // 经串行器（修 P1-a）：ensure_proxy 与其它生命周期操作不并发交叠。
     lifecycle.with_serialized(|| {
-        let (port, secret, _action) = ensure_proxy(&app, &state, lifecycle.as_ref())?;
+        let trace = OperationTrace::start(OperationKind::VerifyKey, "command=verify_key");
+        let (port, secret, _action) =
+            ensure_proxy(&app, &state, lifecycle.as_ref(), Some(&trace))?;
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}"#;
-        match proc::http_post_status(port, Some(&secret), "/v1/messages", body, 15000) {
-            Some(200) => Ok(json!({ "ok": true, "hint": "key 有效，上游已接受。" })),
-            Some(code @ (401 | 403)) => Ok(
-                json!({ "ok": false, "hint": format!("上游拒绝（{code}），key 可能无效或无权限。") }),
-            ),
-            Some(code) => Ok(json!({
-                "ok": false,
-                "hint": format!("上游返回 {code}，可能是 key 无效、额度不足或上游异常。")
-            })),
-            None => Err("验证请求无响应（多为网络或上游不通）。".to_string()),
+        trace.stage(OperationStage::UpstreamProbe, "POST /v1/messages via active proxy");
+        match proc::http_post_status(
+            port,
+            Some(&secret),
+            "/v1/messages",
+            body,
+            operation::VERIFY_KEY_TIMEOUT_MS,
+        ) {
+            Some(200) => {
+                trace.finish("ok status=200");
+                Ok(json!({ "ok": true, "hint": "key 有效，上游已接受。" }))
+            }
+            Some(code @ (401 | 403)) => {
+                trace.finish(format!("rejected status={code}"));
+                Ok(
+                    json!({ "ok": false, "hint": format!("上游拒绝（{code}），key 可能无效或无权限。") }),
+                )
+            }
+            Some(code) => {
+                trace.finish(format!("upstream_status={code}"));
+                Ok(json!({
+                    "ok": false,
+                    "hint": format!("上游返回 {code}，可能是 key 无效、额度不足或上游异常。")
+                }))
+            }
+            None => {
+                trace.finish("error=no_response");
+                Err("验证请求无响应（多为网络或上游不通）。".to_string())
+            }
         }
     })
 }
@@ -456,6 +507,10 @@ fn fetch_models_inner_cmd(
     let py = proc::find_exe("python3").ok_or("缺少依赖 python3（起临时代理需要）。")?;
     let script = root.join("proxy/csswitch_proxy.py");
     let adapter = templates::adapter_for(tid);
+    let trace = OperationTrace::start(
+        OperationKind::FetchModels,
+        format!("template_id={tid} adapter={adapter}"),
+    );
 
     let res = scratch::scratch_probe(
         &py,
@@ -469,10 +524,12 @@ fn fetch_models_inner_cmd(
             relay_thinking: tpl.thinking_policy,
         },
         scratch::ProbeKind::Models,
+        Some(&trace),
     );
     let builtin = tpl.builtin_models;
     match scratch::classify(res.status) {
         scratch::ProbeOutcome::Ok => {
+            trace.stage(OperationStage::ScratchUpstreamProbe, "outcome=ok");
             let v: serde_json::Value =
                 serde_json::from_str(&res.body).map_err(|e| format!("解析模型列表失败：{e}"))?;
             let live: Vec<(String, Option<bool>)> = v
@@ -489,23 +546,27 @@ fn fetch_models_inner_cmd(
                 })
                 .unwrap_or_default();
             if live.is_empty() {
+                trace.finish("ok source=builtin empty_live");
                 return Ok(json!({
                     "models": merge_and_sort_models(vec![], builtin),
                     "source": "builtin", "error_kind": null, "upstream_status": 200
                 }));
             }
+            trace.finish(format!("ok source=live count={}", live.len()));
             Ok(json!({
                 "models": merge_and_sort_models(live, builtin),
                 "source": "live", "error_kind": null, "upstream_status": 200
             }))
         }
         scratch::ProbeOutcome::Auth(code) => {
+            trace.finish(format!("rejected status={code}"));
             Err(format!("上游拒绝（{code}），key 或权限可能有误。"))
         }
         // 非 200 且非 Auth：一律 builtin 兜底，但按语义分「发现不支持」(4xx) 与「网络/上游临时」(5xx/429/无响应)，
         // 供前端区分提示（spec v3 §3.4.3）。绝不把 Auth 混进来掩盖坏 key。
         other => {
             let source = scratch::discovery_fallback_source(&other);
+            trace.finish(format!("fallback source={source} outcome={other:?}"));
             let error_kind = if source == "network" {
                 json!("network")
             } else {
@@ -574,8 +635,9 @@ fn one_click_login_inner(
     state: SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
 ) -> Result<serde_json::Value, String> {
+    let trace = OperationTrace::start(OperationKind::OneClickLogin, "command=one_click_login");
     // 1~3. 确保代理在跑且健康（内部已查生效 profile、key、探活）。带回本次是复用还是重启。
-    let (pport, secret, proxy_action) = ensure_proxy(&app, &state, lifecycle)?;
+    let (pport, secret, proxy_action) = ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
 
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
@@ -601,6 +663,10 @@ fn one_click_login_inner(
                 Ok(()) => format!("{base}，已重新打开 Science。"),
                 Err(_) => format!("{base}，服务已就绪，请手动打开：{url}"),
             };
+            trace.finish(format!(
+                "ok action=reopened proxy_action={}",
+                proxy_action.as_str()
+            ));
             return Ok(json!({ "url": url, "msg": msg, "action": "reopened" }));
         }
         {
@@ -613,6 +679,7 @@ fn one_click_login_inner(
     let root = asset_root(&app)
         .ok_or("找不到 scripts/launch-virtual-sandbox.sh（打包资源或仓库根均未命中）。")?;
 
+    trace.stage(OperationStage::SandboxLogin, "ensure_virtual_login");
     let (forged, login_action) =
         oauth_forge::ensure_virtual_login(&auth_dir, "virtual@localhost.invalid", &sbx_home)
             .map_err(|e| format!("写虚拟登录失败：{e}"))?;
@@ -639,6 +706,7 @@ fn one_click_login_inner(
         );
     }
     let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
+    trace.stage(OperationStage::SandboxLaunch, format!("port={sport}"));
     let status = Command::new("zsh")
         .arg(&launch)
         .arg("--port")
@@ -653,24 +721,30 @@ fn one_click_login_inner(
         .map_err(|e| format!("起沙箱失败：{e}"))?;
     if !status.success() {
         let tail = redact(&tail_file(&log_path("sandbox.log"), 600), &secret);
+        trace.finish("error=sandbox_launch_failed");
         return Err(format!("起沙箱脚本失败。\n{tail}"));
     }
 
     // 5. 轮询沙箱 /health 直到就绪或超时（~8s）。
     let mut ok = false;
-    for _ in 0..80 {
-        std::thread::sleep(Duration::from_millis(100));
-        if proc::http_health(sport, None, 400) {
+    for _ in 0..(operation::SANDBOX_HEALTH_BUDGET_MS / POLL_INTERVAL_MS) {
+        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        if proc::http_health(sport, None, operation::LOCAL_HEALTH_TIMEOUT_MS) {
             ok = true;
             break;
         }
     }
+    trace.stage(
+        OperationStage::SandboxHealth,
+        if ok { "ready" } else { "not_ready" },
+    );
     if !ok {
         let tail = redact(&tail_file(&log_path("sandbox.log"), 600), &secret);
         {
             let mut st = lock(&state);
             let _ = stop_sandbox_state(&app, &mut st);
         }
+        trace.finish("error=sandbox_health_timeout");
         return Err(format!(
             "沙箱起后探活超时（端口 {sport}）。已尝试停掉刚起的沙箱。\n{tail}"
         ));
@@ -682,6 +756,7 @@ fn one_click_login_inner(
             let mut st = lock(&state);
             let _ = stop_sandbox_state(&app, &mut st);
         }
+        trace.finish("error=sandbox_identity_mismatch");
         return Err(format!(
             "端口 {sport} 有服务响应，但按 data-dir 确认不是本沙箱 Science（疑似被其它服务占用）。已尝试停掉刚起的沙箱。"
         ));
@@ -702,6 +777,11 @@ fn one_click_login_inner(
         Ok(()) => format!("{started}。"),
         Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
     };
+    trace.stage(OperationStage::OpenBrowser, "done");
+    trace.finish(format!(
+        "ok action=started proxy_action={}",
+        proxy_action.as_str()
+    ));
     Ok(json!({ "url": url, "msg": msg, "action": "started" }))
 }
 
@@ -735,9 +815,11 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
     };
     let uhost = upstream_host(&adapter, &base_url);
     let lights = status_lights(StatusProbeInput {
-        proxy_ok: !secret.is_empty() && proc::http_health(pport, Some(&secret), 150),
-        sandbox_ok: proc::http_health(sport, None, 150),
-        upstream_ok: !uhost.is_empty() && proc::tcp_reachable(&uhost, 443, 250),
+        proxy_ok: !secret.is_empty()
+            && proc::http_health(pport, Some(&secret), operation::STATUS_HEALTH_TIMEOUT_MS),
+        sandbox_ok: proc::http_health(sport, None, operation::STATUS_HEALTH_TIMEOUT_MS),
+        upstream_ok: !uhost.is_empty()
+            && proc::tcp_reachable(&uhost, 443, operation::STATUS_UPSTREAM_TIMEOUT_MS),
     });
     json!({ "proxy": lights.proxy, "sandbox": lights.sandbox, "upstream": lights.upstream })
 }

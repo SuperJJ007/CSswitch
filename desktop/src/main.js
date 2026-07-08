@@ -246,6 +246,13 @@ function scheduleBusyMsg(ms, op, text) {
   busyMsgTimers.push(timer);
 }
 
+function startFetchModelsFeedback(id) {
+  clearBusyMsgTimers();
+  setMsg("获取模型中：正在用临时代理探 /v1/models，网络慢时可能需要约 20 秒…");
+  scheduleBusyMsg(4500, { kind: "fetchModels", id }, "仍在等待上游模型列表响应。不会改动当前配置或正在运行的代理。");
+  scheduleBusyMsg(18000, { kind: "fetchModels", id }, "模型发现接近等待上限。若上游不支持或暂时不通，会回退到内置候选并据实提示。");
+}
+
 function startActivateFeedback(id, skipVerify) {
   const name = profileName(id);
   clearBusyMsgTimers();
@@ -257,6 +264,25 @@ function startActivateFeedback(id, skipVerify) {
   setMsg("正在启用「" + name + "」：先用临时代理校验上游，网络慢时可能需要约 20 秒…");
   scheduleBusyMsg(4500, { kind: "activate", id }, "仍在等待上游校验响应。可以继续查看日志/报告，请不要重复切换配置。");
   scheduleBusyMsg(18000, { kind: "activate", id }, "上游校验仍未返回，接近本次等待上限。完成后会自动切换，或给出重试/跳过验证提示。");
+}
+
+function startSaveConnectionFeedback(id, active) {
+  clearBusyMsgTimers();
+  if (active) {
+    setMsg("正在保存当前生效配置：先校验新连接，再重启正式代理并探活…");
+    scheduleBusyMsg(4500, { kind: "saveConnection", id }, "仍在等待新连接上游校验。失败会保留原连接和原代理。");
+    scheduleBusyMsg(18000, { kind: "saveConnection", id }, "上游校验接近等待上限。完成后才会写盘并应用，失败会据实回滚。");
+    return;
+  }
+  setMsg("保存连接中：正在做候选上游校验；无法确认时会保存但标记为未校验…");
+  scheduleBusyMsg(4500, { kind: "saveConnection", id }, "仍在等待候选连接校验。不会影响当前正在运行的代理。");
+}
+
+function startOneClickFeedback() {
+  clearBusyMsgTimers();
+  setMsg("一键开始：检查代理 → 准备虚拟登录 → 启动/复用沙箱 → 探活…");
+  scheduleBusyMsg(3500, { kind: "oneClick" }, "仍在准备代理或沙箱。若代理配置已变更，可能需要重启本地代理。");
+  scheduleBusyMsg(9000, { kind: "oneClick" }, "仍在等待沙箱就绪。完成后会自动打开 Science；失败会显示日志摘要。");
 }
 
 function setBusy(on, op) {
@@ -595,8 +621,8 @@ async function wizFetch() {
   if (baseErr) { setMsg(baseErr, "err"); return; }
   const key = els.wizKey.value.trim();
   if (!key) { setMsg("请先填 key 再获取模型。", "err"); return; }
-  setBusy(true);
-  setMsg("获取模型中：起临时代理探 /v1/models…");
+  setBusy(true, { kind: "fetchModels", id: "wizard" });
+  startFetchModelsFeedback("wizard");
   try {
     const r = await call("fetch_models", { req: { template_id: t.id, base_url: base, key } });
     applyFetchResult(els.wizModel, t.requires_model_override, r);
@@ -698,8 +724,8 @@ async function connFetch() {
   if (!base) { setMsg("请先填写 base_url。", "err"); return; }
   const baseErr = openaiCustomAnthropicBaseMessage(t, base);
   if (baseErr) { setMsg(baseErr, "err"); return; }
-  setBusy(true);
-  setMsg("获取模型中：起临时代理探 /v1/models…");
+  setBusy(true, { kind: "fetchModels", id: p.id });
+  startFetchModelsFeedback(p.id);
   try {
     const key = els.connKey.value.trim(); // 有新 key 带上；空则后端用已存 key（profileId）
     const r = await call("fetch_models", {
@@ -731,8 +757,8 @@ async function connSave() {
   const active = p.id === state.active_id;
   // key 留空＝不改（后端语义）；base_url/model 照传。api_format 不在此改（保留模板值）。
   const args = { id: p.id, baseUrl: base, model, key: els.connKey.value.trim() };
-  setBusy(true);
-  setMsg(active ? "校验中→切换中…（保存当前生效配置的新连接）" : "保存连接中…");
+  setBusy(true, { kind: "saveConnection", id: p.id });
+  startSaveConnectionFeedback(p.id, active);
   try {
     const r = await call("update_profile_connection", args);
     els.connKey.value = "";
@@ -867,8 +893,8 @@ async function oneClick() {
     setMsg("还没有「当前生效」的配置。请先「＋ 新建」或在列表点「设为当前」选一条，再一键开始。", "err");
     return;
   }
-  setBusy(true);
-  setMsg("一键开始：起代理 → 起沙箱 → 探活…");
+  setBusy(true, { kind: "oneClick" });
+  startOneClickFeedback();
   try {
     const r = await call("one_click_login");
     // 透传后端据实回传的 msg（已重开 / 已用新配置重启 / 沿用原对话 / 已启动 / 打开失败请手动打开）。

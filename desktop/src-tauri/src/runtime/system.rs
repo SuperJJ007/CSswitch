@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
@@ -75,6 +76,35 @@ pub(crate) fn open_log(name: &str) -> std::io::Result<std::fs::File> {
         .open(&p)?;
     let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
     Ok(f)
+}
+
+/// Append a redaction-safe operation event to `operation.log`.
+/// Callers must pass only coarse stage metadata, never keys, secrets, base URLs, or request bodies.
+pub(crate) fn append_operation_log(line: &str) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let p = log_path("operation.log");
+    let Some(parent) = p.parent() else {
+        return;
+    };
+    if config::assert_not_symlink(parent).is_err() || config::assert_not_symlink(&p).is_err() {
+        return;
+    }
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    let mut f = match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc_o_nofollow())
+        .open(&p)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    let _ = writeln!(f, "{line}");
 }
 
 /// Redact a path-secret before returning child-process log tails to the frontend.

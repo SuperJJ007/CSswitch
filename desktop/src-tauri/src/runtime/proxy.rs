@@ -5,6 +5,15 @@ pub(crate) enum ProxyAction {
     Restarted, // 首次起 / 换 key / 换 profile / 不健康，重起了代理
 }
 
+impl ProxyAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ProxyAction::Reused => "reused",
+            ProxyAction::Restarted => "restarted",
+        }
+    }
+}
+
 /// 探活结束回锁后是否可写回 `st.proxy`：generation 未被取代【且】secret 仍是本次启动的。
 /// 抽成纯函数便于确定性单测（gen 同/异 × secret 同/异 4 组合）。
 /// secret 合取防「冷启动双起、两个不同 secret、generation 却相等」的窄窗：另起若用不同 secret

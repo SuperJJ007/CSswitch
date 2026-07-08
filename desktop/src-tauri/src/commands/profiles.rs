@@ -1,6 +1,7 @@
 use serde_json::json;
 use tauri::State;
 
+use crate::runtime::operation::{OperationKind, OperationStage, OperationTrace};
 use crate::runtime::profile::{
     build_get_config, build_list_templates, clear_profile_key_inner, create_profile_inner,
     delete_profile_inner, nonactive_probe_verdict, probe_kind_for, update_profile_connection_inner,
@@ -124,7 +125,15 @@ fn scratch_validate_candidate(
     candidate: &config::Profile,
 ) -> Result<bool, String> {
     let launch = proxy_args_for(candidate);
+    let trace = OperationTrace::start(
+        OperationKind::ValidateConnection,
+        format!(
+            "profile_id={} template_id={} adapter={}",
+            candidate.id, candidate.template_id, launch.adapter
+        ),
+    );
     if !should_scratch_candidate(&launch.adapter, &launch.key, &launch.base_url) {
+        trace.finish("skipped reason=missing_key_or_base");
         return Ok(false); // 跳过 = 未校验（如实标记）
     }
     let root = asset_root(app).ok_or("找不到代理脚本 proxy/csswitch_proxy.py。")?;
@@ -142,8 +151,11 @@ fn scratch_validate_candidate(
             relay_thinking: launch.thinking_policy,
         },
         probe_kind_for(&launch.adapter, &launch.model),
+        Some(&trace),
     );
-    nonactive_probe_verdict(&scratch::classify(res.status))
+    let outcome = scratch::classify(res.status);
+    trace.finish(format!("outcome={outcome:?}"));
+    nonactive_probe_verdict(&outcome)
 }
 
 #[tauri::command]
@@ -319,12 +331,24 @@ fn set_active_profile_txn(
     }
     // 快照旧 active（回滚锚点）：旧 profile 仍在盘上未动、active_id 未改，恢复据它重起旧代理。
     let old_active = cfg.active_id.clone();
+    let trace = OperationTrace::start(
+        if is_edit {
+            OperationKind::UpdateActiveConnection
+        } else {
+            OperationKind::ActivateProfile
+        },
+        format!(
+            "profile_id={} template_id={} adapter={} skip_verify={}",
+            candidate.id, candidate.template_id, launch.adapter, skip_verify
+        ),
+    );
 
     // 1) scratch 校验候选（临时端口+secret+候选 key，避开 8765；绝不碰正式链路）。
     //    所有 adapter 都预检：native(deepseek/qwen) 用各自官方端点 + Message 探测（其 /v1/models 静态，
     //    探不出坏 key）；只有用户显式 skip_verify 才跳过（修真机 P1：原生免校验会让无效 key 提交为
     //    active 并谎报「已切到」，首个真实推理才 401）。分类失败保留结构化提示（committed:false/can_skip）。
     let scratch_ok = if skip_scratch_verify(native, skip_verify) {
+        trace.stage(OperationStage::ScratchUpstreamProbe, "skipped_by_user");
         true
     } else {
         let root = asset_root(app).ok_or("找不到代理脚本 proxy/csswitch_proxy.py。")?;
@@ -342,20 +366,29 @@ fn set_active_profile_txn(
                 relay_thinking: launch.thinking_policy,
             },
             probe_kind_for(&launch.adapter, &launch.model),
+            Some(&trace),
         );
-        match scratch::classify(res.status) {
+        let outcome = scratch::classify(res.status);
+        trace.stage(
+            OperationStage::ScratchUpstreamProbe,
+            format!("outcome={outcome:?}"),
+        );
+        match outcome {
             scratch::ProbeOutcome::Ok => true,
             scratch::ProbeOutcome::Auth(code) => {
+                trace.finish(format!("rejected status={code}"));
                 return Ok(json!({ "committed": false,
                     "hint": format!("上游拒绝（{code}），key/权限有误，{verb}（{tail}）。") }));
             }
             scratch::ProbeOutcome::ModelError(code) => {
+                trace.finish(format!("model_error status={code}"));
                 return Ok(json!({ "committed": false,
                     "hint": format!("上游拒绝该模型（{code}），{verb}。请换一个模型或核对 base_url。") }));
             }
             scratch::ProbeOutcome::Ambiguous(_)
             | scratch::ProbeOutcome::NoResponse
             | scratch::ProbeOutcome::Unsupported(_) => {
+                trace.finish("ambiguous can_skip=true");
                 return Ok(json!({ "committed": false, "can_skip": true,
                     "hint": format!("无法确认（网络/上游繁忙），{verb}。可重试，或用「跳过验证」。") }));
             }
@@ -364,8 +397,9 @@ fn set_active_profile_txn(
 
     // 2/3) 用候选起【正式代理】并探活。bump_generation 使并发中的旧启动（如同时的 verify_key）作废。
     lifecycle.bump_generation();
-    let real_healthy =
-        scratch_ok && commands::runtime::start_proxy_for(app, state, lifecycle, &candidate).is_ok();
+    let real_healthy = scratch_ok
+        && commands::runtime::start_proxy_for(app, state, lifecycle, &candidate, Some(&trace))
+            .is_ok();
 
     match decide_switch(scratch_ok, real_healthy) {
         SwitchOutcome::Commit => {
@@ -384,7 +418,9 @@ fn set_active_profile_txn(
             }) {
                 // spec §7 步 5：config 提交失败也要回滚进程——正式代理已起，若不回滚就成「运行新/盘旧」。
                 // 恢复旧 active 代理，active_id 仍为旧值，用户可重试。
+                trace.stage(OperationStage::Rollback, "reason=config_write_failed");
                 let restored = restore_proxy_for_active(app, state, lifecycle, &cfg, &old_active);
+                trace.finish(format!("error=config_write_failed restored={restored}"));
                 return Err(format!(
                     "校验通过、代理已起，但写盘失败（{e}），{}。请检查磁盘空间/权限后重试。",
                     rollback_status_clause(restored)
@@ -395,12 +431,16 @@ fn set_active_profile_txn(
             } else {
                 format!("已切到「{}」。", candidate.name)
             };
+            trace.stage(OperationStage::Commit, "ok");
+            trace.finish("committed=true");
             Ok(json!({ "committed": true, "active_id": id, "hint": hint }))
         }
         SwitchOutcome::RollbackToOld => {
             // 候选正式代理起/探活失败：恢复旧代理，active_id 不动，连接不落盘，不停沙箱。
+            trace.stage(OperationStage::Rollback, "reason=proxy_unhealthy");
             let restored = restore_proxy_for_active(app, state, lifecycle, &cfg, &old_active);
             let clause = rollback_status_clause(restored);
+            trace.finish(format!("rollback restored={restored}"));
             if is_edit {
                 Err(format!(
                     "连接已校验通过，但正式代理启动/探活失败，连接未保存，{clause}。"
@@ -414,6 +454,7 @@ fn set_active_profile_txn(
         SwitchOutcome::AbortBeforeStart => {
             // scratch 校验未过；旧态零改动、连接不落盘。（明确拒绝/含糊态在上面已 committed:false 早返，
             // 此分支是 scratch_ok=false 的兜底措辞。）
+            trace.finish("aborted_before_start");
             if is_edit {
                 Err("连接上游校验失败（key/base_url/网络？），连接未保存。".into())
             } else {
@@ -439,7 +480,7 @@ fn restore_proxy_for_active(
     match cfg.profile_by_id(old_active) {
         Some(old) => {
             lifecycle.bump_generation();
-            commands::runtime::start_proxy_for(app, state, lifecycle, old).is_ok()
+            commands::runtime::start_proxy_for(app, state, lifecycle, old, None).is_ok()
         }
         None => false, // 旧 active 指向已不存在的 profile（罕见）→ 无法恢复，代理已停
     }
