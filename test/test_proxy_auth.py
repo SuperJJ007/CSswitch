@@ -380,6 +380,55 @@ class ProxyOpenAICustomModelsDiscovery(unittest.TestCase):
 
 
 @unittest.skipUnless(loopback_available(), "env-blocked: loopback bind/connect not permitted")
+class ProxyOpenAICustomForcedModelList(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.up_url, cls.hits, cls.stop_up = start_mock("openai_models")
+        port = 18998
+        cls.base = f"http://127.0.0.1:{port}"
+        cls.logf = os.path.join(tempfile.gettempdir(), f"csswitch-openai-forced-models-{port}.log")
+        open(cls.logf, "w").close()
+        env = dict(os.environ, CSSWITCH_OPENAI_KEY="fake-openai-key",
+                   CSSWITCH_OPENAI_BASE_URL=cls.up_url,
+                   CSSWITCH_OPENAI_MODEL="glm-4.5")
+        cls.proc = subprocess.Popen(
+            [sys.executable, PROXY, "--provider", "openai-custom",
+             "--port", str(port), "--auth-token", SEC, "--log", cls.logf],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(50):
+            try:
+                s, _b = _req(f"{cls.base}/{SEC}/health")
+                if s == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait(timeout=5)
+        cls.stop_up()
+
+    def test_formal_proxy_returns_claude_shell_for_science_selector(self):
+        # 回归 #26：正式代理已选定 custom OpenAI 模型时，Science 只能显示
+        # claude-* 壳 id；真实模型名必须放 display_name，出站再由 force override。
+        s, b = _req(f"{self.base}/{SEC}/v1/models")
+        self.assertEqual(s, 200, b[:160])
+        body = json.loads(b)
+        self.assertEqual(body["data"], [{
+            "type": "model",
+            "id": "claude-opus-4-8",
+            "display_name": "glm-4.5",
+            "supports_tools": None,
+            "created_at": "2026-01-01T00:00:00Z",
+        }])
+        self.assertEqual(body["first_id"], "claude-opus-4-8")
+        self.assertEqual(body["last_id"], "claude-opus-4-8")
+        self.assertEqual(self.hits, [], "formal proxy should not expose raw non-claude IDs")
+
+
+@unittest.skipUnless(loopback_available(), "env-blocked: loopback bind/connect not permitted")
 class ProxyOpenAIResponses(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -420,6 +469,18 @@ class ProxyOpenAIResponses(unittest.TestCase):
         self.assertEqual(body["usage"], {"input_tokens": 2, "output_tokens": 3})
         self.assertIn("/up/v1/responses", self.hits)
         self.assertNotIn("/up/v1/chat/completions", self.hits)
+
+    def test_models_returns_claude_shell_for_science_selector(self):
+        s, b = _req(f"{self.base}/{SEC}/v1/models")
+        self.assertEqual(s, 200, b[:160])
+        body = json.loads(b)
+        self.assertEqual(body["data"], [{
+            "type": "model",
+            "id": "claude-opus-4-8",
+            "display_name": "gpt-5.2",
+            "supports_tools": None,
+            "created_at": "2026-01-01T00:00:00Z",
+        }])
 
 
 if __name__ == "__main__":
