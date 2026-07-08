@@ -67,6 +67,11 @@ def _req(url, method="GET", body=None):
         return e.code, e.read()
 
 
+def _read(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 @unittest.skipUnless(loopback_available(), "env-blocked: loopback bind/connect not permitted")
 class ProxyAuth(unittest.TestCase):
     @classmethod
@@ -426,6 +431,9 @@ class ProxyOpenAICustomForcedModelList(unittest.TestCase):
         self.assertEqual(body["first_id"], "claude-opus-4-8")
         self.assertEqual(body["last_id"], "claude-opus-4-8")
         self.assertEqual(self.hits, [], "formal proxy should not expose raw non-claude IDs")
+        log = _read(self.logf)
+        self.assertIn("GET /v1/models -> openai-custom(force 借壳): glm-4.5", log)
+        self.assertNotIn("fake-openai-key", log)
 
 
 @unittest.skipUnless(loopback_available(), "env-blocked: loopback bind/connect not permitted")
@@ -471,6 +479,7 @@ class ProxyOpenAIResponses(unittest.TestCase):
         self.assertNotIn("/up/v1/chat/completions", self.hits)
 
     def test_models_returns_claude_shell_for_science_selector(self):
+        self.hits.clear()
         s, b = _req(f"{self.base}/{SEC}/v1/models")
         self.assertEqual(s, 200, b[:160])
         body = json.loads(b)
@@ -481,6 +490,10 @@ class ProxyOpenAIResponses(unittest.TestCase):
             "supports_tools": None,
             "created_at": "2026-01-01T00:00:00Z",
         }])
+        self.assertEqual(self.hits, [], "formal proxy should not expose raw non-claude IDs")
+        log = _read(self.logf)
+        self.assertIn("GET /v1/models -> openai-responses(force 借壳): gpt-5.2", log)
+        self.assertNotIn("fake-openai-key", log)
 
 
 if __name__ == "__main__":
