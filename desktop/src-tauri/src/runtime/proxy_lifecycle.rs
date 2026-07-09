@@ -110,6 +110,14 @@ fn gateway_bin_path_from(
     None
 }
 
+fn stop_packaged_python_proxy_on_port<R: Runtime>(app: &tauri::AppHandle<R>, port: u16) {
+    if let Some(root) = asset_root(app) {
+        let script = root.join("proxy/csswitch_proxy.py");
+        let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
+        let _ = Command::new("pkill").arg("-f").arg(&pat).status();
+    }
+}
+
 /// Ensure the active profile's proxy is running and healthy.
 pub(crate) fn ensure_proxy<R: Runtime>(
     app: &tauri::AppHandle<R>,
@@ -176,10 +184,11 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             && st.gateway_kind == gateway_kind
             && st.shim_mode == shim_mode
             && st.key_fp == key_fp
-            && proc::http_health(
+            && proc::http_health_gateway(
                 port,
                 Some(&st.secret),
                 operation::PROXY_REUSE_HEALTH_TIMEOUT_MS,
+                gateway_kind,
             )
         {
             if let Some(t) = trace {
@@ -208,6 +217,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
                 ),
             );
         }
+        stop_packaged_python_proxy_on_port(app, port);
         let mut cmd = if gateway_kind == "rust" {
             let bin = gateway_bin_path(app)
                 .ok_or("找不到 csswitch-gateway 二进制；请先构建 desktop/gateway，或设置 CSSWITCH_GATEWAY_BIN。")?;
@@ -226,8 +236,6 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             let py = proc::find_exe("python3")
                 .ok_or("缺少依赖 python3（起翻译代理需要）。已查 PATH、常见目录与登录 shell 仍未找到；macOS 一般自带 /usr/bin/python3（装 Xcode 命令行工具：xcode-select --install）。")?;
             let script = root.join("proxy/csswitch_proxy.py");
-            let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
-            let _ = Command::new("pkill").arg("-f").arg(&pat).status();
             let mut cmd = Command::new(&py);
             cmd.arg(&script)
                 .arg("--provider")
@@ -253,7 +261,12 @@ pub(crate) fn start_proxy_for<R: Runtime>(
     let mut ok = false;
     for _ in 0..(operation::PROXY_HEALTH_BUDGET_MS / POLL_INTERVAL_MS) {
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-        if proc::http_health(port, Some(&secret), operation::LOCAL_HEALTH_TIMEOUT_MS) {
+        if proc::http_health_gateway(
+            port,
+            Some(&secret),
+            operation::LOCAL_HEALTH_TIMEOUT_MS,
+            gateway_kind,
+        ) {
             ok = true;
             break;
         }

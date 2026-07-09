@@ -330,7 +330,7 @@ class RustGatewayLoopback(unittest.TestCase):
             body = json.loads(resp.read())
             conn.close()
             self.assertEqual(resp.status, 200)
-            self.assertEqual(body, {"status": "ok", "provider": "deepseek"})
+            self.assertEqual(body, {"status": "ok", "provider": "deepseek", "gateway": "rust"})
         finally:
             self.stop_gateway(proc)
 

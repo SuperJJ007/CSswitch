@@ -163,7 +163,7 @@ fn handle_get(stream: &mut TcpStream, cfg: &GatewayConfig, target: &str) {
             stream,
             200,
             "OK",
-            json!({"status": "ok", "provider": cfg.provider}),
+            json!({"status": "ok", "provider": cfg.provider, "gateway": "rust"}),
         ),
         "/v1/models" => write_json(stream, 200, "OK", models::deepseek_models_response()),
         _ => not_found_json(stream, &path),

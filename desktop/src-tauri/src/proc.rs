@@ -10,18 +10,36 @@ use std::time::Duration;
 /// 对本地回环代理做 HTTP 探活：`GET /<secret>/health`，响应状态行含 200 即视为健康。
 /// 代理带 path-secret 鉴权时必须带上 secret，否则会拿到 403。
 pub fn http_health(port: u16, secret: Option<&str>, timeout_ms: u64) -> bool {
+    http_health_response(port, secret, timeout_ms).is_some()
+}
+
+/// 正式 CSSwitch proxy 探活：除 200 外，还要求 `/health` 报告的 gateway 身份匹配。
+/// 这防止同端口同 secret 的旧代理在新 gateway 启动失败时冒充 ready。
+pub fn http_health_gateway(
+    port: u16,
+    secret: Option<&str>,
+    timeout_ms: u64,
+    expected_gateway: &str,
+) -> bool {
+    http_health_response(port, secret, timeout_ms)
+        .as_deref()
+        .map(|resp| json_string_field_matches(resp, "gateway", expected_gateway))
+        .unwrap_or(false)
+}
+
+fn http_health_response(port: u16, secret: Option<&str>, timeout_ms: u64) -> Option<String> {
     let addr = match ("127.0.0.1", port)
         .to_socket_addrs()
         .ok()
         .and_then(|mut a| a.next())
     {
         Some(a) => a,
-        None => return false,
+        None => return None,
     };
     let dur = Duration::from_millis(timeout_ms);
     let mut stream = match TcpStream::connect_timeout(&addr, dur) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     let _ = stream.set_read_timeout(Some(dur));
     let _ = stream.set_write_timeout(Some(dur));
@@ -31,10 +49,10 @@ pub fn http_health(port: u16, secret: Option<&str>, timeout_ms: u64) -> bool {
     };
     let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
-        return false;
+        return None;
     }
     let mut buf = Vec::new();
-    // 只需读到状态行；读上限防呆。
+    // 读完整个小 health 响应；读上限防呆，超时则用已读内容判定。
     let mut chunk = [0u8; 1024];
     while buf.len() < 8192 {
         match stream.read(&mut chunk) {
@@ -42,14 +60,42 @@ pub fn http_health(port: u16, secret: Option<&str>, timeout_ms: u64) -> bool {
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(_) => break,
         }
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if let Some(expected) = expected_http_response_len(&buf) {
+            if buf.len() >= expected {
+                break;
+            }
         }
     }
-    let head = String::from_utf8_lossy(&buf);
-    let status_line = head.lines().next().unwrap_or("");
+    let resp = String::from_utf8_lossy(&buf).to_string();
+    let status_line = resp.lines().next().unwrap_or("");
     // 形如 "HTTP/1.1 200 OK"：严格取第二段等于 200，避免 contains 误配 reason phrase。
-    status_line.split_whitespace().nth(1) == Some("200")
+    if status_line.split_whitespace().nth(1) == Some("200") {
+        Some(resp)
+    } else {
+        None
+    }
+}
+
+fn json_string_field_matches(resp: &str, field: &str, expected: &str) -> bool {
+    let compact: String = resp.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains(&format!("\"{field}\":\"{expected}\""))
+}
+
+fn expected_http_response_len(buf: &[u8]) -> Option<usize> {
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let head = String::from_utf8_lossy(&buf[..header_end]);
+    for line in head.lines() {
+        let (name, value) = match line.split_once(':') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            if let Ok(len) = value.trim().parse::<usize>() {
+                return Some(header_end + len);
+            }
+        }
+    }
+    Some(header_end)
 }
 
 /// 向本地回环代理 POST 一段 JSON（`POST /<secret><path>`），返回 HTTP 响应状态码；
@@ -320,6 +366,26 @@ mod tests {
     fn health_false_when_nothing_listening() {
         // 一个几乎肯定没人监听的高端口。
         assert!(!http_health(59999, None, 300));
+    }
+
+    #[test]
+    fn gateway_health_requires_matching_identity() {
+        let python = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"status\":\"ok\",\"provider\":\"deepseek\",\"gateway\":\"python\"}";
+        assert!(json_string_field_matches(python, "gateway", "python"));
+        assert!(!json_string_field_matches(python, "gateway", "rust"));
+        let spaced = "HTTP/1.1 200 OK\r\n\r\n{\"gateway\": \"rust\"}";
+        assert!(json_string_field_matches(spaced, "gateway", "rust"));
+    }
+
+    #[test]
+    fn health_reader_waits_for_declared_body() {
+        let partial = b"HTTP/1.1 200 OK\r\ncontent-length: 17\r\n\r\n{\"gateway\":\"r";
+        assert_eq!(
+            expected_http_response_len(partial),
+            Some("HTTP/1.1 200 OK\r\ncontent-length: 17\r\n\r\n".len() + 17)
+        );
+        let complete = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+        assert_eq!(expected_http_response_len(complete), Some(complete.len()));
     }
 
     #[test]

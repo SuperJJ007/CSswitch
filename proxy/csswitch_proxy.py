@@ -485,7 +485,7 @@ class H(BaseHTTPRequestHandler):
             code, body = build_models_response(runtime)
             self._send_json(code, body)
         elif self.path.startswith("/health"):
-            self._send_json(200, {"status": "ok", "provider": runtime.prov_name})
+            self._send_json(200, {"status": "ok", "provider": runtime.prov_name, "gateway": "python"})
         else:
             self._send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": self.path}})
 
