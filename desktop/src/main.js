@@ -106,6 +106,8 @@ function mockInvoke(cmd, args) {
       return Promise.resolve({ url: "http://127.0.0.1:8990", msg: "（预览模式：假装已就绪）", action: "started" });
     case "status":
       return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber" });
+    case "boot_error":
+      return Promise.resolve(null);
     case "app_version":
       return Promise.resolve("0.0.0-preview");
     case "run_doctor":
@@ -120,7 +122,10 @@ const els = {};
 let statusTimer = null;
 let busy = false;
 let busyOp = null;
+let activationInFlight = false;
+let activationOp = null;
 let busyMsgTimers = [];
+let doctorInFlight = false;
 let statusRecoveryMsg = "";
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
@@ -273,20 +278,29 @@ function profileName(id) {
 function syncProfileBusyState() {
   if (!els.profileList) return;
   els.profileList.querySelectorAll(".prow").forEach((row) => {
-    const isTarget = !!(busyOp && busyOp.kind === "activate" && row.getAttribute("data-id") === busyOp.id);
+    const rowId = row.getAttribute("data-id");
+    const isTarget = !!(
+      (busyOp && busyOp.kind === "activate" && rowId === busyOp.id) ||
+      (activationOp && activationOp.kind === "activate" && rowId === activationOp.id)
+    );
     row.classList.toggle("pworking", isTarget);
     row.querySelectorAll("button[data-act]").forEach((btn) => {
-      btn.disabled = busy;
-      if (btn.getAttribute("data-act") === "activate") {
-        btn.textContent = isTarget ? "正在启用…" : "设为当前";
+      const act = btn.getAttribute("data-act");
+      btn.disabled = busy || (activationInFlight && act === "activate");
+      if (act === "activate") {
+        btn.textContent = isTarget ? "已提交" : "设为当前";
       }
     });
   });
 }
 
+function sameOp(a, b) {
+  return !!(a && b && a.kind === b.kind && (a.id || "") === (b.id || ""));
+}
+
 function scheduleBusyMsg(ms, op, text) {
   const timer = setTimeout(() => {
-    if (busy && busyOp && busyOp.kind === op.kind && busyOp.id === op.id) setMsg(text);
+    if (busy && sameOp(busyOp, op)) setMsg(text);
   }, ms);
   busyMsgTimers.push(timer);
 }
@@ -300,15 +314,11 @@ function startFetchModelsFeedback(id) {
 
 function startActivateFeedback(id, skipVerify) {
   const name = profileName(id);
-  clearBusyMsgTimers();
   if (skipVerify) {
-    setMsg("正在启用「" + name + "」：已跳过上游校验，正在启动正式代理并探活…");
-    scheduleBusyMsg(3500, { kind: "activate", id }, "仍在等待正式代理探活完成。完成后会自动应用，失败会保留原配置。");
+    setMsg("已提交「" + name + "」：跳过上游校验，后台启动正式代理并探活。完成后会提示结果。");
     return;
   }
-  setMsg("正在启用「" + name + "」：先用临时代理校验上游，网络慢时可能需要约 20 秒…");
-  scheduleBusyMsg(4500, { kind: "activate", id }, "仍在等待上游校验响应。可以继续查看日志/报告，请不要重复切换配置。");
-  scheduleBusyMsg(18000, { kind: "activate", id }, "上游校验仍未返回，接近本次等待上限。完成后会自动切换，或给出重试/跳过验证提示。");
+  setMsg("已提交「" + name + "」：后台校验上游并准备正式代理。完成后会提示结果。");
 }
 
 function startSaveConnectionFeedback(id, active) {
@@ -360,20 +370,42 @@ function startDoctorFeedback() {
 function setBusy(on, op) {
   busy = on;
   busyOp = on ? (op || { kind: "global" }) : null;
+  const activationBusy = on && busyOp && busyOp.kind === "activate";
   if (!on) clearBusyMsgTimers();
   [
     els.oneClickBtn, els.stopBtn, els.newBtn,
     els.wizSaveBtn, els.wizFetchBtn, els.wizCancelBtn,
     els.connSaveBtn, els.connFetchBtn, els.connClearBtn, els.connCancelBtn,
-    els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn, els.doctorBtn,
+    els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn,
     // 端口输入也纳入忙碌禁用：忙碌中改端口会与在途操作竞态（修 P1-c 前端侧）。
     els.proxyPort, els.sandboxPort,
   ].forEach((b) => b && (b.disabled = on));
+  if (els.doctorBtn) els.doctorBtn.disabled = on && !activationBusy;
   // 模式切换按钮同样禁用：忙碌中切官方会与「一键开始」竞态（修 P1-b 前端侧）。
   if (els.modeSeg) els.modeSeg.querySelectorAll(".seg-btn").forEach((b) => (b.disabled = on));
   syncProfileBusyState();
   // 松开忙碌时，把模型必填保存门控交回门（避免 setBusy(false) 覆盖门控）。
   if (!on) { refreshWizGate(); refreshConnGate(); }
+  syncActivationControls();
+}
+
+function syncActivationControls() {
+  const writeLocked = busy;
+  [
+    els.newBtn, els.proxyPort, els.sandboxPort,
+    els.connClearBtn, els.metaSaveBtn,
+  ].forEach((b) => b && (b.disabled = writeLocked));
+  if (els.modeSeg) els.modeSeg.querySelectorAll(".seg-btn").forEach((b) => (b.disabled = writeLocked));
+  if (els.skipActivateBtn) els.skipActivateBtn.disabled = busy;
+  syncProfileBusyState();
+  refreshWizGate();
+  refreshConnGate();
+}
+
+function setActivationInFlight(on, op) {
+  activationInFlight = on;
+  activationOp = on ? op : null;
+  syncActivationControls();
 }
 
 async function call(cmd, args) {
@@ -943,8 +975,12 @@ async function doDelete(id) {
 // 设为当前：走后端切换事务（校验→起正式→健康才提交）。
 // 返回体 committed:true=已生效；committed:false=未生效（可能可 skip）；抛错=回滚/中止。
 async function activate(id, skipVerify) {
+  if (activationInFlight) {
+    setMsg("已有配置应用在后台完成。可以查看日志、反馈或自检；请稍后再提交另一条配置。");
+    return;
+  }
   hideSkip();
-  setBusy(true, { kind: "activate", id });
+  setActivationInFlight(true, { kind: "activate", id });
   startActivateFeedback(id, !!skipVerify);
   try {
     const r = await call("set_active_profile", { id, skipVerify: !!skipVerify });
@@ -960,7 +996,7 @@ async function activate(id, skipVerify) {
     await loadConfig();
     setMsg("设为当前失败：" + e, "err");
   } finally {
-    setBusy(false);
+    setActivationInFlight(false);
     await refreshStatus();
   }
 }
@@ -1008,16 +1044,25 @@ async function openBrowser() {
 }
 
 async function runDoctor() {
-  if (busy) return;
-  setBusy(true, { kind: "doctor" });
-  startDoctorFeedback();
+  const activationBusy = activationInFlight || (busy && busyOp && busyOp.kind === "activate");
+  if (doctorInFlight || (busy && !activationBusy)) return;
+  doctorInFlight = true;
+  if (els.doctorBtn) els.doctorBtn.disabled = true;
+  if (activationBusy) {
+    setMsg("自检中：配置后台应用仍在继续。自检只读取当前配置摘要和本地依赖状态。");
+  } else {
+    setBusy(true, { kind: "doctor" });
+    startDoctorFeedback();
+  }
   try {
     const out = await call("run_doctor");
     setMsg(out, out.includes("失败 0") ? "ok" : null);
   } catch (e) {
     setMsg("自检失败：" + e, "err");
   } finally {
-    setBusy(false);
+    doctorInFlight = false;
+    if (els.doctorBtn) els.doctorBtn.disabled = busy && busyOp && busyOp.kind !== "activate";
+    if (!activationBusy) setBusy(false);
   }
 }
 
@@ -1148,6 +1193,16 @@ function wire() {
 window.addEventListener("DOMContentLoaded", async () => {
   wire();
   await loadConfig();
+  if (!PREVIEW && window.__TAURI__.event) {
+    window.__TAURI__.event.listen("boot://failed", (e) => {
+      setMsg("自动启动未成功：" + (e.payload || "未知原因") + "\n可检查配置后点「一键开始」重试。", "err");
+      refreshStatus();
+    });
+  }
+  try {
+    const bootError = await call("boot_error");
+    if (bootError) setMsg("自动启动未成功：" + bootError + "\n可检查配置后点「一键开始」重试。", "err");
+  } catch (e) {}
   try { els.verLabel.textContent = "v" + (await call("app_version")); } catch (e) {}
   await refreshStatus();
   if (PREVIEW) {

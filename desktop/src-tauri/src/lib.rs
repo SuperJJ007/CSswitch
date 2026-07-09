@@ -24,9 +24,50 @@ mod templates;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use runtime::system::kill_child;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchPath {
+    ShowPanel,
+    OpenOfficial,
+    BootScience,
+}
+
+fn decide_launch_with_auto_boot(cfg: &config::Config, auto_boot: bool) -> LaunchPath {
+    if !auto_boot {
+        return LaunchPath::ShowPanel;
+    }
+    if cfg.mode == "official" {
+        return LaunchPath::OpenOfficial;
+    }
+    match cfg.active_profile() {
+        Some(p) if !p.api_key.trim().is_empty() => LaunchPath::BootScience,
+        _ => LaunchPath::ShowPanel,
+    }
+}
+
+fn decide_launch(cfg: &config::Config) -> LaunchPath {
+    let auto_boot = std::env::var("CSSWITCH_AUTO_BOOT_ON_LAUNCH")
+        .ok()
+        .as_deref()
+        == Some("1");
+    decide_launch_with_auto_boot(cfg, auto_boot)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BootState {
+    #[default]
+    Idle,
+    Starting,
+    Ready,
+    Failed,
+}
+
+fn should_begin_boot(state: BootState) -> bool {
+    matches!(state, BootState::Idle | BootState::Failed)
+}
 
 #[derive(Default)]
 pub(crate) struct AppState {
@@ -41,6 +82,8 @@ pub(crate) struct AppState {
     pub(crate) sandbox: Option<Child>,
     pub(crate) sandbox_port: u16,
     pub(crate) sandbox_url: Option<String>,
+    boot: BootState,
+    pub(crate) boot_error: Option<String>,
 }
 
 impl AppState {
@@ -75,11 +118,110 @@ where
         .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+fn install_menu(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+
+    let preferences = MenuItemBuilder::with_id("preferences", "偏好设置...")
+        .accelerator("CmdOrCtrl+,")
+        .build(app)?;
+    let app_menu = SubmenuBuilder::new(app, "CSSwitch")
+        .item(&preferences)
+        .separator()
+        .quit()
+        .build()?;
+    let menu = MenuBuilder::new(app).item(&app_menu).build()?;
+    app.set_menu(menu)?;
+    app.on_menu_event(|app, event| {
+        if event.id().as_ref() == "preferences" {
+            show_main_window(app);
+        }
+    });
+    Ok(())
+}
+
+fn cleanup_for_exit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let state = app.state::<SharedAppState>();
+    let mut st = lock(state.inner());
+    st.stop_proxy();
+}
+
+fn mark_boot_failed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, error: String) {
+    let state = app.state::<SharedAppState>();
+    {
+        let mut st = lock(state.inner());
+        st.boot = BootState::Failed;
+        st.boot_error = Some(error.clone());
+    }
+    show_main_window(app);
+    let _ = app.emit("boot://failed", error);
+}
+
+fn run_boot_coordinator(app: tauri::AppHandle) {
+    {
+        let state = app.state::<SharedAppState>();
+        let mut st = lock(state.inner());
+        if !should_begin_boot(st.boot) {
+            show_main_window(&app);
+            return;
+        }
+        st.boot = BootState::Starting;
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg = match config::load_from(&config::default_dir()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                mark_boot_failed(&app, format!("读取配置失败：{e}"));
+                return;
+            }
+        };
+        let state = app.state::<SharedAppState>();
+        match decide_launch(&cfg) {
+            LaunchPath::ShowPanel => {
+                let mut st = lock(state.inner());
+                st.boot = BootState::Idle;
+                st.boot_error = None;
+                show_main_window(&app);
+            }
+            LaunchPath::OpenOfficial => match commands::runtime::open_official() {
+                Ok(()) => {
+                    let mut st = lock(state.inner());
+                    st.boot = BootState::Idle;
+                    st.boot_error = None;
+                }
+                Err(e) => mark_boot_failed(&app, e),
+            },
+            LaunchPath::BootScience => {
+                let state_inner = state.inner().clone();
+                let lifecycle = app.state::<SharedLifecycle>().inner().clone();
+                match commands::runtime::one_click_login_cmd(app.clone(), state_inner, lifecycle) {
+                    Ok(_) => {
+                        let mut st = lock(state.inner());
+                        st.boot = BootState::Ready;
+                        st.boot_error = None;
+                    }
+                    Err(e) => mark_boot_failed(&app, e),
+                }
+            }
+        }
+    });
+}
+
 // ---------- 入口 ----------
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            run_boot_coordinator(app.clone());
+        }))
         .manage(Arc::new(Mutex::new(AppState::default())))
         .manage(Arc::new(lifecycle::Lifecycle::new()))
         .invoke_handler(tauri::generate_handler![
@@ -100,6 +242,7 @@ pub fn run() {
             commands::runtime::stop_all,
             commands::runtime::one_click_login,
             commands::runtime::status,
+            commands::runtime::boot_error,
             commands::runtime::open_url,
             commands::diagnostics::run_doctor,
             commands::diagnostics::app_version,
@@ -109,34 +252,40 @@ pub fn run() {
             commands::runtime::quit_app
         ])
         .setup(|app| {
-            // 正常桌面应用：进 Dock、走常规应用生命周期。窗口在 tauri.conf.json 里配了
-            // decorations + visible + center，启动即居中弹出、可拖动。托盘图标已移除。
+            install_menu(app)?;
 
             // 启动即触发一次 load：若是旧 v1 固定槽文件，这里完成 v1→v2 迁移 + 落盘 + 留 .v1.bak；
             // 悬空 active 归一化为空。迁移逻辑并入 config::load_from（不再单独跑 relay_presets）。
             let _ = config::load_from(&config::default_dir());
 
-            // 关窗即退出：与「退出」按钮一致 —— 停代理、清 secret，保留沙箱运行（spec §5.1）。
+            // 关窗隐藏配置面板，不销毁窗口、不停止后台链路。显式退出统一清理代理。
             if let Some(win) = app.get_webview_window("main") {
-                let handle = app.handle().clone();
+                let w = win.clone();
                 win.on_window_event(move |ev| {
-                    if let tauri::WindowEvent::CloseRequested { .. } = ev {
-                        let state = handle.state::<SharedAppState>();
-                        let mut st = lock(state.inner());
-                        st.stop_proxy();
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = ev {
+                        api.prevent_close();
+                        let _ = w.hide();
                     }
                 });
             }
+            run_boot_coordinator(app.handle().clone());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app, event| match event {
+        tauri::RunEvent::Reopen { .. } => show_main_window(app),
+        tauri::RunEvent::ExitRequested { .. } => cleanup_for_exit(app),
+        _ => {}
+    });
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::config::{Config, Profile};
     use crate::runtime::system::redact;
-    use crate::AppState;
+    use crate::{decide_launch_with_auto_boot, should_begin_boot, AppState, BootState, LaunchPath};
 
     #[test]
     fn app_state_clear_proxy_identity_removes_runtime_credentials() {
@@ -160,5 +309,90 @@ mod tests {
         );
         assert_eq!(redact("原样返回", ""), "原样返回");
         assert!(!redact("leak abcd1234 leak abcd1234", "abcd1234").contains("abcd1234"));
+    }
+
+    fn keyed_profile(id: &str, key: &str) -> Profile {
+        Profile {
+            id: id.into(),
+            name: id.into(),
+            template_id: "deepseek".into(),
+            category: "cn_official".into(),
+            api_format: "anthropic".into(),
+            api_key: key.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decide_launch_defaults_to_showing_panel() {
+        let active_with_key = Config {
+            profiles: vec![keyed_profile("p1", "sk-present")],
+            active_id: "p1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_launch_with_auto_boot(&active_with_key, false),
+            LaunchPath::ShowPanel
+        );
+    }
+
+    #[test]
+    fn decide_launch_auto_boot_uses_current_mode_and_active_profile_key() {
+        let official = Config {
+            mode: "official".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_launch_with_auto_boot(&official, true),
+            LaunchPath::OpenOfficial
+        );
+
+        let no_active = Config {
+            profiles: vec![keyed_profile("p1", "sk-present")],
+            active_id: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_launch_with_auto_boot(&no_active, true),
+            LaunchPath::ShowPanel
+        );
+
+        let active_without_key = Config {
+            profiles: vec![keyed_profile("p1", "")],
+            active_id: "p1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_launch_with_auto_boot(&active_without_key, true),
+            LaunchPath::ShowPanel
+        );
+
+        let active_with_key = Config {
+            profiles: vec![keyed_profile("p1", "sk-present")],
+            active_id: "p1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_launch_with_auto_boot(&active_with_key, true),
+            LaunchPath::BootScience
+        );
+
+        let dangling_active = Config {
+            profiles: vec![keyed_profile("p1", "sk-present")],
+            active_id: "missing".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_launch_with_auto_boot(&dangling_active, true),
+            LaunchPath::ShowPanel
+        );
+    }
+
+    #[test]
+    fn should_begin_boot_only_from_idle_or_failed() {
+        assert!(should_begin_boot(BootState::Idle));
+        assert!(should_begin_boot(BootState::Failed));
+        assert!(!should_begin_boot(BootState::Starting));
+        assert!(!should_begin_boot(BootState::Ready));
     }
 }

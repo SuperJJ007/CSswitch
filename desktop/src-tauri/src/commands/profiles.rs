@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde_json::json;
 use tauri::State;
 
@@ -11,7 +13,7 @@ use crate::runtime::provider::{
     adapter_for_profile, reject_openai_custom_anthropic_base, relay_missing_base_url,
     relay_missing_model,
 };
-use crate::{config, lock, run_blocking, SharedAppState, SharedLifecycle};
+use crate::{config, lifecycle, lock, run_blocking, SharedAppState, SharedLifecycle};
 
 #[tauri::command]
 pub(crate) fn get_config() -> Result<serde_json::Value, String> {
@@ -66,19 +68,12 @@ pub(crate) fn clear_profile_key(
     lifecycle: State<'_, SharedLifecycle>,
     id: String,
 ) -> Result<(), String> {
-    lifecycle.with_serialized(|| {
-        let dir = config::default_dir();
-        let was_active = config::load_from(&dir)
-            .map(|c| c.active_id == id)
-            .unwrap_or(false);
-        clear_profile_key_inner(&dir, &id)?;
-        if was_active {
-            lifecycle.bump_generation();
-            let mut st = lock(state.inner());
-            st.stop_proxy();
-        }
-        Ok(())
-    })
+    clear_profile_key_cmd(
+        &config::default_dir(),
+        state.inner(),
+        lifecycle.as_ref(),
+        &id,
+    )
 }
 
 /// 删 profile：经串行器；删的是【生效】profile → active 置空（inner 内）+ bump + 停代理。
@@ -88,15 +83,48 @@ pub(crate) fn delete_profile(
     lifecycle: State<'_, SharedLifecycle>,
     id: String,
 ) -> Result<(), String> {
+    delete_profile_cmd(
+        &config::default_dir(),
+        state.inner(),
+        lifecycle.as_ref(),
+        &id,
+    )
+}
+
+fn clear_profile_key_cmd(
+    dir: &Path,
+    state: &SharedAppState,
+    lifecycle: &lifecycle::Lifecycle,
+    id: &str,
+) -> Result<(), String> {
     lifecycle.with_serialized(|| {
-        let dir = config::default_dir();
-        let was_active = config::load_from(&dir)
+        let was_active = config::load_from(dir)
             .map(|c| c.active_id == id)
             .unwrap_or(false);
-        delete_profile_inner(&dir, &id)?;
+        clear_profile_key_inner(dir, id)?;
         if was_active {
             lifecycle.bump_generation();
-            let mut st = lock(state.inner());
+            let mut st = lock(state);
+            st.stop_proxy();
+        }
+        Ok(())
+    })
+}
+
+fn delete_profile_cmd(
+    dir: &Path,
+    state: &SharedAppState,
+    lifecycle: &lifecycle::Lifecycle,
+    id: &str,
+) -> Result<(), String> {
+    lifecycle.with_serialized(|| {
+        let was_active = config::load_from(dir)
+            .map(|c| c.active_id == id)
+            .unwrap_or(false);
+        delete_profile_inner(dir, id)?;
+        if was_active {
+            lifecycle.bump_generation();
+            let mut st = lock(state);
             st.stop_proxy();
         }
         Ok(())
@@ -222,4 +250,124 @@ fn set_active_profile_inner_cmd(
     lifecycle.with_serialized(|| {
         set_active_profile_txn(&app, &state, lifecycle.as_ref(), &id, skip_verify, None)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clear_profile_key_cmd, delete_profile_cmd};
+    use crate::{
+        config::{self, Config, Profile},
+        lifecycle, lock, AppState, SharedAppState,
+    };
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("csswitch-{name}-{n}"))
+    }
+
+    fn profile(id: &str, key: &str) -> Profile {
+        Profile {
+            id: id.into(),
+            name: id.into(),
+            template_id: "deepseek".into(),
+            category: "cn_official".into(),
+            api_format: "anthropic".into(),
+            base_url: "https://api.deepseek.com/anthropic".into(),
+            api_key: key.into(),
+            ..Default::default()
+        }
+    }
+
+    fn state_with_proxy_identity() -> SharedAppState {
+        Arc::new(Mutex::new(AppState {
+            secret: "runtime-secret".into(),
+            provider: "deepseek".into(),
+            key_fp: 42,
+            ..AppState::default()
+        }))
+    }
+
+    #[test]
+    fn clear_active_profile_key_stops_runtime_proxy_identity() {
+        let dir = tmpdir("clear-active-key");
+        let cfg = Config {
+            profiles: vec![profile("active", "sk-active")],
+            active_id: "active".into(),
+            ..Default::default()
+        };
+        config::save_to(&dir, &cfg).unwrap();
+        let state = state_with_proxy_identity();
+        let lifecycle = lifecycle::Lifecycle::new();
+        let before = lifecycle.current_generation();
+
+        clear_profile_key_cmd(&dir, &state, &lifecycle, "active").unwrap();
+
+        let after = config::load_from(&dir).unwrap();
+        assert_eq!(after.profile_by_id("active").unwrap().api_key, "");
+        assert!(lifecycle.current_generation() > before);
+        let st = lock(&state);
+        assert!(st.secret.is_empty());
+        assert!(st.provider.is_empty());
+        assert_eq!(st.key_fp, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_non_active_profile_key_leaves_runtime_proxy_identity() {
+        let dir = tmpdir("clear-non-active-key");
+        let cfg = Config {
+            profiles: vec![profile("active", "sk-active"), profile("other", "sk-other")],
+            active_id: "active".into(),
+            ..Default::default()
+        };
+        config::save_to(&dir, &cfg).unwrap();
+        let state = state_with_proxy_identity();
+        let lifecycle = lifecycle::Lifecycle::new();
+        let before = lifecycle.current_generation();
+
+        clear_profile_key_cmd(&dir, &state, &lifecycle, "other").unwrap();
+
+        let after = config::load_from(&dir).unwrap();
+        assert_eq!(after.profile_by_id("other").unwrap().api_key, "");
+        assert_eq!(lifecycle.current_generation(), before);
+        let st = lock(&state);
+        assert_eq!(st.secret, "runtime-secret");
+        assert_eq!(st.provider, "deepseek");
+        assert_eq!(st.key_fp, 42);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_active_profile_stops_runtime_proxy_identity() {
+        let dir = tmpdir("delete-active-profile");
+        let cfg = Config {
+            profiles: vec![profile("active", "sk-active")],
+            active_id: "active".into(),
+            ..Default::default()
+        };
+        config::save_to(&dir, &cfg).unwrap();
+        let state = state_with_proxy_identity();
+        let lifecycle = lifecycle::Lifecycle::new();
+        let before = lifecycle.current_generation();
+
+        delete_profile_cmd(&dir, &state, &lifecycle, "active").unwrap();
+
+        let after = config::load_from(&dir).unwrap();
+        assert!(after.active_id.is_empty());
+        assert!(after.profile_by_id("active").is_none());
+        assert!(lifecycle.current_generation() > before);
+        let st = lock(&state);
+        assert!(st.secret.is_empty());
+        assert!(st.provider.is_empty());
+        assert_eq!(st.key_fp, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -335,7 +335,7 @@ pub(crate) async fn one_click_login(
     run_blocking(move || one_click_login_cmd(app, state, lifecycle)).await
 }
 
-fn one_click_login_cmd(
+pub(crate) fn one_click_login_cmd(
     app: tauri::AppHandle,
     state: SharedAppState,
     lifecycle: SharedLifecycle,
@@ -426,6 +426,11 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
 }
 
 #[tauri::command]
+pub(crate) fn boot_error(state: State<'_, SharedAppState>) -> Option<String> {
+    lock(state.inner()).boot_error.clone()
+}
+
+#[tauri::command]
 pub(crate) fn open_url(state: State<'_, SharedAppState>) -> Result<(), String> {
     let url = { lock(state.inner()).sandbox_url.clone() };
     let url = url.ok_or("还没有沙箱 URL，请先「一键开始」。")?;
@@ -433,15 +438,8 @@ pub(crate) fn open_url(state: State<'_, SharedAppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn quit_app(
-    app: tauri::AppHandle,
-    state: State<'_, SharedAppState>,
-) -> Result<(), String> {
-    // 默认：退 app 停代理、保留沙箱运行（spec §5.1）。
-    {
-        let mut st = lock(state.inner());
-        st.stop_proxy();
-    }
+pub(crate) fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    // 显式退出统一交给 RunEvent::ExitRequested 清理，避免多个退出入口各自停代理。
     app.exit(0);
     Ok(())
 }

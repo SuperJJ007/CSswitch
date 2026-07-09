@@ -2,7 +2,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tauri::Runtime;
+use tauri::{Manager, Runtime};
 
 use crate::runtime::operation::{
     self, OperationKind, OperationStage, OperationTrace, POLL_INTERVAL_MS,
@@ -18,6 +18,39 @@ fn stop_sandbox_state<R: Runtime>(
     st: &mut AppState,
 ) -> Result<(), String> {
     stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url)
+}
+
+fn open_science_surface<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    url: &str,
+) -> Result<&'static str, String> {
+    if std::env::var("CSSWITCH_SCIENCE_WEBVIEW_SPIKE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        if let Some(win) = app.get_webview_window("science") {
+            let _ = win.close();
+        }
+        let parsed = url
+            .parse()
+            .map_err(|e| format!("Science URL 解析失败：{e}"))?;
+        match tauri::WebviewWindowBuilder::new(app, "science", tauri::WebviewUrl::External(parsed))
+            .title("Claude Science")
+            .inner_size(1100.0, 800.0)
+            .build()
+        {
+            Ok(win) => {
+                let _ = win.set_focus();
+                return Ok("webview");
+            }
+            Err(_) => {
+                // Spike-only path: construction failure falls through to the existing browser surface.
+            }
+        }
+    }
+    open_in_browser(url)?;
+    Ok("browser")
 }
 
 /// One-click session startup: active proxy, virtual login, sandbox, browser.
@@ -50,8 +83,9 @@ pub(crate) fn one_click_login<R: Runtime>(
                 ProxyAction::Reused => "已在运行",
                 ProxyAction::Restarted => "已用新配置重启代理，Science 沿用不变",
             };
-            let msg = match open_in_browser(&url) {
-                Ok(()) => format!("{base}，已重新打开 Science。"),
+            let msg = match open_science_surface(&app, &url) {
+                Ok("webview") => format!("{base}，已重新打开 Science 窗口。"),
+                Ok(_) => format!("{base}，已重新打开 Science。"),
                 Err(_) => format!("{base}，服务已就绪，请手动打开：{url}"),
             };
             trace.finish(format!(
@@ -159,8 +193,9 @@ pub(crate) fn one_click_login<R: Runtime>(
         oauth_forge::LoginAction::Created => "已启动",
         _ => "沙箱已重新启动，沿用原有对话",
     };
-    let msg = match open_in_browser(&url) {
-        Ok(()) => format!("{started}。"),
+    let msg = match open_science_surface(&app, &url) {
+        Ok("webview") => format!("{started}，已打开 Science 窗口。"),
+        Ok(_) => format!("{started}。"),
         Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
     };
     trace.stage(OperationStage::OpenBrowser, "done");
