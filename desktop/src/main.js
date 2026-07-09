@@ -123,7 +123,7 @@ let busyOp = null;
 let busyMsgTimers = [];
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
-let state = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990 };
+let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990 };
 let pendingSkipActivateId = null;   // set_active 校验含糊时，允许「跳过验证」再切
 let pendingConfirm = null;          // 危险操作（清 key / 删除）的「再点一次确认」态
 
@@ -242,7 +242,7 @@ function clearBusyMsgTimers() {
 }
 
 function profileName(id) {
-  const p = (state.profiles || []).find((x) => x.id === id);
+  const p = (configState.profiles || []).find((x) => x.id === id);
   return p ? p.name : id;
 }
 
@@ -330,7 +330,7 @@ function startPortSaveFeedback(changed) {
 function startDoctorFeedback() {
   clearBusyMsgTimers();
   setMsg("自检中：正在运行本地诊断脚本…");
-  scheduleBusyMsg(3500, { kind: "doctor" }, "自检仍在运行。它只检查本地依赖、端口和当前配置摘要，不会读取完整 key。");
+  scheduleBusyMsg(3500, { kind: "doctor" }, "自检仍在运行。它只检查本地依赖、端口和当前配置摘要，不会读取真实 Science HOME，也不会传出、打印或展示完整 key。");
 }
 
 function setBusy(on, op) {
@@ -363,7 +363,7 @@ function escapeHtml(s) {
 }
 
 function tplById(id) {
-  return (state.templates || []).find((t) => t.id === id) || null;
+  return (configState.templates || []).find((t) => t.id === id) || null;
 }
 
 // ── 视图切换：列表 / 新建向导 / 连接编辑 / 改名。一次只显示一个表单（列表隐去减少高度）。──
@@ -401,13 +401,13 @@ function confirmAction(token, promptText, fn) {
 async function loadConfig() {
   try {
     const cfg = await call("get_config");
-    state.profiles = cfg.profiles || [];
-    state.templates = cfg.templates || [];
-    state.active_id = cfg.active_id || "";
-    state.proxy_port = cfg.proxy_port ?? 18991;
-    state.sandbox_port = cfg.sandbox_port ?? 8990;
-    els.proxyPort.value = state.proxy_port;
-    els.sandboxPort.value = state.sandbox_port;
+    configState.profiles = cfg.profiles || [];
+    configState.templates = cfg.templates || [];
+    configState.active_id = cfg.active_id || "";
+    configState.proxy_port = cfg.proxy_port ?? 18991;
+    configState.sandbox_port = cfg.sandbox_port ?? 8990;
+    els.proxyPort.value = configState.proxy_port;
+    els.sandboxPort.value = configState.sandbox_port;
     applyMode(cfg.mode === "official" ? "official" : "proxy");
     renderList();
     showView("list");
@@ -430,13 +430,13 @@ function modelSummary(p) {
 
 function renderList() {
   const list = els.profileList;
-  const ps = state.profiles || [];
+  const ps = configState.profiles || [];
   if (!ps.length) {
     list.innerHTML = '<div class="empty">还没有配置。点右上「＋ 新建」加一条第三方来源。</div>';
     return;
   }
   list.innerHTML = ps.map((p) => {
-    const active = p.id === state.active_id;
+    const active = p.id === configState.active_id;
     const catLabel = CAT_LABELS[p.category] || p.category || "";
     const hasKey = typeof p.has_key === "boolean" ? p.has_key : !!p.key;
     const keyMask = hasKey ? escapeHtml(p.key_masked || p.key || "已保存") : "未填 key";
@@ -523,15 +523,15 @@ async function persistPorts() {
   if (busy) return; // 忙碌中不改端口（防与在途操作竞态；输入亦已禁用，此为双保险）。修 P1-c
   const p = parseInt(els.proxyPort.value, 10) || 18991;
   const s = parseInt(els.sandboxPort.value, 10) || 8990;
-  const changed = p !== state.proxy_port || s !== state.sandbox_port;
+  const changed = p !== configState.proxy_port || s !== configState.sandbox_port;
   // 本次端口提交全程置忙：仅靠开头的 `if (busy) return` 只挡「已在忙时进入」，挡不住本函数在途
   // 时其它操作（切模式/一键/连接编辑）启动。置忙 + 禁用控件才能保证操作顺序符合用户预期。修 GPT 三轮 P2
   setBusy(true, { kind: "ports" });
   startPortSaveFeedback(changed);
   try {
     await call("set_settings", { cfg: { proxy_port: p, sandbox_port: s } });
-    state.proxy_port = p;
-    state.sandbox_port = s;
+    configState.proxy_port = p;
+    configState.sandbox_port = s;
     // 后端在端口变化时会拆掉旧代理/沙箱（否则会复用指向旧端口的死链路），如实告知需重开。修 P1-c
     if (changed) {
       setMsg("端口已保存。改端口会重置正在运行的代理/沙箱，请重新「一键开始」。", "ok");
@@ -541,8 +541,8 @@ async function persistPorts() {
     }
   } catch (e) {
     // 出错＝端口未落盘（校验不过 / 停旧沙箱失败）：把输入框还原成实际生效值，避免显示未保存的数字。
-    els.proxyPort.value = state.proxy_port;
-    els.sandboxPort.value = state.sandbox_port;
+    els.proxyPort.value = configState.proxy_port;
+    els.sandboxPort.value = configState.sandbox_port;
     setMsg(String(e), "err");
   } finally {
     setBusy(false);
@@ -591,14 +591,14 @@ function applyFetchResult(sel, requiresOverride, r) {
 function openWizard() {
   hideSkip();
   renderTemplateChips();
-  const first = (state.templates || [])[0];
+  const first = (configState.templates || [])[0];
   selectWizTemplate(first ? first.id : "");
   showView("wizard");
   setMsg("选择来源，填 key 即可创建。");
 }
 
 function renderTemplateChips() {
-  els.wizTemplateChips.innerHTML = (state.templates || []).map((t) => {
+  els.wizTemplateChips.innerHTML = (configState.templates || []).map((t) => {
     const dot = t.icon_color ? ' style="background:' + escapeHtml(t.icon_color) + '"' : "";
     const cat = CAT_LABELS[t.category] || t.category || "";
     return (
@@ -721,16 +721,16 @@ async function wizSave() {
 // ── C3：连接编辑（base_url/model/key）+ 清 key ──
 function currentConn() {
   const id = els.connSec.dataset.id;
-  return (state.profiles || []).find((x) => x.id === id) || null;
+  return (configState.profiles || []).find((x) => x.id === id) || null;
 }
 
 function openConn(id) {
-  const p = (state.profiles || []).find((x) => x.id === id);
+  const p = (configState.profiles || []).find((x) => x.id === id);
   if (!p) return;
   const t = tplById(p.template_id);
   const capSrc = profileCapabilitySource(p, t);
   const editable = t ? t.base_url_editable : true;
-  const active = id === state.active_id;
+  const active = id === configState.active_id;
   els.connSec.dataset.id = id;
   els.connTitle.textContent = "编辑连接 · " + p.name + (active ? "（当前生效）" : "");
   els.connBase.value = p.base_url || (t ? t.base_url : "");
@@ -808,7 +808,7 @@ async function connSave() {
   if (editable && !base) { setMsg("中转 / 自定义端点必须填写连接地址（base_url）。", "err"); return; }
   const baseErr = openaiCustomAnthropicBaseMessage(t, base);
   if (baseErr) { setMsg(baseErr, "err"); return; }
-  const active = p.id === state.active_id;
+  const active = p.id === configState.active_id;
   // key 留空＝不改（后端语义）；base_url/model 照传。api_format 不在此改（保留模板值）。
   const args = { id: p.id, baseUrl: base, model, key: els.connKey.value.trim() };
   setBusy(true, { kind: "saveConnection", id: p.id });
@@ -837,12 +837,12 @@ async function connSave() {
 
 // 清 key（行内 / 连接表单都可触发）：二次确认后 clear_profile_key。
 function clearKey(id) {
-  const p = (state.profiles || []).find((x) => x.id === id);
+  const p = (configState.profiles || []).find((x) => x.id === id);
   const nm = p ? p.name : id;
   confirmAction("clearkey:" + id, "将清除「" + nm + "」的 API key（需重填才能用）", () => doClearKey(id));
 }
 async function doClearKey(id) {
-  const wasActive = id === state.active_id;
+  const wasActive = id === configState.active_id;
   setBusy(true);
   setMsg("清除 key 中…");
   try {
@@ -864,7 +864,7 @@ async function doClearKey(id) {
 
 // ── C4：改名/备注 + 删除 + 设为当前 ──
 function openMeta(id) {
-  const p = (state.profiles || []).find((x) => x.id === id);
+  const p = (configState.profiles || []).find((x) => x.id === id);
   if (!p) return;
   els.metaSec.dataset.id = id;
   els.metaName.value = p.name;
@@ -891,12 +891,12 @@ async function metaSave() {
 }
 
 function del(id) {
-  const p = (state.profiles || []).find((x) => x.id === id);
+  const p = (configState.profiles || []).find((x) => x.id === id);
   const nm = p ? p.name : id;
   confirmAction("delete:" + id, "将删除配置「" + nm + "」", () => doDelete(id));
 }
 async function doDelete(id) {
-  const wasActive = id === state.active_id;
+  const wasActive = id === configState.active_id;
   setBusy(true);
   setMsg("删除中…");
   try {
@@ -943,7 +943,7 @@ async function activate(id, skipVerify) {
 
 // ── 一键开始：读 active profile。无生效则引导先建/选一条（不再对旧 provider 槽落未提交输入）。──
 async function oneClick() {
-  if (!state.active_id) {
+  if (!configState.active_id) {
     setMsg("还没有「当前生效」的配置。请先「＋ 新建」或在列表点「设为当前」选一条，再一键开始。", "err");
     return;
   }

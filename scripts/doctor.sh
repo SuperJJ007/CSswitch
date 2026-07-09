@@ -7,6 +7,7 @@
 #   CSSWITCH_PROVIDER (生效 template_id，如 deepseek/qwen/glm/xiaomi/…)
 #   CSSWITCH_ADAPTER  (deepseek|qwen|relay)   CSSWITCH_KEY_PRESENT (0|1)
 #   CSSWITCH_PROXY_PORT  CSSWITCH_SANDBOX_PORT  CSSWITCH_CONFIG (config.json 路径)  SCIENCE_BIN
+#   CSSWITCH_DOCTOR_CHECK_REAL_HOME=1  显式 opt-in 后才检查 $HOME/.claude-science 是否存在
 set -u
 
 PROVIDER="${CSSWITCH_PROVIDER:-}"
@@ -16,7 +17,7 @@ PROXY_PORT="${CSSWITCH_PROXY_PORT:-18991}"
 SANDBOX_PORT="${CSSWITCH_SANDBOX_PORT:-8990}"
 CONFIG="${CSSWITCH_CONFIG:-$HOME/.csswitch/config.json}"
 SCIENCE_BIN="${SCIENCE_BIN:-/Applications/Claude Science.app/Contents/Resources/bin/claude-science}"
-REAL_DIR="$HOME/.claude-science"
+CHECK_REAL_HOME="${CSSWITCH_DOCTOR_CHECK_REAL_HOME:-0}"
 
 WARN=0; FAIL=0
 pass() { echo "  ✓ $1"; }
@@ -55,7 +56,7 @@ classify_port() {  # $1=port；打印占用分型
   local lc
   lc="$(printf '%s' "$cmd" | tr '[:upper:]' '[:lower:]')"
   case "$lc" in
-    *python*|*csswitch*|*claude-science*) echo "疑似 CSSwitch 旧进程：$cmd（可 stop_all 或手动清）" ;;
+    *python*|*csswitch*|*claude-science*) echo "疑似 CSSwitch 旧进程：${cmd}（可 stop_all 或手动清）" ;;
     *) echo "未知占用：$cmd" ;;
   esac
 }
@@ -77,7 +78,12 @@ else
 fi
 
 echo "[铁律]"
-if [ -d "$REAL_DIR" ]; then pass "真实目录存在（本工具只读诊断，绝不写/删）：$REAL_DIR"; else warn "未见真实 Science 目录：$REAL_DIR"; fi
+if [ "$CHECK_REAL_HOME" = "1" ]; then
+  REAL_DIR="$HOME/.claude-science"
+  if [ -d "$REAL_DIR" ]; then pass "真实目录存在（显式 opt-in 只读检查，绝不写/删）：$REAL_DIR"; else warn "未见真实 Science 目录（显式 opt-in 只读检查）：$REAL_DIR"; fi
+else
+  pass "真实 HOME 检查默认跳过（未设置 CSSWITCH_DOCTOR_CHECK_REAL_HOME=1，不读取 ~/.claude-science）"
+fi
 
 echo "----"
 echo "诊断完成：警告 ${WARN}，失败 ${FAIL}"

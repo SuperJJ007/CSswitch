@@ -119,6 +119,8 @@ CSSwitch includes a read-only capability catalog that makes known compatibility 
 
 This catalog is for diagnostics and observability. It is not proof that a live provider, real Claude account state, Science GUI E2E flow, DMG signing/notarization, or official hosted capability has been verified. A catalog rule id means CSSwitch records that rule or boundary; it does not mean external providers, Anthropic-hosted MCP, Directory connectors, or remote skills are fully verified or fixed.
 
+Status lights are local observations only. For example, the sandbox light is local HTTP health, not proof that the port has been identity-verified as the CSSwitch sandbox Science instance. `Doctor` skips the real `~/.claude-science` path by default; checking whether the real HOME path exists requires explicitly setting `CSSWITCH_DOCTOR_CHECK_REAL_HOME=1`.
+
 ## How it protects your real account
 
 CSSwitch's core boundary is simple: third-party model mode only operates inside the sandbox. It does not take over your real Claude account.
@@ -183,11 +185,12 @@ npm run tauri dev
 Common checks:
 
 ```bash
-cd desktop/src-tauri
-cargo test
+bash test/run_all.sh
+bash test/run_all.sh --require-release-ready
 
-cd ../..
-python3 -m pytest test
+python3 -m unittest test.test_proxy_units test.test_provider_policy test.test_proxy_packaging -v
+(cd desktop/src-tauri && cargo test)
+node --check desktop/src/main.js
 ```
 
 More development notes:

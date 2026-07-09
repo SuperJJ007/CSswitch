@@ -30,6 +30,19 @@ pub(crate) fn default_mode() -> String {
     "proxy".to_string()
 }
 
+pub(crate) fn validate_runtime_ports(proxy_port: u16, sandbox_port: u16) -> Result<(), String> {
+    if proxy_port == 8765 || sandbox_port == 8765 {
+        return Err("端口 8765 是真实 Science 实例保留端口，不能用。".into());
+    }
+    if proxy_port == 0 || sandbox_port == 0 {
+        return Err("端口不能为 0。".into());
+    }
+    if proxy_port == sandbox_port {
+        return Err("代理端口与沙箱端口不能相同。".into());
+    }
+    Ok(())
+}
+
 /// 当前配置 schema 版本。>2 的文件由更新版本 app 写入，本版本拒绝启动（不误改）。
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
@@ -361,6 +374,7 @@ pub fn load_from(dir: &Path) -> io::Result<Config> {
                     filled.len()
                 ));
             }
+            validate_loaded_ports(&cfg)?;
             save_to(dir, &cfg)?; // 落盘为 v2（幂等，下次读走 V2 分支）
             Ok(cfg)
         }
@@ -379,11 +393,23 @@ pub fn load_from(dir: &Path) -> io::Result<Config> {
                     "已为 {} 个旧配置补上默认模型（可在连接编辑修改）。",
                     filled.len()
                 ));
+                validate_loaded_ports(&cfg)?;
                 save_to(dir, &cfg)?;
+            } else {
+                validate_loaded_ports(&cfg)?;
             }
             Ok(cfg)
         }
     }
+}
+
+fn validate_loaded_ports(cfg: &Config) -> io::Result<()> {
+    validate_runtime_ports(cfg.proxy_port, cfg.sandbox_port).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config.json 端口无效：{e}"),
+        )
+    })
 }
 
 /// 加载后归一化两个不变式（spec §4）：
@@ -627,6 +653,57 @@ mod tests {
         let got = load_from(&d).unwrap();
         assert_eq!(got, cfg);
         assert_eq!(got.active_profile().unwrap().api_key, "sk-abcdef1234");
+    }
+
+    #[test]
+    fn load_rejects_invalid_runtime_ports() {
+        let cases = [
+            ("proxy_8765", 8765, 8990),
+            ("sandbox_8765", 18991, 8765),
+            ("proxy_zero", 0, 8990),
+            ("sandbox_zero", 18991, 0),
+            ("same_ports", 18991, 18991),
+        ];
+        for (name, proxy_port, sandbox_port) in cases {
+            let d = tmpdir().join(format!(".csswitch-{name}"));
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                config_path(&d),
+                format!(
+                    r#"{{"schema_version":2,"profiles":[],"active_id":"","proxy_port":{proxy_port},"sandbox_port":{sandbox_port}}}"#
+                ),
+            )
+            .unwrap();
+            let err = load_from(&d).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name}");
+            assert!(
+                err.to_string().contains("config.json 端口无效"),
+                "error should identify invalid config ports for {name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_legacy_invalid_ports_before_v2_save() {
+        let d = tmpdir().join(".csswitch-legacy-bad-port");
+        fs::create_dir_all(&d).unwrap();
+        let legacy = r#"{
+            "provider":"deepseek",
+            "proxy_port":18991,
+            "sandbox_port":8765,
+            "secret":"sec",
+            "mode":"proxy",
+            "providers":{"deepseek":{"key":"sk-ds","base_url":"","model":""}}
+        }"#;
+        fs::write(config_path(&d), legacy).unwrap();
+        let err = load_from(&d).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let after = fs::read_to_string(config_path(&d)).unwrap();
+        assert!(
+            !after.contains("\"schema_version\""),
+            "invalid legacy config should not be saved as v2: {after}"
+        );
+        assert!(d.join("config.json.v1.bak").is_file());
     }
 
     // ---------- A2: 版本探测 ----------

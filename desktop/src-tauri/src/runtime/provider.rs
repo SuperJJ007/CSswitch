@@ -139,29 +139,57 @@ pub(crate) fn current_shim_mode_for_adapter(adapter: &str) -> &'static str {
     )
 }
 
-/// 上游主机名（供 status 上游灯做 TCP 可达性探测）。relay 家族从其 base_url 解析。
-pub(crate) fn upstream_host(adapter: &str, base_url: &str) -> String {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UpstreamEndpoint {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
+
+/// 上游 authority（host + port），供 status 灯按真实 scheme/端口探测。
+pub(crate) fn upstream_endpoint(adapter: &str, base_url: &str) -> Option<UpstreamEndpoint> {
     match adapter {
-        "deepseek" => "api.deepseek.com".to_string(),
-        "qwen" => "dashscope.aliyuncs.com".to_string(),
-        _ => parse_host(base_url).unwrap_or_default(),
+        "deepseek" => Some(UpstreamEndpoint {
+            host: "api.deepseek.com".to_string(),
+            port: 443,
+        }),
+        "qwen" => Some(UpstreamEndpoint {
+            host: "dashscope.aliyuncs.com".to_string(),
+            port: 443,
+        }),
+        _ => parse_endpoint(base_url),
     }
 }
 
-/// 从 `http(s)://host[:port]/path` 里抽出 host。解析不出返回 None（不引 url crate）。
-pub(crate) fn parse_host(url: &str) -> Option<String> {
-    let rest = url
+/// 从 `http(s)://host[:port]/path` 里抽出 host + port。解析不出返回 None（不引 url crate）。
+pub(crate) fn parse_endpoint(url: &str) -> Option<UpstreamEndpoint> {
+    let (rest, default_port) = url
         .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let host = rest
-        .split(['/', ':', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .to_string();
+        .map(|r| (r, 443))
+        .or_else(|| url.strip_prefix("http://").map(|r| (r, 80)))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(after_open) = authority.strip_prefix('[') {
+        let (host, rest) = after_open.split_once(']')?;
+        let port = match rest.strip_prefix(':') {
+            Some(raw) if !raw.is_empty() => raw.parse().ok()?,
+            Some(_) => return None,
+            None => default_port,
+        };
+        (host.to_string(), port)
+    } else {
+        let (host, port) = match authority.split_once(':') {
+            Some((host, raw)) if !raw.is_empty() => (host, raw.parse().ok()?),
+            Some(_) => return None,
+            None => (authority, default_port),
+        };
+        (host.to_string(), port)
+    };
     if host.is_empty() {
         None
     } else {
-        Some(host)
+        Some(UpstreamEndpoint { host, port })
     }
 }
 
@@ -190,9 +218,9 @@ pub(crate) fn relay_missing_model(adapter: &str, model: &str) -> bool {
 mod tests {
     use super::{
         adapter_for_profile, assert_format_supported, gateway_kind_for_adapter,
-        key_env_for_adapter, key_fingerprint, normalize_shim_mode, parse_host, proxy_args_for,
+        key_env_for_adapter, key_fingerprint, normalize_shim_mode, parse_endpoint, proxy_args_for,
         proxy_fingerprint, proxy_fingerprint_with_runtime, reject_openai_custom_anthropic_base,
-        relay_missing_base_url, relay_missing_model, should_scratch_candidate, upstream_host,
+        relay_missing_base_url, relay_missing_model, should_scratch_candidate, upstream_endpoint,
     };
     use crate::config::Profile;
 
@@ -391,36 +419,41 @@ mod tests {
     }
 
     #[test]
-    fn parse_host_extracts_host_from_relay_base_url() {
+    fn parse_endpoint_preserves_scheme_default_and_explicit_ports() {
         assert_eq!(
-            parse_host("https://byteswarm.ai/claude").as_deref(),
-            Some("byteswarm.ai")
+            parse_endpoint("https://relay.example.com/api"),
+            Some(super::UpstreamEndpoint {
+                host: "relay.example.com".to_string(),
+                port: 443,
+            })
         );
         assert_eq!(
-            parse_host("http://127.0.0.1:8080/v1").as_deref(),
-            Some("127.0.0.1")
+            parse_endpoint("http://127.0.0.1:11434/v1"),
+            Some(super::UpstreamEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 11434,
+            })
         );
         assert_eq!(
-            parse_host("https://relay.example.com:8443").as_deref(),
-            Some("relay.example.com")
+            parse_endpoint("http://localhost/v1"),
+            Some(super::UpstreamEndpoint {
+                host: "localhost".to_string(),
+                port: 80,
+            })
         );
-        assert_eq!(parse_host("byteswarm.ai/claude"), None);
-        assert_eq!(parse_host(""), None);
+        assert_eq!(parse_endpoint("https://relay.example.com:"), None);
     }
 
     #[test]
-    fn upstream_host_by_adapter() {
-        assert_eq!(upstream_host("deepseek", ""), "api.deepseek.com");
-        assert_eq!(upstream_host("qwen", ""), "dashscope.aliyuncs.com");
+    fn upstream_endpoint_by_adapter() {
         assert_eq!(
-            upstream_host("openai-custom", "https://open.bigmodel.cn/api/paas/v4"),
-            "open.bigmodel.cn"
+            upstream_endpoint("openai-custom", "http://127.0.0.1:11434/v1"),
+            Some(super::UpstreamEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 11434,
+            })
         );
-        assert_eq!(
-            upstream_host("relay", "https://open.bigmodel.cn/api/anthropic"),
-            "open.bigmodel.cn"
-        );
-        assert_eq!(upstream_host("", ""), "", "无生效配置 -> 空（灯显黄）");
+        assert_eq!(upstream_endpoint("", ""), None);
     }
 
     #[test]

@@ -69,6 +69,7 @@ pub(crate) fn build_status_response(
     shim_mode: &str,
     catalog: serde_json::Value,
     science: serde_json::Value,
+    last_error: Option<serde_json::Value>,
 ) -> serde_json::Value {
     json!({
         "proxy": lights.proxy,
@@ -81,7 +82,7 @@ pub(crate) fn build_status_response(
         },
         "catalog": catalog,
         "science": science,
-        "last_error": null,
+        "last_error": last_error.unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -142,6 +143,7 @@ mod tests {
                 sandbox_port: 8990,
                 sandbox_ok: false,
             }),
+            None,
         );
         assert_eq!(v["proxy"], "green");
         assert_eq!(v["sandbox"], "amber");
@@ -159,5 +161,30 @@ mod tests {
             "science.auth.refresh-hardcoded-0_1_15"
         );
         assert!(v["last_error"].is_null());
+    }
+
+    #[test]
+    fn status_response_can_surface_typed_last_error() {
+        let v = build_status_response(
+            status_lights(StatusProbeInput {
+                proxy_ok: false,
+                sandbox_ok: false,
+                upstream_ok: false,
+            }),
+            serde_json::Value::Null,
+            "python",
+            "off",
+            json!({"schema_version": 1}),
+            science_diagnostics(ScienceDiagnosticsInput {
+                sandbox_port: 8990,
+                sandbox_ok: false,
+            }),
+            Some(json!({
+                "type": "config_error",
+                "message": "config unreadable",
+            })),
+        );
+        assert_eq!(v["last_error"]["type"], "config_error");
+        assert_eq!(v["last_error"]["message"], "config unreadable");
     }
 }

@@ -1,6 +1,8 @@
-# Provider / API 支持调研与计划
+# Provider / API 支持调研与计划（Historical Research）
 
-目标：CSSwitch 支持的第三方 API **尽量多**，慢慢实现。本文回答两个核心问题（到底走 Anthropic 端点还是 OpenAI 端点、Claude Science 的工具调用格式怎么处理），并给出候选 provider 清单与实现优先级。对应 roadmap 见 [`known-issues.md`](known-issues.md) 第 2 条。
+> **Historical / reference-only status（2026-07-09）：** 本文是早期 provider/API 调研留档，不是当前产品支持矩阵、release gate 或 live provider 验证清单。当前实现事实以 [`desktop/src-tauri/src/templates.rs`](../desktop/src-tauri/src/templates.rs)、[`catalog/capabilities.v1.json`](../catalog/capabilities.v1.json)、[`docs/provider-capability-matrix.md`](provider-capability-matrix.md) 和运行时 `status().catalog` 为准。本文保留 CC Switch / CS native 参考和候选 provider 线索，但不得被解读为 CSSwitch 已完整支持、验证或承诺这些 provider。
+
+目标：记录第三方 API 支持方向。本文回答两个核心问题（到底走 Anthropic 端点还是 OpenAI 端点、Claude Science 的工具调用格式怎么处理），并给出候选 provider 清单与实现优先级。对应 roadmap 见 [`known-issues.md`](known-issues.md) 第 2 条。
 
 > 状态：**调研封存**（用户 2026-07-03 叫停）。#1 文案脱敏已完成；**本研究的落地切片「面板内自定义 OpenAI 端点」已定为 #1 之后的下个主线**（见 [`known-issues.md`](known-issues.md) 文末）。已定稿：核心分型、Science 工具调用格式与翻译坑、CC Switch 参考（第三节）、国际 provider 数据（已调研）。**待续**：把国产各家 OpenAI 端点 / 模型细节并成第四节大表（深挖 agent 中断）。
 >

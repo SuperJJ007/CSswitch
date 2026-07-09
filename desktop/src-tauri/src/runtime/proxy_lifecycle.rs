@@ -4,11 +4,36 @@ use std::time::Duration;
 use crate::runtime::operation::{self, OperationStage, OperationTrace, POLL_INTERVAL_MS};
 use crate::runtime::provider::{
     assert_format_supported, is_native_adapter, is_openai_adapter, proxy_args_for,
-    proxy_fingerprint,
+    proxy_fingerprint, ProxyLaunch,
 };
 use crate::runtime::proxy::{ere_escape, health_timeout_reason, should_write_back, ProxyAction};
 use crate::runtime::system::{asset_root, log_path, open_log, redact, tail_file};
 use crate::{config, lifecycle, lock, proc, SharedAppState};
+
+fn formal_proxy_env(launch: &ProxyLaunch) -> Vec<(&'static str, String)> {
+    let native = is_native_adapter(&launch.adapter);
+    let mut env = vec![(launch.key_env, launch.key.clone())];
+    if !native {
+        if is_openai_adapter(&launch.adapter) {
+            env.push(("CSSWITCH_OPENAI_BASE_URL", launch.base_url.clone()));
+            if !launch.model.is_empty() {
+                env.push(("CSSWITCH_OPENAI_MODEL", launch.model.clone()));
+            }
+        } else {
+            env.push(("CSSWITCH_RELAY_BASE_URL", launch.base_url.clone()));
+            if !launch.model.is_empty() {
+                env.push(("CSSWITCH_RELAY_MODEL", launch.model.clone()));
+            }
+            if !launch.thinking_policy.is_empty() {
+                env.push((
+                    "CSSWITCH_RELAY_THINKING",
+                    launch.thinking_policy.to_string(),
+                ));
+            }
+        }
+    }
+    env
+}
 
 /// Ensure the active profile's proxy is running and healthy.
 pub(crate) fn ensure_proxy(
@@ -112,23 +137,9 @@ pub(crate) fn start_proxy_for(
             .arg("--port")
             .arg(port.to_string())
             .arg("--auth-token")
-            .arg(&secret)
-            .env(launch.key_env, &launch.key);
-        if !native {
-            if is_openai_adapter(&launch.adapter) {
-                cmd.env("CSSWITCH_OPENAI_BASE_URL", &launch.base_url);
-                if !launch.model.is_empty() {
-                    cmd.env("CSSWITCH_OPENAI_MODEL", &launch.model);
-                }
-            } else {
-                cmd.env("CSSWITCH_RELAY_BASE_URL", &launch.base_url);
-                if !launch.model.is_empty() {
-                    cmd.env("CSSWITCH_RELAY_MODEL", &launch.model);
-                }
-                if !launch.thinking_policy.is_empty() {
-                    cmd.env("CSSWITCH_RELAY_THINKING", launch.thinking_policy);
-                }
-            }
+            .arg(&secret);
+        for (k, v) in formal_proxy_env(&launch) {
+            cmd.env(k, v);
         }
         cmd.stdout(Stdio::from(logf))
             .stderr(Stdio::from(logf2))
@@ -173,4 +184,75 @@ pub(crate) fn start_proxy_for(
         st.key_fp = key_fp;
     }
     Ok((port, secret, ProxyAction::Restarted))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::formal_proxy_env;
+    use crate::runtime::provider::ProxyLaunch;
+
+    fn launch(adapter: &str, model: &str) -> ProxyLaunch {
+        launch_with_thinking(adapter, model, "")
+    }
+
+    fn launch_with_thinking(
+        adapter: &str,
+        model: &str,
+        thinking_policy: &'static str,
+    ) -> ProxyLaunch {
+        ProxyLaunch {
+            adapter: adapter.to_string(),
+            base_url: "https://upstream.example/api".to_string(),
+            model: model.to_string(),
+            key: "test-key".to_string(),
+            key_env: if matches!(adapter, "openai-custom" | "openai-responses") {
+                "CSSWITCH_OPENAI_KEY"
+            } else {
+                "CSSWITCH_RELAY_KEY"
+            },
+            thinking_policy,
+        }
+    }
+
+    #[test]
+    fn formal_proxy_env_pins_relay_model_only_on_formal_launch() {
+        let env = formal_proxy_env(&launch("relay", "glm-5.2"));
+        assert!(env.contains(&(
+            "CSSWITCH_RELAY_BASE_URL",
+            "https://upstream.example/api".to_string()
+        )));
+        assert!(env.contains(&("CSSWITCH_RELAY_MODEL", "glm-5.2".to_string())));
+    }
+
+    #[test]
+    fn formal_proxy_env_pins_openai_model_only_on_formal_launch() {
+        let env = formal_proxy_env(&launch("openai-custom", "gpt-5.2"));
+        assert!(env.contains(&(
+            "CSSWITCH_OPENAI_BASE_URL",
+            "https://upstream.example/api".to_string()
+        )));
+        assert!(env.contains(&("CSSWITCH_OPENAI_MODEL", "gpt-5.2".to_string())));
+    }
+
+    #[test]
+    fn formal_proxy_env_native_adapter_only_sets_native_key() {
+        let mut native = launch("deepseek", "");
+        native.key_env = "DEEPSEEK_API_KEY";
+        let env = formal_proxy_env(&native);
+        assert_eq!(env, vec![("DEEPSEEK_API_KEY", "test-key".to_string())]);
+    }
+
+    #[test]
+    fn formal_proxy_env_empty_model_does_not_pin_model() {
+        let env = formal_proxy_env(&launch("relay", ""));
+        assert!(env.iter().any(|(k, _)| *k == "CSSWITCH_RELAY_BASE_URL"));
+        assert!(!env.iter().any(|(k, _)| *k == "CSSWITCH_RELAY_MODEL"));
+        assert!(!env.iter().any(|(k, _)| *k == "CSSWITCH_OPENAI_MODEL"));
+    }
+
+    #[test]
+    fn formal_proxy_env_preserves_relay_thinking_policy() {
+        let env = formal_proxy_env(&launch_with_thinking("relay", "glm-5.2", "enabled"));
+        assert!(env.contains(&("CSSWITCH_RELAY_THINKING", "enabled".to_string())));
+    }
 }

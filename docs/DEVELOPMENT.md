@@ -24,9 +24,9 @@ CSSwitch = 翻译代理（Python）+ 虚拟登录伪造器（**Rust 原生**）+
 
 app 是**进程管家**：Rust 后端起停子进程、注入环境变量、读写配置、探活、跑切换事务；已验证的越权/翻译逻辑仍留在 `proxy/`、`scripts/` 里被当子进程调用（保住护栏与已验证行为，Rust 侧最小）。虚拟 OAuth 伪造已移进 Rust（`src-tauri/src/oauth_forge.rs`，字节级一致、护栏拒真实目录），**app 运行不需要 Node.js**；`scripts/make-virtual-oauth.mjs` 是等价的 Node 独立版，仅命令行单独用时才需要 node。
 
-## 现状（截至 2026-07-04，`main`，最新发布 v0.3.2）
+## 现状（截至 2026-07-09，`main`，最新发布线 v0.3.6）
 
-**已发布**：v0.3.2（Latest）—— 见 [`../CHANGELOG.md`](../CHANGELOG.md) 与 GitHub Releases（此处不复述版本号，以那两处为准）。
+**已发布**：当前发布事实以 [`../CHANGELOG.md`](../CHANGELOG.md) 与 GitHub Releases 为准；本文件只记录架构与开发流程，不作为发布状态唯一来源。
 
 **能力面**：
 - **多 profile 配置管理**（cc-switch 式）：7 家 provider 模板（DeepSeek / 通义千问 / 智谱 GLM / Kimi / MiniMax / 小米 MiMo / 硅基流动 / OpenRouter）+ 自定义端点；同一家可保存多套（不同 key / 模型）；JSON 存储 `~/.csswitch/config.json`（schema v2，v1→v2 一次性迁移），key 明文 0600、只回掩码。
@@ -82,9 +82,10 @@ npm run tauri build               # 打包 → src-tauri/target/release/bundle/d
 ## 离线回归
 
 ```bash
-bash test/run_all.sh                        # python 单元 + node 伪造器 + bash 脚本三件套（不碰 Science、不联网）
-python3 -m pytest test/test_proxy_units.py  # 代理纯逻辑单测（40）
-cd desktop/src-tauri && cargo test          # Rust 后端单测（122）；配 cargo clippy --all-targets -- -D warnings + cargo fmt --check
+bash test/run_all.sh                        # S0 分层门：offline / loopback / scripts / rust / frontend
+bash test/run_all.sh --require-release-ready # 要求所有层 pass 且无 env-blocked
+python3 -m unittest test.test_proxy_units test.test_provider_policy test.test_proxy_packaging -v
+cd desktop/src-tauri && cargo test          # Rust 后端单测；配 cargo clippy --all-targets -- -D warnings + cargo fmt --check
 node --check desktop/src/main.js            # 前端语法（不加 node 测试依赖，前端逻辑预览手验）
 ```
 
@@ -124,7 +125,7 @@ registry = "sparse+https://rsproxy.cn/index/"
 ## 发版流程（v0.3.2 实操记录）
 
 ```bash
-# 0. 功能分支合 main（真机验证过后），跑全绿：cargo test / clippy / fmt / pytest / node --check
+# 0. 功能分支合 main（真机验证过后），跑全绿：run_all --require-release-ready / cargo test / clippy / fmt / node --check
 # 1. 版本号 bump（5 处一致）：desktop/package.json + package-lock.json（根 + packages[""]）
 #    + src-tauri/Cargo.toml + Cargo.lock（desktop 包）+ tauri.conf.json
 # 2. CHANGELOG.md 加条目（已修问题从 known-issues「毕业」到这里）；README 若有能力面变化一并改

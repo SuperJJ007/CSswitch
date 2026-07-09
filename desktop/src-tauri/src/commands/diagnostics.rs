@@ -11,7 +11,7 @@ pub(crate) async fn run_doctor(app: tauri::AppHandle) -> Result<String, String> 
 
 fn run_doctor_inner_cmd(app: tauri::AppHandle) -> Result<String, String> {
     let root = asset_root(&app).ok_or("找不到 scripts/doctor.sh（打包资源或仓库根均未命中）。")?;
-    let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
+    let cfg = doctor_config_from(&config::default_dir())?;
     let doctor = root.join("scripts/doctor.sh");
     // 生效 profile 的展示名（template_id）+ adapter + 有无 key；无生效配置则留空。
     let (provider_label, adapter, has_key) = match cfg.active_profile() {
@@ -39,6 +39,10 @@ fn run_doctor_inner_cmd(app: tauri::AppHandle) -> Result<String, String> {
         text.push_str(err.trim());
     }
     Ok(text)
+}
+
+fn doctor_config_from(dir: &std::path::Path) -> Result<config::Config, String> {
+    config::load_from(dir).map_err(|e| format!("读取配置失败，无法运行自检：{e}"))
 }
 
 /// 当前 app 版本（供前端「检查更新」与页脚版本号用）。
@@ -69,4 +73,34 @@ pub(crate) fn open_logs() -> Result<(), String> {
         .status()
         .map_err(|e| format!("打开日志目录失败：{e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::doctor_config_from;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("csswitch-doctor-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn doctor_config_rejects_reserved_port_instead_of_defaulting() {
+        let dir = tmpdir("reserved-port");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            br#"{"schema_version":2,"profiles":[],"active_id":"","proxy_port":8765,"sandbox_port":8990}"#,
+        )
+        .unwrap();
+
+        let err = doctor_config_from(&dir).unwrap_err();
+        assert!(err.contains("读取配置失败"));
+        assert!(err.contains("8765"));
+    }
 }

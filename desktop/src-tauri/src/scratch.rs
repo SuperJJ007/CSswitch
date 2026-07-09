@@ -346,6 +346,36 @@ mod tests {
     }
 
     #[test]
+    fn scratch_env_models_discovery_does_not_pin_relay_model() {
+        let env = scratch_env(
+            "relay",
+            "CSSWITCH_RELAY_KEY",
+            "sk-y",
+            "https://r/claude",
+            None,
+            "",
+        );
+        assert!(env.iter().any(|(k, _)| k == "CSSWITCH_RELAY_BASE_URL"));
+        assert!(!env.iter().any(|(k, _)| k == "CSSWITCH_RELAY_MODEL"));
+        assert!(!env.iter().any(|(k, _)| k == "CSSWITCH_OPENAI_MODEL"));
+    }
+
+    #[test]
+    fn scratch_env_models_discovery_does_not_pin_openai_model() {
+        let env = scratch_env(
+            "openai-custom",
+            "CSSWITCH_OPENAI_KEY",
+            "sk-z",
+            "https://open.bigmodel.cn/api/paas/v4",
+            None,
+            "",
+        );
+        assert!(env.iter().any(|(k, _)| k == "CSSWITCH_OPENAI_BASE_URL"));
+        assert!(!env.iter().any(|(k, _)| k == "CSSWITCH_OPENAI_MODEL"));
+        assert!(!env.iter().any(|(k, _)| k == "CSSWITCH_RELAY_MODEL"));
+    }
+
+    #[test]
     fn scratch_env_openai_custom_sets_openai_base_and_model() {
         let env = scratch_env(
             "openai-custom",

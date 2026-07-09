@@ -2,16 +2,18 @@
 
 本文件记待修队列与近期排期。按用户反馈与自测记录，附根因与方向。
 
-> **✅ 最新（2026-07-04）：`v0.3.0` 正式版已发布为 Latest**（主题「多 API 支持 + UI 改版」）。自研功能线已 **merge 进 `main`**（`c6e23bc` + 版本 bump `8fa66f3`），真机验收由用户在场完成，本地也已升 0.3.0。**已随本版毕业**：`#8` 多 profile 配置管理、原排期②「面板内自定义 OpenAI 端点」（7 家 provider + 自定义端点已交付）、relay 中转站、DSML 兜底 shim（默认 off）、面板 UI 改版 + 本轮 bug 修（掩码横向溢出 / 自检多 profile 感知 / 去常驻反馈栏）。详见 CHANGELOG `[0.3.0]`。**剩余待办**：① issue #3 原生入口（打开 app 即自动起 Science + 后台常驻，spec 已写、待做）；② 翻译代理移 Rust/axum 拔 python；③ DSML 阶段二 rewrite 前 3 闸门（rewrite 仍默认 off）。
+> **✅ 当前发布线（2026-07-09）：CHANGELOG 已到 `v0.3.6`。** 历史 `v0.3.0`（2026-07-04）发布了「多 API 支持 + UI 改版」，随后 `v0.3.2`–`v0.3.6` 继续补上模型选择器、自定义 OpenAI / Responses 等发布切片。发布事实以 [`../CHANGELOG.md`](../CHANGELOG.md) 与 GitHub Releases 为准。**长期剩余待办**：① issue #3 原生入口（打开 app 即自动起 Science + 后台常驻，spec 已写、待做）；② 翻译代理移 Rust/axum 拔 python；③ DSML 阶段二 rewrite 前 3 闸门（rewrite 仍默认 off）。
 
-> **排期（历史）**：**v0.2.1**（Latest 曾至 2026-07-04，登录热修：修 0.2.0 两处「一键开始走完仍落登录页」缺陷，见 #7 与 CHANGELOG）。此前 v0.2.0（#3 幂等 forge 毕业 + 三轮外审 + 阻止 #6 复发）。#6 待 #6b 做完历史恢复才真正修复毕业。
+> **2026-07-09 重构收口注记（当前源码工作树）：** main 已在 #37-#40 后继续补强 packaging gate、architecture boundary、runtime/status/provider/science diagnostics、set-current vs discovery/pin 边界、doctor 默认不探真实 HOME、frontend config snapshot 命名和文档边界。已验证的是源码单元/脚本/代理契约与隔离 mock 路径；这**不等于**真实账号态、真实 `~/.claude-science`、Science GUI E2E、live provider E2E、published DMG、签名或公证验证。Phase 7/release 前仍需按 `test/run_all.sh --require-release-ready`、打包资源 smoke、必要真机手测分开确认。
+
+> **排期（历史）**：**v0.2.1**（2026-07-03 登录热修：修 0.2.0 两处「一键开始走完仍落登录页」缺陷，见 #7 与 CHANGELOG）。此前 v0.2.0（#3 幂等 forge 毕业 + 三轮外审 + 阻止 #6 复发）。#6 待 #6b 做完历史恢复才真正修复毕业。
 
 > **约定**：已修问题发布后从本文件「毕业」到 [`../CHANGELOG.md`](../CHANGELOG.md)。
-> **v0.3.0 已发布**（2026-07-04，Latest）：多 API 支持 + UI 改版，见顶部横幅 / CHANGELOG `[0.3.0]`。此前 **v0.2.1**（2026-07-03）：登录热修（`sandbox_url` 多行 URL 只取首条 + 健康快捷路径先只读校验登录态），见 #7 / CHANGELOG `[0.2.1]`。此前 **v0.2.0**：#3 运行中再点主按钮幂等分派（幂等 forge：org_uuid 只在真首启铸一次、此后 sticky，健康沙箱不重伪造）+ 三轮 GPT 外审 + 阻止 #6 复发。更早 v0.1.5（#1 文案脱敏）、v0.1.4（node-ectomy、卡死实机修 403→401、正常窗口去托盘）见 CHANGELOG。
+> **v0.3.x 发布线**：`v0.3.0`（2026-07-04）发布多 API 支持 + UI 改版，后续 `v0.3.2`–`v0.3.6` 继续发布模型选择器、自定义 OpenAI / Responses 等切片；具体版本以 CHANGELOG 为准。此前 **v0.2.1**（2026-07-03）：登录热修（`sandbox_url` 多行 URL 只取首条 + 健康快捷路径先只读校验登录态），见 #7 / CHANGELOG `[0.2.1]`。此前 **v0.2.0**：#3 运行中再点主按钮幂等分派（幂等 forge：org_uuid 只在真首启铸一次、此后 sticky，健康沙箱不重伪造）+ 三轮 GPT 外审 + 阻止 #6 复发。更早 v0.1.5（#1 文案脱敏）、v0.1.4（node-ectomy、卡死实机修 403→401、正常窗口去托盘）见 CHANGELOG。
 
 ## 1. ✅ 对外文案脱敏（已随 v0.1.5 发布，已毕业）
 
-> 主按钮及提示文案「一键越过登录」→「一键开始」，已随 **v0.1.5**（2026-07-03，Latest）发布。详情见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.1.5]`。编号保留占位，避免与 #2–#5 混淆。
+> 主按钮及提示文案「一键越过登录」→「一键开始」，已随 **v0.1.5**（2026-07-03，当时发布线）发布。详情见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.1.5]`。编号保留占位，避免与 #2–#5 混淆。
 >
 > **长期约定**：用户可见文案保持中性，别再引入「越过 / 绕过登录」这类字眼；技术内部文档描述机制时可仍用「越过门票 / 虚拟登录」。
 
@@ -39,7 +41,7 @@
 
 ## 3. ✅ 运行中再点主按钮的幂等分派（已随 v0.2.0 发布，已毕业）
 
-> **状态：已随 v0.2.0（2026-07-03，Latest）发布并毕业到 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.2.0]`。** 幂等 forge 落地（org_uuid 只在真首启铸一次、此后 sticky，健康沙箱只重开不重伪造），实机 T1 已验证「会话不会丢」；同时阻止 #6 复发。详细设计与实现计划见本地开发文档（不入库）。原设计如下（历史留存）：
+> **状态：已随 v0.2.0（2026-07-03，当时发布线）发布并毕业到 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.2.0]`。** 幂等 forge 落地（org_uuid 只在真首启铸一次、此后 sticky，健康沙箱只重开不重伪造），实机 T1 已验证「会话不会丢」；同时阻止 #6 复发。详细设计与实现计划见本地开发文档（不入库）。原设计如下（历史留存）：
 >
 > 主按钮在「已在运行」时再点，行为要更合理。同时修 #6（更新后对话孤儿化，下游用户反馈）。
 
@@ -92,7 +94,7 @@
 
 ## 7. ✅「开了 CSSwitch 仍要登录」登录热修（已随 v0.2.1 发布，已毕业）
 
-> **状态：已随 v0.2.1（2026-07-03，Latest）发布并毕业到 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.2.1]`。** 下游 0.2.0 用户反馈「开了 switch、一键开始走完仍要登录」。GPT 两轮诊断 + 对代码逐条核实，锁定 0.2.0 两处缺陷（走 systematic-debugging，test-first 红→绿修复）：
+> **状态：已随 v0.2.1（2026-07-03，当时发布线）发布并毕业到 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.2.1]`。** 下游 0.2.0 用户反馈「开了 switch、一键开始走完仍要登录」。GPT 两轮诊断 + 对代码逐条核实，锁定 0.2.0 两处缺陷（走 systematic-debugging，test-first 红→绿修复）：
 >
 > - **Bug1 入口 URL 解析**：`claude-science url` 现输出多行（第一行真 URL + 第二行「single-use…」说明），`sandbox_url()`（`lib.rs`）把整段 stdout 当 URL 交 `open` → 换行/说明污染参数、单次性 nonce 未被正确消费 → 落 `/login`（**这条才是用户直接症状**）。修：新增纯函数 `first_http_url()` 只取第一条合法 `http(s)://` URL。
 > - **Bug2 健康快捷路径绕过登录修复**：0.2.0 只要沙箱 daemon 活着就「连 auth 文件都不读」直接重开，导致旧版遗留 / 凭证损坏 / 已落登录页的健康 daemon 永不自愈（0.2.0 引入的分支）。修：健康分支先做**只读**校验 `login_intact`（复用既有 `read_intact_login` 自洽判定）；自洽→只重开（org 不动、旧对话不丢），失效→停沙箱、走 `ensure_virtual_login` 修复保 org + 重启。
@@ -101,7 +103,7 @@
 
 ## 8. 「API 支持」重架方向：cc-switch 式多 profile 配置 + 代理移 Rust（2026-07-03 定，主线）
 
-> **✅ 状态（2026-07-04）：已随 `v0.3.0` 正式版毕业。** 轨道 1（多 profile 配置管理）实现 + 四轮外审全修 + 真机验收（用户在场）通过 → 连同 relay + DSML + Slice A UX **merge 进 `main`（`c6e23bc`）并发进 `v0.3.0` 正式版（Latest，取代 v0.2.1）**。7 家 provider + 自定义端点已交付，原「② 面板内自定义 OpenAI 端点」并入本轨。**剩余唯一 = 轨道 2（翻译代理移 Rust/axum 拔 python），未做。** 过程记录（beta.1 撤回、beta.2 大预览版、逐轮外审、外部 relay PR #4 / WSL2 PR #7 待议）见 `findings/2026-07-04-codex-review-dsml-wiring-and-beta-status.md`。下方技术细节为历史留存。
+> **✅ 状态（2026-07-04）：已随 `v0.3.0` 正式版毕业。** 轨道 1（多 profile 配置管理）实现 + 四轮外审全修 + 真机验收（用户在场）通过 → 连同 relay + DSML + Slice A UX **merge 进 `main`（`c6e23bc`）并发进 `v0.3.0` 正式版（当时取代 v0.2.1）**。7 家 provider + 自定义端点已交付，原「② 面板内自定义 OpenAI 端点」并入本轨。**剩余唯一 = 轨道 2（翻译代理移 Rust/axum 拔 python），未做。** 过程记录（beta.1 撤回、beta.2 大预览版、逐轮外审、外部 relay PR #4 / WSL2 PR #7 待议）见 `findings/2026-07-04-codex-review-dsml-wiring-and-beta-status.md`。下方技术细节为历史留存。
 >
 > **GPT 二轮外审 + 修复（2026-07-03，改动只在 `desktop/src-tauri/src/lib.rs` + `desktop/src/main.js`，未 commit）**：复审多 profile 更新链 `45f3304..fdad9ea`。第一轮 5 项：P1-a `start_proxy`/`verify_key` 未过串行器（属实但两命令前端零调用=死命令、竞态不可达，已仍包串行器）、P1-b `set_mode` 与一键并发、P1-c 改代理端口后复用旧沙箱指向死端口、P2-d 非 active 连接编辑不校验、P2-e 回滚失败仍谎称已回滚，**无一触碰铁律**（最坏=孤儿第三方沙箱），全修。第二轮增量 2 项：P1 端口拆链 `let _ = stop_sandbox_inner` 丢结果+先落盘 → 改为**停成功才落盘/停失败返 Err 且端口不变**+前端如实提示；P2 非 active 校验用户选 **truthful-save**（只拦明确 401/403/400/404/422，native/429/5xx/无响应仍保存但据实标「未校验，激活再验」，`update_profile_connection` 回传 `{validated}`）。新增纯函数 `settings_change_needs_teardown`/`rollback_status_clause`/`nonactive_probe_verdict`（均 TDD）。**cargo test 104→107、clippy 0、fmt、node --check、run_all ALL GREEN、gitleaks 0。**
 >
@@ -132,7 +134,7 @@
 
 ## 9. 模型选择器显示 claude / opus（用户 2026-07-04 批次，⭐高优先：先修再发 v0.3.2）
 
-> **状态：已实现 + 真机验证通过，已 merge 进 main（2026-07-04，分支 `feat/relay-model-shell` 8 commit FF 合入），待随 v0.3.2 发布。** 真机证据：沙箱 Science 顶部选择器显示真实模型名 `glm-5.2`（非 claude/opus），代理 `/v1/models` 在 force 时返回单壳 `{id:claude-opus-4-8, display_name:真实名}`；铁律全程守住（8765 与真实目录未碰）。对应用户 bug 清单 #11（智谱等显示 claude）+ #12 显示部分（自定义显示 opus）。**#12 的校验部分（自定义 scratch 探测误判 Ambiguous）仍待复现，未在本轮解决。**
+> **状态：已实现 + 真机验证通过 + 已随 v0.3.2 发布。** 真机证据：沙箱 Science 顶部选择器显示真实模型名 `glm-5.2`（非 claude/opus），代理 `/v1/models` 在 force 时返回单壳 `{id:claude-opus-4-8, display_name:真实名}`；铁律全程守住（8765 与真实目录未碰）。对应用户 bug 清单 #11（智谱等显示 claude）+ #12 显示部分（自定义显示 opus）。**#12 的校验部分（自定义 scratch 探测误判 Ambiguous）仍待复现，未在本轮解决。**
 >
 > **2026-07-08 追加（#26 自定义 OpenAI / Responses 选择器空列表）：** 当前 main 已有本地隔离 proxy/mock 证据，正式 `openai-custom` 与 `openai-responses` profile 在已配置模型时，`/{secret}/v1/models` 只返回单壳 `claude-opus-4-8`，真实模型名放 `display_name`，且 force 模式不回源暴露第三方原始模型 id；见 [`findings/2026-07-08-issue-26-custom-selector-evidence.md`](../findings/2026-07-08-issue-26-custom-selector-evidence.md)。随后又用隔离 Science UI + mock/custom OpenAI 上游验证 `openai-custom` selector：菜单非空并显示/选中 `glm-4.5`；见 [`findings/2026-07-08-issue-26-science-ui-evidence.md`](../findings/2026-07-08-issue-26-science-ui-evidence.md)。这仍不是真实账号态、真实 HOME、published DMG、签名/公证或 live provider E2E 验证；关闭 #26 时应按“当前 main 源码代理契约 + 隔离 mock/UI 证据”表述。
 >
@@ -173,8 +175,8 @@
 | 8 | Directory connectors unavailable / session expired | 架构边界：目录连接器是 claude.ai 服务端功能 |
 | 9 | 弹 sign in 但点一下直接进（没真登录） | 架构边界/预期：虚拟登录表现为"未登录门票" |
 | 10 | 截图（待补） | 待辨 |
-| **11** | **模型选择器显示不正确**（小米/智谱/openrouter/硅基/kimi/minimax 都有） | **✅ 已修（见 #9，真机验证 `glm-5.2` 正确显示，merge 进 main 待 v0.3.2 发）** |
+| **11** | **模型选择器显示不正确**（小米/智谱/openrouter/硅基/kimi/minimax 都有） | **✅ 已修（见 #9，真机验证 `glm-5.2` 正确显示，已随 v0.3.2 发布）** |
 | **12** | **自定义 API「无法确认(网络/上游繁忙)，未切换，可重试或跳过验证」**；用户说 curl 没问题 | 显示 opus 部分 **✅ 已修（→ #9：custom 现可自填模型名 + 借壳显示真实名）**；校验部分（自定义 relay 的 scratch 探测把可用端点误判为 Ambiguous）**仍需复现**：拿用户的自定义 base_url/流程，看 scratch Message/Models 探测状态码为何非 200；curl 通但代理探测不通 = 探测路径/鉴权头/thinking 注入差异 |
 
 - **三大根因归类**（沿用 2026-07-03 分诊，`findings/2026-07-03-user-reported-bugs-triage.md`）：① 架构边界（claude.ai 服务端功能被 401 隔离）=#3/#5/#8/#9；② 模型端（DeepSeek 透传把 tool_use 吐成文本卡死）=#2/#6 最严重；③ 疑可修代理 bug=#4（输出一晃而过）/#12（自定义校验）/#1（梯子）。
-- **下一步优先级（2026-07-04 更新）**：~~先修 #9 模型选择器~~ **✅ #9 已实现 + 真机验证 + merge 进 main**。剩：① 补 README/About → 走 v0.3.2 发版（版本 bump/tag/dmg/Release）；② #12 校验部分（自定义 scratch 误判）待复现；③ Kimi/MiniMax 已就绪随 v0.3.2 一起发。
+- **下一步优先级（2026-07-09 更新）**：~~先修 #9 模型选择器~~ **✅ #9 已实现 + 真机验证 + 已随 v0.3.2 发布**。剩：① #12 校验部分（自定义 scratch 误判）待复现；② DSML 阶段二 rewrite；③ 原生入口 / 后台常驻与 python-ectomy 仍按 roadmap 另线推进。

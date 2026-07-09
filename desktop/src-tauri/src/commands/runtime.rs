@@ -13,13 +13,39 @@ use crate::runtime::diagnostics::{
 use crate::runtime::operation::{self, OperationKind, OperationStage, OperationTrace};
 use crate::runtime::profile::profile_capabilities;
 use crate::runtime::provider::{
-    adapter_for_profile, current_shim_mode_for_adapter, gateway_kind_for_adapter, upstream_host,
+    adapter_for_profile, current_shim_mode_for_adapter, gateway_kind_for_adapter, upstream_endpoint,
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
 use crate::runtime::science::{settings_change_needs_teardown, stop_sandbox};
 use crate::runtime::settings::validate_runtime_ports;
 use crate::runtime::system::open_in_browser;
 use crate::{config, lock, proc, run_blocking, AppState, SharedAppState, SharedLifecycle};
+
+fn config_last_error_json(error: &dyn std::fmt::Display) -> serde_json::Value {
+    json!({
+        "type": "config_error",
+        "message": error.to_string(),
+    })
+}
+
+fn status_response_for_config_error(error: &dyn std::fmt::Display) -> serde_json::Value {
+    build_status_response(
+        status_lights(StatusProbeInput {
+            proxy_ok: false,
+            sandbox_ok: false,
+            upstream_ok: false,
+        }),
+        serde_json::Value::Null,
+        "",
+        "off",
+        diagnostics_for_profile(None, "off"),
+        science_diagnostics(ScienceDiagnosticsInput {
+            sandbox_port: 0,
+            sandbox_ok: false,
+        }),
+        Some(config_last_error_json(error)),
+    )
+}
 
 fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
     stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url)
@@ -326,7 +352,10 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
     // 沙箱强身份确认保留在 one_click_login 的启动/复用边界。
     let (pport, secret, sport, adapter, base_url, active_profile, catalog_profile) = {
         let st = lock(state.inner());
-        let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
+        let cfg = match config::load_from(&config::default_dir()) {
+            Ok(cfg) => cfg,
+            Err(e) => return status_response_for_config_error(&e),
+        };
         let pport = if st.proxy_port != 0 {
             st.proxy_port
         } else {
@@ -367,12 +396,14 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             catalog_profile,
         )
     };
-    let uhost = upstream_host(&adapter, &base_url);
+    let upstream = upstream_endpoint(&adapter, &base_url);
     let proxy_ok = !secret.is_empty()
         && proc::http_health(pport, Some(&secret), operation::STATUS_HEALTH_TIMEOUT_MS);
     let sandbox_ok = proc::http_health(sport, None, operation::STATUS_HEALTH_TIMEOUT_MS);
-    let upstream_ok = !uhost.is_empty()
-        && proc::tcp_reachable(&uhost, 443, operation::STATUS_UPSTREAM_TIMEOUT_MS);
+    let upstream_ok = upstream
+        .as_ref()
+        .map(|e| proc::tcp_reachable(&e.host, e.port, operation::STATUS_UPSTREAM_TIMEOUT_MS))
+        .unwrap_or(false);
     let lights = status_lights(StatusProbeInput {
         proxy_ok,
         sandbox_ok,
@@ -389,6 +420,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             sandbox_port: sport,
             sandbox_ok,
         }),
+        None,
     )
 }
 
@@ -411,4 +443,34 @@ pub(crate) fn quit_app(
     }
     app.exit(0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{config_last_error_json, status_response_for_config_error};
+
+    #[test]
+    fn config_last_error_json_preserves_typed_config_error() {
+        let err = config_last_error_json(&"bad config");
+        assert_eq!(
+            err.get("type").and_then(|v| v.as_str()),
+            Some("config_error")
+        );
+        assert_eq!(
+            err.get("message").and_then(|v| v.as_str()),
+            Some("bad config")
+        );
+    }
+
+    #[test]
+    fn status_response_for_config_error_is_fail_closed() {
+        let v = status_response_for_config_error(&"bad config");
+        assert_eq!(v["proxy"], "amber");
+        assert_eq!(v["sandbox"], "amber");
+        assert_eq!(v["upstream"], "amber");
+        assert_eq!(v["active_profile"], serde_json::Value::Null);
+        assert_eq!(v["science"]["sandbox"]["port"], 0);
+        assert_eq!(v["last_error"]["type"], "config_error");
+        assert_eq!(v["last_error"]["message"], "bad config");
+    }
 }

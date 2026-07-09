@@ -24,10 +24,38 @@ trap cleanup_bundle_test_artifacts EXIT
 # 正常：依赖齐全（本机有 python3/node），config 指向不存在的临时路径 → 退出 0
 out="$(CSSWITCH_CONFIG="$T/nope.json" SCIENCE_BIN="$T/no-bin" "$DOCTOR" 2>&1)"; rc=$?
 if [ $rc -eq 0 ]; then ok "doctor exits 0 when deps present"; else no "doctor failed with deps present (rc=$rc): $out"; fi
+if echo "$out" | grep -q "$HOME/.claude-science"; then no "doctor default probed real HOME path"; else ok "doctor skips real HOME check by default"; fi
+REAL_HOME_TMP="$T/real-home-optin"; mkdir -p "$REAL_HOME_TMP/.claude-science"
+out="$(HOME="$REAL_HOME_TMP" CSSWITCH_DOCTOR_CHECK_REAL_HOME=1 CSSWITCH_CONFIG="$T/nope.json" SCIENCE_BIN="$T/no-bin" "$DOCTOR" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && echo "$out" | grep -q "显式 opt-in"; then ok "doctor real HOME check is explicit opt-in"; else no "doctor opt-in real HOME check drifted (rc=$rc): $out"; fi
 
 # 铁律：代理端口设成 8765 → 必须失败关闭，输出含 8765
 out="$(CSSWITCH_PROXY_PORT=8765 CSSWITCH_CONFIG="$T/nope.json" "$DOCTOR" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "8765"; then ok "doctor fails on reserved port 8765"; else no "doctor did not reject 8765 (rc=$rc): $out"; fi
+if [ "$(python3 "$ROOT/test/_capability.py")" != "1" ]; then
+  echo "skip - doctor occupied-port classification env-blocked（loopback 被禁）"
+else
+  PORT_FILE="$T/doctor-listener-port"
+  python3 - "$PORT_FILE" <<'PY' &
+import socket, sys, time
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    f.write(str(s.getsockname()[1]))
+try:
+    time.sleep(10)
+finally:
+    s.close()
+PY
+  LISTENER_PID=$!
+  for _ in $(seq 1 50); do [ -s "$PORT_FILE" ] && break; sleep 0.1; done
+  OCC_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
+  out="$(CSSWITCH_PROXY_PORT="$OCC_PORT" CSSWITCH_CONFIG="$T/nope.json" "$DOCTOR" 2>&1)"; rc=$?
+  kill "$LISTENER_PID" 2>/dev/null; wait "$LISTENER_PID" 2>/dev/null
+  if echo "$out" | grep -q "unbound variable"; then no "doctor occupied-port diagnostic hit set -u error"; else ok "doctor occupied-port diagnostic avoids set -u error"; fi
+  if [ $rc -eq 0 ] && echo "$out" | grep -q "疑似 CSSwitch 旧进程"; then ok "doctor classifies python listener as CSSwitch-like occupied port"; else no "doctor occupied-port classification drifted (rc=$rc): $out"; fi
+fi
 
 # key present 契约：app 传 CSSWITCH_KEY_PRESENT=1 + provider/adapter，doctor 报「已配置」且绝不打印任何 key 值
 SECRETVAL="DUMMY-KEY-abc123XYZ-should-never-print"

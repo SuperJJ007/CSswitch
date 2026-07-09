@@ -1,15 +1,4 @@
-pub(crate) fn validate_runtime_ports(proxy_port: u16, sandbox_port: u16) -> Result<(), String> {
-    if proxy_port == 8765 || sandbox_port == 8765 {
-        return Err("端口 8765 是真实 Science 实例保留端口，不能用。".into());
-    }
-    if proxy_port == 0 || sandbox_port == 0 {
-        return Err("端口不能为 0。".into());
-    }
-    if proxy_port == sandbox_port {
-        return Err("代理端口与沙箱端口不能相同。".into());
-    }
-    Ok(())
-}
+pub(crate) use crate::config::validate_runtime_ports;
 
 #[cfg(test)]
 mod tests {
