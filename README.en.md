@@ -4,6 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.0"><img src="https://img.shields.io/badge/release-v0.4.0-2ea44f.svg" alt="CSSwitch v0.4.0"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
