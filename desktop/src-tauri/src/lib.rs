@@ -19,6 +19,7 @@ mod oauth_forge;
 mod proc;
 mod runtime;
 mod scratch;
+mod skill_manager;
 mod templates;
 
 use std::process::Child;
@@ -282,6 +283,16 @@ pub fn run() {
             commands::diagnostics::open_release_page,
             commands::diagnostics::report_bug,
             commands::diagnostics::open_logs,
+            commands::skills::list_skills,
+            commands::skills::inspect_skill_source,
+            commands::skills::import_skill,
+            commands::skills::update_skill,
+            commands::skills::reveal_skill_folder,
+            commands::skills::set_skill_enabled,
+            commands::skills::evaluate_skill_compatibility,
+            commands::skills::uninstall_skill,
+            commands::skills::reconcile_skills,
+            commands::skills::get_skill_manager_status,
             commands::runtime::quit_app
         ])
         .setup(|app| {

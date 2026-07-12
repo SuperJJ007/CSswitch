@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.1"><img src="https://img.shields.io/badge/release-v0.4.1-2ea44f.svg" alt="CSSwitch v0.4.1"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.2"><img src="https://img.shields.io/badge/release-v0.4.2-2ea44f.svg" alt="CSSwitch v0.4.2"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -24,7 +24,7 @@ CSSwitch 是一个给 Claude Science 使用的本地模型切换器。它把 Sci
 
 [下载最新版](../../releases/latest) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.4.1 升级提示：** 推理数据面使用随应用打包的 Rust gateway。0.4.1 会在身份完全匹配时安全清理旧版遗留的 CSSwitch Python proxy；未知 listener 仍保持拒绝处理。覆盖安装会保留 v2 配置，见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
+> **0.4.2 升级提示：** 新增 Skill Manager：从明确配置的来源扫描科研 Skill，导入 CSSwitch 管理的 store，再部署到隔离 Science；来源消失不会删除已导入副本。0.4.1 的旧 Python proxy 精确身份清理完整保留，未知 listener 仍拒绝处理。见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
 
 ## 目录
 
@@ -70,6 +70,7 @@ Claude Science sandbox
 - 点击「一键开始」会自动启动代理、准备隔离环境、打开 Science。
 - Science 顶部模型选择器会显示你选择的真实模型名，而不是笼统的 `claude` 或 `opus`。
 - 可以一键切回「官方 Claude」模式，不干扰你的真实 Claude 登录。
+- 扫描、导入、管理并部署本地科研 Skill；导入副本与来源解耦，沙箱重建后可从 store 恢复。
 
 **给进阶用户**
 
@@ -101,7 +102,7 @@ Claude Science sandbox
 
 ## 从旧版升级
 
-0.4.1 保留现有 v2 配置格式。退出旧版 CSSwitch 后，将 0.4.1 拖入「应用程序」并覆盖即可；首次启动仍可能需要右键选择「打开」。升级前建议备份 `~/.csswitch/config.json`。如果 0.4.1 阻断你的工作流，请先退出 CSSwitch，再重新安装上一稳定版；0.4.1 没有可切回 Python 数据面的运行时开关。
+0.4.2 保留现有 v2 配置格式。退出旧版 CSSwitch 后，将 0.4.2 拖入「应用程序」并覆盖即可；首次启动仍可能需要右键选择「打开」。升级前建议备份整个 `~/.csswitch/`，其中包含配置和已导入 Skill。回滚只替换 app，不会自动删除新数据；旧版本会忽略它无法识别的 Skill Manager 数据。
 
 完整步骤、备份位置和回滚边界见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
 

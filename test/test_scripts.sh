@@ -49,10 +49,20 @@ if [ $rc -ne 0 ] && echo "$out" | grep -q "拒绝"; then ok "08765 rejected via 
 out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9931 --dry-run 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && echo "$out" | grep -q "DRY-RUN OK"; then ok "valid port passes guards in dry-run"; else no "valid port dry-run failed (rc=$rc): $out"; fi
 
-out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-link" SCIENCE_BIN="$FAKE_LINK" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9932 --skip-oauth-forge 2>&1)"; rc=$?
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-proof-missing" SCIENCE_BIN="$FAKE_OK" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9932 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "reconcile data-dir"; then ok "launch requires Skill reconcile proof"; else no "launch accepted missing Skill reconcile proof (rc=$rc): $out"; fi
+
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-proof-mismatch" CSSWITCH_RECONCILED_DATA_DIR="$T/other-data" SCIENCE_BIN="$FAKE_OK" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9932 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "沙箱不一致"; then ok "launch rejects mismatched Skill reconcile data-dir"; else no "launch accepted mismatched Skill reconcile data-dir (rc=$rc): $out"; fi
+
+mkdir -p "$T/vh-proof-ok/.claude-science/bin"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-proof-ok" CSSWITCH_RECONCILED_DATA_DIR="$T/vh-proof-ok/.claude-science" SCIENCE_BIN="$FAKE_OK" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9932 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -eq 0 ]; then ok "launch accepts matching Skill reconcile data-dir"; else no "launch rejected matching Skill reconcile data-dir (rc=$rc): $out"; fi
+
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-link" CSSWITCH_RECONCILED_DATA_DIR="$T/vh-link/.claude-science" SCIENCE_BIN="$FAKE_LINK" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9932 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "launch rejects explicit Science symlink"; else no "launch accepted explicit Science symlink (rc=$rc): $out"; fi
 
-out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-parent-link" SCIENCE_BIN="$PARENT_LINK_BIN" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9933 --skip-oauth-forge 2>&1)"; rc=$?
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-parent-link" CSSWITCH_RECONCILED_DATA_DIR="$T/vh-parent-link/.claude-science" SCIENCE_BIN="$PARENT_LINK_BIN" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9933 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "launch rejects symlinked Science parent"; else no "launch accepted symlinked Science parent (rc=$rc): $out"; fi
 
 # 7.7 review: 畸形端口必须失败关闭（fail-closed），而不是绕过算术守卫

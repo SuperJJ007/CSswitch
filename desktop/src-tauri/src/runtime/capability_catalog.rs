@@ -4,6 +4,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::runtime::provider::adapter_for_profile;
+use crate::skill_manager::compatibility::{
+    public_catalog_text_is_safe, validate_skill_catalog_rules,
+};
 use crate::{config, templates};
 
 const STATIC_CATALOG_JSON: &str = include_str!("../../../../catalog/capabilities.v1.json");
@@ -64,6 +67,8 @@ pub(crate) fn load_static_catalog() -> Result<CapabilityCatalog, String> {
     let catalog: CapabilityCatalog = serde_json::from_str(STATIC_CATALOG_JSON)
         .map_err(|e| format!("catalog JSON 解析失败：{e}"))?;
     validate_catalog(&catalog)?;
+    validate_skill_catalog_rules(&catalog)
+        .map_err(|e| format!("catalog Skill 兼容性规则无效：{e}"))?;
     Ok(catalog)
 }
 
@@ -125,8 +130,39 @@ pub(crate) fn validate_catalog(catalog: &CapabilityCatalog) -> Result<(), String
         if rule.evidence.is_empty() {
             return Err(format!("catalog rule evidence 不能为空：{}", rule.id));
         }
+        if !catalog_rule_text_is_safe(rule) {
+            return Err(format!("catalog rule 包含不安全的静态文本：{}", rule.id));
+        }
     }
     Ok(())
+}
+
+fn catalog_rule_text_is_safe(rule: &CatalogRule) -> bool {
+    [
+        rule.id.as_str(),
+        rule.scope.as_str(),
+        rule.status.as_str(),
+        rule.action.as_str(),
+        rule.reason.as_str(),
+    ]
+    .into_iter()
+    .chain(rule.evidence.iter().map(String::as_str))
+    .chain(rule.tests.iter().map(String::as_str))
+    .all(|text| public_catalog_text_is_safe(text, 2_048))
+        && rule.match_fields.iter().all(|(key, value)| {
+            public_catalog_text_is_safe(key, 256) && catalog_value_text_is_safe(value)
+        })
+}
+
+fn catalog_value_text_is_safe(value: &Value) -> bool {
+    match value {
+        Value::String(text) => public_catalog_text_is_safe(text, 2_048),
+        Value::Array(values) => values.iter().all(catalog_value_text_is_safe),
+        Value::Object(values) => values.iter().all(|(key, value)| {
+            public_catalog_text_is_safe(key, 256) && catalog_value_text_is_safe(value)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+    }
 }
 
 fn profile_api_format(p: &config::Profile) -> String {
@@ -219,6 +255,7 @@ fn boundary_rule_ids() -> &'static [&'static str] {
         "transport.connect.non-anthropic-direct-tunnel",
         "transport.http-proxy.not-set-by-default",
         "transport.upstream-proxy.planned-for-http-mcp",
+        "transport.ssh.bridge-not-implemented",
     ]
 }
 
@@ -268,8 +305,13 @@ pub(crate) fn diagnostics_for_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::{context_for_profile, diagnostics_for_profile, load_static_catalog};
+    use super::{
+        context_for_profile, diagnostics_for_profile, load_static_catalog, validate_catalog,
+    };
     use crate::config::Profile;
+    use crate::skill_manager::compatibility::{
+        validate_skill_catalog_rules, CompatibilityErrorCode,
+    };
 
     fn ids(v: &serde_json::Value, key: &str) -> Vec<String> {
         v[key]
@@ -288,6 +330,51 @@ mod tests {
             .providers
             .iter()
             .any(|r| r.id == "provider.relay.force-model-shell"));
+        assert_eq!(catalog.skills.len(), 36);
+        assert!(catalog.skills.iter().all(|rule| rule.scope == "skill"
+            && rule
+                .match_fields
+                .keys()
+                .all(|key| matches!(key.as_str(), "requirement" | "state"))));
+    }
+
+    #[test]
+    fn static_catalog_validation_requires_the_complete_skill_condition_set() {
+        let mut missing = load_static_catalog().unwrap();
+        missing.skills.pop();
+        assert_eq!(
+            validate_skill_catalog_rules(&missing).unwrap_err().code,
+            CompatibilityErrorCode::MissingCatalogRule
+        );
+
+        let mut duplicate = load_static_catalog().unwrap();
+        duplicate.skills.push(duplicate.skills[0].clone());
+        assert_eq!(
+            validate_skill_catalog_rules(&duplicate).unwrap_err().code,
+            CompatibilityErrorCode::InvalidCatalog
+        );
+    }
+
+    #[test]
+    fn every_static_catalog_section_rejects_private_or_credential_value_shapes() {
+        let mut private_transport = load_static_catalog().unwrap();
+        private_transport.transport_rules[0].reason = "/Users/example/.ssh/config".to_string();
+        assert!(validate_catalog(&private_transport).is_err());
+
+        let mut credential_value = load_static_catalog().unwrap();
+        credential_value.providers[0].reason = "API key: sk-secret-value".to_string();
+        assert!(validate_catalog(&credential_value).is_err());
+
+        let mut sensitive_match_key = load_static_catalog().unwrap();
+        sensitive_match_key.providers[0]
+            .match_fields
+            .insert("api_key".to_string(), serde_json::Value::Bool(true));
+        assert!(validate_catalog(&sensitive_match_key).is_err());
+
+        let mut public_terms = load_static_catalog().unwrap();
+        public_terms.transport_rules[0].reason =
+            "API key and private key handling are capability boundaries only.".to_string();
+        validate_catalog(&public_terms).unwrap();
     }
 
     #[test]
@@ -324,6 +411,7 @@ mod tests {
         let boundaries = ids(&v, "boundary_rules");
         assert!(boundaries.contains(&"transport.connect.anthropic-fastfail-401".to_string()));
         assert!(boundaries.contains(&"transport.upstream-proxy.planned-for-http-mcp".to_string()));
+        assert!(boundaries.contains(&"transport.ssh.bridge-not-implemented".to_string()));
     }
 
     #[test]

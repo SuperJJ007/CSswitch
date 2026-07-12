@@ -4,14 +4,53 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tauri::{Manager, Runtime};
 
+use crate::commands::skills::{
+    scan_and_reconcile_skills_for_runtime, RuntimeSkillReconcileContext,
+};
 use crate::runtime::operation::{
     self, OperationKind, OperationStage, OperationTrace, POLL_INTERVAL_MS,
 };
 use crate::runtime::proxy::ProxyAction;
 use crate::runtime::proxy_lifecycle::ensure_proxy;
-use crate::runtime::science::{sandbox_home, sandbox_running_ours, sandbox_url, stop_sandbox};
+use crate::runtime::science::{
+    sandbox_data_dir, sandbox_home, sandbox_running_ours, sandbox_science_state,
+    sandbox_science_version, sandbox_url, stop_sandbox, SandboxScienceState,
+};
 use crate::runtime::system::{asset_root, log_path, open_in_browser, open_log, redact, tail_file};
+use crate::skill_manager::deployment::ReconcileReport;
+use crate::skill_manager::discovery::ScienceProbeState;
+use crate::skill_manager::error::SkillManagerError;
+use crate::skill_manager::external::external_skills_root_from_process_home;
+use crate::skill_manager::store::SkillManager;
 use crate::{config, lifecycle, lock, oauth_forge, proc, AppState, SharedAppState};
+
+fn skill_error_text(error: SkillManagerError) -> String {
+    let skill = error
+        .skill_id
+        .as_ref()
+        .map(|id| format!(" skill_id={}", id.as_str()))
+        .unwrap_or_default();
+    format!(
+        "Skill Manager [{}]{skill}: {}；{}",
+        error.code.as_str(),
+        error.message,
+        error.remediation
+    )
+}
+
+fn reconcile_error_text(report: &ReconcileReport) -> Option<String> {
+    report.errors.first().map(|error| {
+        let skill = error
+            .skill_id
+            .as_ref()
+            .map(|id| format!(" skill_id={}", id.as_str()))
+            .unwrap_or_default();
+        format!(
+            "Skill reconcile [{}]{skill}: {}；{}",
+            error.code, error.message, error.remediation
+        )
+    })
+}
 
 fn stop_sandbox_state<R: Runtime>(
     app: &tauri::AppHandle<R>,
@@ -62,16 +101,55 @@ pub(crate) fn one_click_login<R: Runtime>(
     lifecycle: &lifecycle::Lifecycle,
 ) -> Result<Value, String> {
     let trace = OperationTrace::start(OperationKind::OneClickLogin, "command=one_click_login");
-    let (pport, secret, proxy_action) = ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
-
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
     let sport = cfg.sandbox_port;
 
     let sbx_home = sandbox_home();
     let auth_dir = sbx_home.join(".claude-science");
+    let data_dir = sandbox_data_dir();
+    let skills = SkillManager::new(dir.clone());
+    let external_root = external_skills_root_from_process_home().map_err(skill_error_text)?;
 
-    if sandbox_running_ours(sport) {
+    let science_state = sandbox_science_state(sport);
+    if science_state == SandboxScienceState::Unknown {
+        trace.finish("error=sandbox_state_unknown_before_skill_reconcile");
+        return Err(format!(
+            "无法确认隔离 Science 是否已停止（端口 {sport} 或 data-dir 状态不一致）。为避免热改 Skill，未执行 reconcile；请先停止隔离 Science 并确认端口空闲。"
+        ));
+    }
+
+    if science_state == SandboxScienceState::RunningHealthy {
+        let science_version = sandbox_science_version();
+        let (external_scan, dry) = scan_and_reconcile_skills_for_runtime(
+            &skills,
+            RuntimeSkillReconcileContext {
+                external_root: &external_root,
+                data_dir: &data_dir,
+                dry_run: true,
+                reason: "running_check",
+                science_version: science_version.as_deref(),
+                runtime_mode: &cfg.mode,
+                science_state: ScienceProbeState::Running,
+            },
+        )
+        .map_err(skill_error_text)?;
+        trace_external_scan(&trace, &external_scan);
+        if let Some(error) = reconcile_error_text(&dry) {
+            trace.finish("error=skill_reconcile_dry_run");
+            return Err(error);
+        }
+        let pending_restart = skills.has_pending_restart().map_err(skill_error_text)?;
+        if dry.restart_required || pending_restart {
+            trace.finish("ok action=restart_required reason=skills_changed");
+            return Ok(json!({
+                "url": sandbox_url(sport),
+                "msg": "Skill 已变更，需要先停止并重新启动隔离 Science 后才会生效。",
+                "action": "restart_required",
+                "restart_required": true
+            }));
+        }
+        let (_, _, proxy_action) = ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
         if oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home) {
             let url = sandbox_url(sport);
             {
@@ -96,17 +174,48 @@ pub(crate) fn one_click_login<R: Runtime>(
         }
         {
             let mut st = lock(&state);
-            let _ = stop_sandbox_state(&app, &mut st);
+            if let Err(error) = stop_sandbox_state(&app, &mut st) {
+                trace.finish("error=sandbox_stop_before_skill_reconcile");
+                return Err(format!(
+                    "隔离 Science 停止失败，为避免热改 Skill，未执行 reconcile：{error}"
+                ));
+            }
         }
     }
 
-    let root = asset_root(&app)
-        .ok_or("找不到 scripts/launch-virtual-sandbox.sh（打包资源或仓库根均未命中）。")?;
-
+    if sandbox_science_state(sport) != SandboxScienceState::Stopped {
+        trace.finish("error=sandbox_not_stopped_before_skill_reconcile");
+        return Err(format!(
+            "未能确认隔离 Science 已停止且端口 {sport} 空闲。为避免热改 Skill，未执行 reconcile。"
+        ));
+    }
     trace.stage(OperationStage::SandboxLogin, "ensure_virtual_login");
     let (forged, login_action) =
         oauth_forge::ensure_virtual_login(&auth_dir, "virtual@localhost.invalid", &sbx_home)
             .map_err(|e| format!("写虚拟登录失败：{e}"))?;
+    let science_version = sandbox_science_version();
+    let (external_scan, reconcile) = scan_and_reconcile_skills_for_runtime(
+        &skills,
+        RuntimeSkillReconcileContext {
+            external_root: &external_root,
+            data_dir: &data_dir,
+            dry_run: false,
+            reason: "before_start",
+            science_version: science_version.as_deref(),
+            runtime_mode: &cfg.mode,
+            science_state: ScienceProbeState::NotRunning,
+        },
+    )
+    .map_err(skill_error_text)?;
+    trace_external_scan(&trace, &external_scan);
+    if let Some(error) = reconcile_error_text(&reconcile) {
+        trace.finish("error=skill_reconcile_before_start");
+        return Err(error);
+    }
+    let (pport, secret, proxy_action) = ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
+
+    let root = asset_root(&app)
+        .ok_or("找不到 scripts/launch-virtual-sandbox.sh（打包资源或仓库根均未命中）。")?;
 
     let launch = root.join("scripts/launch-virtual-sandbox.sh");
     if !launch.is_file() {
@@ -138,6 +247,7 @@ pub(crate) fn one_click_login<R: Runtime>(
         .arg(&proxy_url)
         .arg("--skip-oauth-forge")
         .env("SANDBOX_HOME", sandbox_home())
+        .env("CSSWITCH_RECONCILED_DATA_DIR", &data_dir)
         .stdout(Stdio::from(logf))
         .stderr(Stdio::from(logf2))
         .status()
@@ -183,6 +293,15 @@ pub(crate) fn one_click_login<R: Runtime>(
         ));
     }
 
+    if let Err(error) = skills.mark_science_started(&data_dir) {
+        {
+            let mut st = lock(&state);
+            let _ = stop_sandbox_state(&app, &mut st);
+        }
+        trace.finish("error=skill_restart_state_commit");
+        return Err(skill_error_text(error));
+    }
+
     let url = sandbox_url(sport);
     {
         let mut st = lock(&state);
@@ -204,4 +323,22 @@ pub(crate) fn one_click_login<R: Runtime>(
         proxy_action.as_str()
     ));
     Ok(json!({ "url": url, "msg": msg, "action": "started" }))
+}
+
+fn trace_external_scan(
+    trace: &OperationTrace,
+    scan: &crate::skill_manager::external::ExternalSkillScanReport,
+) {
+    trace.stage(
+        OperationStage::Precheck,
+        format!(
+            "external_skill_scan discovered={} imported={} updated={} unchanged={} retained_missing={} diagnostics={}",
+            scan.discovered,
+            scan.imported,
+            scan.updated,
+            scan.unchanged,
+            scan.retained_missing,
+            scan.diagnostics.len()
+        ),
+    );
 }

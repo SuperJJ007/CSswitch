@@ -50,6 +50,14 @@ _dd_real="${DATA_DIR:A}"; _real_real="${REAL_DIR:A}"
 if [[ "$_dd_real" == "$_real_real" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
 if [[ "$DRY_RUN" == "1" ]]; then echo "DRY-RUN OK：护栏通过，未启动沙箱。"; exit 0; fi
 
+# Skill 安装和同步只能由 Rust Skill Manager 完成；脚本仅验证调用方刚刚 reconcile 的
+# data-dir 与本次 Science data-dir 完全一致，绝不自行复制用户 Skill。
+if [[ "$SKIP_FORGE" == "1" ]]; then
+  _reconciled="${CSSWITCH_RECONCILED_DATA_DIR:-}"
+  [[ -n "$_reconciled" ]] || { echo "拒绝：缺少 Skill reconcile data-dir 证明"; exit 1; }
+  [[ "${_reconciled:A}" == "$_dd_real" ]] || { echo "拒绝：Skill reconcile data-dir 与沙箱不一致"; exit 1; }
+fi
+
 # Prepare the isolated runtime assets on first launch.
 if [[ ! -d "$DATA_DIR/bin" ]]; then
   echo "首次初始化沙箱运行时（APFS 克隆，只拷运行时、不拷真实登录）…"

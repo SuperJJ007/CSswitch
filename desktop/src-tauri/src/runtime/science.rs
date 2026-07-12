@@ -1,6 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
 
 use tauri::Runtime;
 
@@ -14,6 +15,11 @@ pub(crate) const SCIENCE_BIN: &str =
 /// 沙箱可写工作目录（独立 HOME）：`~/.csswitch/sandbox/home`。
 pub(crate) fn sandbox_home() -> PathBuf {
     config::default_dir().join("sandbox").join("home")
+}
+
+/// CSSwitch 隔离 Science 的 data-dir；Skill 运行副本只能落在其 `skills/` 子目录。
+pub(crate) fn sandbox_data_dir() -> PathBuf {
+    sandbox_home().join(".claude-science")
 }
 
 /// 端口变更是否需要拆掉现有链路（纯函数，P1-c）。代理/沙箱任一端口变了，正在跑的代理就绑在
@@ -87,10 +93,41 @@ fn science_bin_for(data_dir: &Path) -> Option<PathBuf> {
     science_bin_for_paths(data_dir, explicit_bin.as_deref(), Path::new(SCIENCE_BIN))
 }
 
-fn science_status_running(out: &Output) -> bool {
+pub(crate) fn sandbox_science_version() -> Option<String> {
+    let home = sandbox_home();
+    let data_dir = sandbox_data_dir();
+    let bin = science_bin_for(&data_dir)?;
+    let out = Command::new(bin)
+        .arg("--version")
+        .env("HOME", home)
+        .output()
+        .ok()?;
     if !out.status.success() {
-        return false;
+        return None;
     }
+    let line = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    if line.is_empty()
+        || line.len() > 160
+        || !line.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'-' | b'_' | b' ' | b'(' | b')' | b',')
+        })
+    {
+        return None;
+    }
+    Some(line)
+}
+
+#[cfg(test)]
+fn science_status_running(out: &Output) -> bool {
+    out.status.success() && science_status_value(out) == Some(true)
+}
+
+fn science_status_value(out: &Output) -> Option<bool> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     for (idx, ch) in stdout.char_indices() {
         if ch != '{' {
@@ -100,17 +137,49 @@ fn science_status_running(out: &Output) -> bool {
             serde_json::Deserializer::from_str(&stdout[idx..]).into_iter::<serde_json::Value>();
         if let Some(Ok(value)) = stream.next() {
             if let Some(running) = value.get("running").and_then(|running| running.as_bool()) {
-                return running;
+                return Some(running);
             }
         }
     }
-    false
+    None
+}
+
+fn trusted_science_status(out: &Output) -> Option<bool> {
+    if out.status.success() {
+        science_status_value(out)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SandboxScienceState {
+    RunningHealthy,
+    Stopped,
+    Unknown,
+}
+
+fn classify_sandbox_state(
+    status: Option<bool>,
+    health_ready: bool,
+    port_accepts_tcp: bool,
+) -> SandboxScienceState {
+    match status {
+        Some(true) if health_ready => SandboxScienceState::RunningHealthy,
+        Some(false) if !port_accepts_tcp => SandboxScienceState::Stopped,
+        _ => SandboxScienceState::Unknown,
+    }
+}
+
+fn loopback_port_accepts_tcp(port: u16) -> bool {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
 }
 
 /// Return the sandbox UI URL, falling back to the plain localhost port.
 pub(crate) fn sandbox_url(port: u16) -> String {
     let home = sandbox_home();
-    let data_dir = home.join(".claude-science");
+    let data_dir = sandbox_data_dir();
     if let Some(bin) = science_bin_for(&data_dir) {
         if let Ok(out) = Command::new(bin)
             .arg("url")
@@ -131,10 +200,14 @@ pub(crate) fn sandbox_url(port: u16) -> String {
 /// Check that the sandbox Science associated with our data-dir is running.
 /// A naked `/health` response is not sufficient identity proof.
 pub(crate) fn sandbox_running_ours(port: u16) -> bool {
+    sandbox_science_state(port) == SandboxScienceState::RunningHealthy
+}
+
+pub(crate) fn sandbox_science_state(port: u16) -> SandboxScienceState {
     let home = sandbox_home();
-    let data_dir = home.join(".claude-science");
+    let data_dir = sandbox_data_dir();
     let Some(bin) = science_bin_for(&data_dir) else {
-        return false;
+        return SandboxScienceState::Unknown;
     };
     let Ok(out) = Command::new(bin)
         .arg("status")
@@ -143,9 +216,12 @@ pub(crate) fn sandbox_running_ours(port: u16) -> bool {
         .env("HOME", &home)
         .output()
     else {
-        return false;
+        return SandboxScienceState::Unknown;
     };
-    science_status_running(&out) && proc::http_health(port, None, 400)
+    let status = trusted_science_status(&out);
+    let health_ready = proc::http_health(port, None, 400);
+    let port_accepts_tcp = health_ready || loopback_port_accepts_tcp(port);
+    classify_sandbox_state(status, health_ready, port_accepts_tcp)
 }
 
 /// Stop the sandbox Science process and clear the in-memory sandbox URL.
@@ -204,8 +280,9 @@ mod tests {
     use std::process::{ExitStatus, Output};
 
     use super::{
-        first_http_url, sandbox_home, sandbox_running_ours, sandbox_url, science_bin_for_paths,
-        science_status_running, settings_change_needs_teardown,
+        classify_sandbox_state, first_http_url, sandbox_home, sandbox_running_ours, sandbox_url,
+        science_bin_for_paths, science_status_running, settings_change_needs_teardown,
+        trusted_science_status, SandboxScienceState,
     };
 
     // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
@@ -289,6 +366,31 @@ mod tests {
             0,
             "warning\n{\"running\": false}\n{\"running\": true}"
         )));
+    }
+
+    #[test]
+    fn sandbox_state_classification_fails_closed_on_probe_disagreement() {
+        assert_eq!(
+            classify_sandbox_state(Some(true), true, true),
+            SandboxScienceState::RunningHealthy
+        );
+        assert_eq!(
+            classify_sandbox_state(Some(false), false, false),
+            SandboxScienceState::Stopped
+        );
+        for state in [
+            classify_sandbox_state(None, false, false),
+            classify_sandbox_state(Some(true), false, true),
+            classify_sandbox_state(Some(true), false, false),
+            classify_sandbox_state(Some(false), true, true),
+            classify_sandbox_state(Some(false), false, true),
+        ] {
+            assert_eq!(state, SandboxScienceState::Unknown);
+        }
+        assert_eq!(
+            trusted_science_status(&status_output(1, r#"{"running":false}"#)),
+            None
+        );
     }
 
     #[test]

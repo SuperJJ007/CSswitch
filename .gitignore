@@ -58,3 +58,4 @@ docs/*
 !docs/assets/
 !docs/assets/**
 !docs/upgrade-and-rollback.md
+!docs/release-evidence-v0.4.2.md

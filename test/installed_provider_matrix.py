@@ -1111,12 +1111,12 @@ case "$cmd" in
   status)
     pid="$(cat "$state/pid" 2>/dev/null || true)"
     recorded_port="$(cat "$state/port" 2>/dev/null || true)"
-    case "$pid:$recorded_port" in *[!0-9:]*) echo '{"running":false}'; exit 1 ;; esac
+    case "$pid:$recorded_port" in *[!0-9:]*) echo '{"running":false}'; exit 0 ;; esac
     if /bin/kill -0 "$pid" 2>/dev/null && /usr/sbin/lsof -nP -a -p "$pid" -iTCP:"$recorded_port" -sTCP:LISTEN >/dev/null 2>&1; then
       echo '{"running":true}'
     else
       echo '{"running":false}'
-      exit 1
+      exit 0
     fi
     ;;
   url)

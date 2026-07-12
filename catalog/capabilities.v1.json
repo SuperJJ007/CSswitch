@@ -243,7 +243,368 @@
     }
   ],
   "mcp_servers": [],
-  "skills": [],
+  "skills": [
+    {
+      "id": "skill.baseline.satisfied",
+      "scope": "skill",
+      "match": {"requirement": "baseline", "state": "satisfied"},
+      "status": "supported",
+      "action": "none",
+      "reason": "The baseline compatibility rule is available; any additional matched rules determine current limitations.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::supported_skill_uses_baseline_rule_and_stable_fingerprint"]
+    },
+    {
+      "id": "skill.sandbox.unavailable",
+      "scope": "skill",
+      "match": {"requirement": "sandbox", "state": "unavailable"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "The managed sandbox is unavailable, so the Skill cannot be deployed safely.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::missing_or_invalid_catalog_rule_fails_closed"]
+    },
+    {
+      "id": "skill.sandbox.unknown",
+      "scope": "skill",
+      "match": {"requirement": "sandbox", "state": "unknown"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The managed sandbox state is unknown and must be diagnosed before enabling the Skill.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::missing_or_invalid_catalog_rule_fails_closed"]
+    },
+    {
+      "id": "skill.deployment.not-deployed",
+      "scope": "skill",
+      "match": {"requirement": "deployment", "state": "not_deployed"},
+      "status": "limited",
+      "action": "diagnose",
+      "reason": "The Skill is installed but has not yet been deployed to the managed runtime.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::pending_deployment_is_limited_with_document_action"]
+    },
+    {
+      "id": "skill.deployment.pending",
+      "scope": "skill",
+      "match": {"requirement": "deployment", "state": "pending"},
+      "status": "limited",
+      "action": "document",
+      "reason": "The Skill deployment is pending and is not yet available in the managed runtime.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::pending_deployment_is_limited_with_document_action"]
+    },
+    {
+      "id": "skill.deployment.restart-required",
+      "scope": "skill",
+      "match": {"requirement": "deployment", "state": "restart_required"},
+      "status": "limited",
+      "action": "document",
+      "reason": "The Skill set changed and requires a controlled runtime restart before it can take effect.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::deployment_limited_and_discovery_unknown_merge_to_unknown"]
+    },
+    {
+      "id": "skill.deployment.failed",
+      "scope": "skill",
+      "match": {"requirement": "deployment", "state": "failed"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "The managed deployment failed, so the Skill must remain disabled until reconciliation succeeds.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::missing_or_invalid_catalog_rule_fails_closed"]
+    },
+    {
+      "id": "skill.discovery.unknown",
+      "scope": "skill",
+      "match": {"requirement": "discovery", "state": "unknown"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "Runtime discovery has not been verified for this Skill and current runtime context.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::deployment_limited_and_discovery_unknown_merge_to_unknown"]
+    },
+    {
+      "id": "skill.discovery.not-discovered",
+      "scope": "skill",
+      "match": {"requirement": "discovery", "state": "not_discovered"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "The runtime did not discover the deployed Skill, so it cannot be treated as usable.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::not_discovered_is_explicitly_unsupported"]
+    },
+    {
+      "id": "skill.network.requirement-unknown",
+      "scope": "skill",
+      "match": {"requirement": "network", "state": "requirement_unknown"},
+      "status": "unknown",
+      "action": "document",
+      "reason": "The Skill has not declared whether it requires network access.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unknown_requirement_is_not_treated_as_false"]
+    },
+    {
+      "id": "skill.network.availability-unknown",
+      "scope": "skill",
+      "match": {"requirement": "network", "state": "availability_unknown"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The Skill requires network access, but current network availability is unknown.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::fingerprint_changes_for_version_network_and_availability"]
+    },
+    {
+      "id": "skill.network.unavailable",
+      "scope": "skill",
+      "match": {"requirement": "network", "state": "unavailable"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "The Skill requires network access, but the current runtime has no available network capability.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unavailable_network_mcp_and_local_command_are_explicitly_unsupported"]
+    },
+    {
+      "id": "skill.ssh.requirement-unknown",
+      "scope": "skill",
+      "match": {"requirement": "ssh", "state": "requirement_unknown"},
+      "status": "unknown",
+      "action": "document",
+      "reason": "The Skill has not declared whether it requires SSH capability.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unknown_requirement_is_not_treated_as_false"]
+    },
+    {
+      "id": "skill.ssh.availability-unknown",
+      "scope": "skill",
+      "match": {"requirement": "ssh", "state": "availability_unknown"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The Skill requires SSH capability, but the safe runtime summary cannot confirm availability.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::ssh_agent_and_config_summary_are_aggregated_conservatively"]
+    },
+    {
+      "id": "skill.ssh.unavailable",
+      "scope": "skill",
+      "match": {"requirement": "ssh", "state": "unavailable"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "The Skill requires SSH capability, but the current runtime summary reports it unavailable.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unavailable_ssh_is_unsupported_and_disable_wins"]
+    },
+    {
+      "id": "skill.mcp.requirement-unknown",
+      "scope": "skill",
+      "match": {"requirement": "mcp", "state": "requirement_unknown"},
+      "status": "unknown",
+      "action": "document",
+      "reason": "The Skill has not declared whether it requires MCP capability.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unknown_requirement_is_not_treated_as_false"]
+    },
+    {
+      "id": "skill.mcp.availability-unknown",
+      "scope": "skill",
+      "match": {"requirement": "mcp", "state": "availability_unknown"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The Skill requires MCP capability, but current MCP availability is unknown.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::fingerprint_changes_for_version_network_and_availability"]
+    },
+    {
+      "id": "skill.mcp.unavailable",
+      "scope": "skill",
+      "match": {"requirement": "mcp", "state": "unavailable"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "The Skill requires MCP capability, but MCP is unavailable in the current runtime.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unavailable_network_mcp_and_local_command_are_explicitly_unsupported"]
+    },
+    {
+      "id": "skill.local-command.requirement-unknown",
+      "scope": "skill",
+      "match": {"requirement": "local_command", "state": "requirement_unknown"},
+      "status": "unknown",
+      "action": "document",
+      "reason": "The Skill has not declared whether it requires local command execution.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unknown_requirement_is_not_treated_as_false"]
+    },
+    {
+      "id": "skill.local-command.availability-unknown",
+      "scope": "skill",
+      "match": {"requirement": "local_command", "state": "availability_unknown"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The Skill requires local command execution, but the current execution policy is unknown.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::fingerprint_changes_for_version_network_and_availability"]
+    },
+    {
+      "id": "skill.local-command.unavailable",
+      "scope": "skill",
+      "match": {"requirement": "local_command", "state": "unavailable"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "The Skill requires local command execution, but the current policy denies it.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unavailable_network_mcp_and_local_command_are_explicitly_unsupported"]
+    },
+    {
+      "id": "skill.binary.requirement-unknown",
+      "scope": "skill",
+      "match": {"requirement": "binary", "state": "requirement_unknown"},
+      "status": "unknown",
+      "action": "document",
+      "reason": "The Skill binary requirements are not known.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unknown_requirement_is_not_treated_as_false"]
+    },
+    {
+      "id": "skill.binary.availability-unknown",
+      "scope": "skill",
+      "match": {"requirement": "binary", "state": "availability_unknown"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The Skill declares binary requirements, but the managed runtime binary inventory is unknown.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::resource_inventory_availability_is_conservative"]
+    },
+    {
+      "id": "skill.binary.missing",
+      "scope": "skill",
+      "match": {"requirement": "binary", "state": "missing"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "At least one declared binary requirement is unavailable in the managed runtime.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::missing_resources_platform_and_version_merge_in_stable_severity_order"]
+    },
+    {
+      "id": "skill.environment.requirement-unknown",
+      "scope": "skill",
+      "match": {"requirement": "environment", "state": "requirement_unknown"},
+      "status": "unknown",
+      "action": "document",
+      "reason": "The Skill environment requirements are not known.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unknown_requirement_is_not_treated_as_false"]
+    },
+    {
+      "id": "skill.environment.availability-unknown",
+      "scope": "skill",
+      "match": {"requirement": "environment", "state": "availability_unknown"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The Skill declares environment requirements, but the managed runtime environment inventory is unknown.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::resource_inventory_availability_is_conservative"]
+    },
+    {
+      "id": "skill.environment.missing",
+      "scope": "skill",
+      "match": {"requirement": "environment", "state": "missing"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "At least one declared environment name is unavailable in the managed runtime.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::missing_resources_platform_and_version_merge_in_stable_severity_order"]
+    },
+    {
+      "id": "skill.runtime-asset.requirement-unknown",
+      "scope": "skill",
+      "match": {"requirement": "runtime_asset", "state": "requirement_unknown"},
+      "status": "unknown",
+      "action": "document",
+      "reason": "The Skill runtime asset requirements are not known.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unknown_requirement_is_not_treated_as_false"]
+    },
+    {
+      "id": "skill.runtime-asset.availability-unknown",
+      "scope": "skill",
+      "match": {"requirement": "runtime_asset", "state": "availability_unknown"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The Skill declares runtime asset requirements, but the managed runtime asset inventory is unknown.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::resource_inventory_availability_is_conservative"]
+    },
+    {
+      "id": "skill.runtime-asset.missing",
+      "scope": "skill",
+      "match": {"requirement": "runtime_asset", "state": "missing"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "At least one declared runtime asset is unavailable in the managed runtime.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::missing_resources_platform_and_version_merge_in_stable_severity_order"]
+    },
+    {
+      "id": "skill.platform.requirement-unknown",
+      "scope": "skill",
+      "match": {"requirement": "platform", "state": "requirement_unknown"},
+      "status": "unknown",
+      "action": "document",
+      "reason": "The Skill supported-platform declaration is not known.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unknown_requirement_is_not_treated_as_false"]
+    },
+    {
+      "id": "skill.platform.mismatch",
+      "scope": "skill",
+      "match": {"requirement": "platform", "state": "mismatch"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "The current platform is not included in the Skill supported-platform declaration.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::missing_resources_platform_and_version_merge_in_stable_severity_order"]
+    },
+    {
+      "id": "skill.minimum-runtime.requirement-unknown",
+      "scope": "skill",
+      "match": {"requirement": "minimum_runtime_version", "state": "requirement_unknown"},
+      "status": "unknown",
+      "action": "document",
+      "reason": "The Skill minimum runtime version requirement is not known.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unknown_requirement_is_not_treated_as_false"]
+    },
+    {
+      "id": "skill.minimum-runtime.missing-version",
+      "scope": "skill",
+      "match": {"requirement": "minimum_runtime_version", "state": "missing_runtime_version"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The current public runtime version is unavailable, so the minimum cannot be evaluated.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::version_comparison_is_conservative"]
+    },
+    {
+      "id": "skill.minimum-runtime.unparseable",
+      "scope": "skill",
+      "match": {"requirement": "minimum_runtime_version", "state": "unparseable"},
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "The public runtime version cannot be compared safely with the declared minimum.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unparseable_runtime_version_yields_unknown_verdict"]
+    },
+    {
+      "id": "skill.minimum-runtime.not-met",
+      "scope": "skill",
+      "match": {"requirement": "minimum_runtime_version", "state": "not_met"},
+      "status": "unsupported",
+      "action": "disable",
+      "reason": "The current public runtime version is lower than the Skill declared minimum.",
+      "evidence": ["desktop/src-tauri/src/skill_manager/compatibility.rs"],
+      "tests": ["desktop/src-tauri/src/skill_manager/compatibility.rs::tests::missing_resources_platform_and_version_merge_in_stable_severity_order"]
+    }
+  ],
   "science_versions": [],
   "transport_rules": [
     {
@@ -323,6 +684,25 @@
         "desktop/gateway/src/messages.rs"
       ],
       "tests": []
+    },
+    {
+      "id": "transport.ssh.bridge-not-implemented",
+      "scope": "transport",
+      "match": {
+        "capability": "ssh_bridge",
+        "implementation": "not_available"
+      },
+      "status": "limited",
+      "action": "document",
+      "reason": "CSSwitch does not provide a managed SSH Bridge in this implementation round; Skills that require SSH are evaluated from a safe capability summary and are not assumed usable after installation.",
+      "evidence": [
+        "desktop/src-tauri/src/skill_manager/compatibility.rs",
+        "scripts/launch-virtual-sandbox.sh"
+      ],
+      "tests": [
+        "desktop/src-tauri/src/skill_manager/compatibility.rs::tests::unavailable_ssh_is_unsupported_and_disable_wins",
+        "desktop/src-tauri/src/skill_manager/compatibility.rs::tests::ssh_agent_and_config_summary_are_aggregated_conservatively"
+      ]
     }
   ]
 }

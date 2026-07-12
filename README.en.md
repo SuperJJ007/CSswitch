@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.1"><img src="https://img.shields.io/badge/release-v0.4.1-2ea44f.svg" alt="CSSwitch v0.4.1"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.2"><img src="https://img.shields.io/badge/release-v0.4.2-2ea44f.svg" alt="CSSwitch v0.4.2"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -24,7 +24,7 @@ It is built for more than developers. You need Claude Science, a third-party API
 
 [Download latest release](../../releases/latest) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.4.1 upgrade note:** The inference data plane uses the bundled Rust gateway. Version 0.4.1 safely stops a legacy CSSwitch Python proxy only when its identity matches exactly; unknown listeners still fail closed. An in-place install preserves v2 configuration. See [Upgrade and rollback](./docs/upgrade-and-rollback.md).
+> **0.4.2 upgrade note:** The new Skill Manager scans configured research-Skill sources, imports managed copies, and deploys them into isolated Science. Imported copies survive source removal. The exact legacy Python-proxy cleanup from 0.4.1 remains intact, and unknown listeners still fail closed. See [Upgrade and rollback](./docs/upgrade-and-rollback.md).
 
 ## Contents
 
@@ -70,6 +70,7 @@ Claude Science sandbox
 - Click "一键开始" (Start) to launch the proxy, prepare the sandbox, and open Science.
 - Show the actual selected model name in Science instead of a vague `claude` or `opus` label.
 - Switch back to "Official Claude" without interfering with your real Claude login.
+- Scan, import, inventory, and deploy local research Skills; managed copies are independent of their source and can be restored after sandbox reconstruction.
 
 **For advanced users**
 
@@ -101,7 +102,7 @@ If you have a Claude subscription and want the normal official Science experienc
 
 ## Upgrading from an older version
 
-CSSwitch 0.4.1 keeps the existing v2 configuration format. Quit the older CSSwitch app, drag 0.4.1 into Applications, and replace the existing copy. The first launch may still require right-clicking the app and choosing “Open.” Back up `~/.csswitch/config.json` before upgrading. If 0.4.1 blocks your workflow, quit CSSwitch and reinstall the previous stable app; there is no runtime switch back to the Python data plane.
+CSSwitch 0.4.2 keeps the existing v2 configuration format. Quit the older app, drag 0.4.2 into Applications, and replace the existing copy. Back up all of `~/.csswitch/` first because it now includes configuration and imported Skills. Rolling back replaces only the app and does not remove new data; older releases ignore Skill Manager data they do not understand.
 
 For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/upgrade-and-rollback.md).
 

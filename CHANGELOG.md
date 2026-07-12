@@ -2,6 +2,26 @@
 
 CSSwitch follows semantic versioning. Older release notes remain available on the [GitHub Releases page](https://github.com/SuperJJ007/CSSwitch/releases).
 
+## [0.4.2] — 2026-07-12
+
+### Added
+
+- Added a local Skill Manager that discovers compatible Skills from configured real-HOME sources, imports immutable copies into CSSwitch-managed storage, tracks inventory, and deploys selected Skills into the isolated Science sandbox.
+- Added requirement inspection and compatibility reporting for Skill files, scripts, assets, references, static trees, and external Python, R, network, or tool dependencies.
+- Expanded the capability catalog and installation-matrix checks used by runtime diagnostics.
+
+### Safety and lifecycle
+
+- Imported Skills remain in managed storage if their original source disappears, and sandbox reconstruction restores deployed Skills from that store.
+- Skill discovery and deployment do not read or copy real Science credentials. The existing sandbox lifecycle and local-only runtime boundaries remain in force.
+- Preserved 0.4.1's exact legacy Python proxy ownership checks: cleanup still requires the expected listener port, UID, Python identity, bundled legacy script path, and provider arguments; unknown processes fail closed.
+
+### Upgrade notes
+
+- Replace the existing app with `CSSwitch_0.4.2_aarch64.dmg`; v2 profiles remain compatible.
+- Existing imported Skills are retained under CSSwitch-managed data. Back up `~/.csswitch/` before upgrading or rolling back.
+- This release remains Apple Silicon only, ad-hoc signed, and not notarized.
+
 ## [0.4.1] — 2026-07-11
 
 ### Fixed

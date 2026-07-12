@@ -1,9 +1,13 @@
 import json
 import pathlib
+import re
+import sys
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 CATALOG = ROOT / "catalog" / "capabilities.v1.json"
 SECTIONS = [
     "providers",
@@ -76,10 +80,65 @@ RUNTIME_OBSERVABILITY_RULE_IDS = {
     "tool.siliconflow.forced-named-to-any",
 }
 
+EXPECTED_SKILL_CONDITIONS = {
+    ("baseline", "satisfied"),
+    ("sandbox", "unavailable"),
+    ("sandbox", "unknown"),
+    ("deployment", "not_deployed"),
+    ("deployment", "pending"),
+    ("deployment", "restart_required"),
+    ("deployment", "failed"),
+    ("discovery", "unknown"),
+    ("discovery", "not_discovered"),
+    *{
+        (requirement, state)
+        for requirement in ("network", "ssh", "mcp", "local_command")
+        for state in ("requirement_unknown", "availability_unknown", "unavailable")
+    },
+    *{
+        (requirement, state)
+        for requirement in ("binary", "environment", "runtime_asset")
+        for state in ("requirement_unknown", "availability_unknown", "missing")
+    },
+    ("platform", "requirement_unknown"),
+    ("platform", "mismatch"),
+    ("minimum_runtime_version", "requirement_unknown"),
+    ("minimum_runtime_version", "missing_runtime_version"),
+    ("minimum_runtime_version", "unparseable"),
+    ("minimum_runtime_version", "not_met"),
+}
+
+UNKNOWN_SKILL_STATES = {
+    "requirement_unknown",
+    "availability_unknown",
+    "unknown",
+    "missing_runtime_version",
+    "unparseable",
+}
+LIMITED_SKILL_CONDITIONS = {
+    ("deployment", "not_deployed"),
+    ("deployment", "pending"),
+    ("deployment", "restart_required"),
+}
+
 
 def load_catalog():
     with CATALOG.open(encoding="utf-8") as f:
         return json.load(f)
+
+
+PRIVATE_CATALOG_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"(?:/users/|/home/|/private/var/|/var/folders/|/tmp/|/etc/|~/|[a-z]:\\users\\)",
+    r"(?:\.ssh(?:[/\\]|$)|\.claude-science)",
+    r"(?:oauth[_-]token|access[_-]token|refresh[_-]token|api[_-]key|private[_-]key|client[_-]secret)",
+    r"(?:encryption\.key|-----begin )",
+    r"(?:inventory\.v1|installed_at|content_hash|source_ref|source_revision|active-org|/orgs/)",
+    r"(?:api key|private key|oauth token|access token|refresh token|client secret)\s*(?::|=)\s*\S+",
+))
+
+
+def private_catalog_shape(text):
+    return next((pattern.pattern for pattern in PRIVATE_CATALOG_PATTERNS if pattern.search(text)), None)
 
 
 class CapabilityCatalogSchema(unittest.TestCase):
@@ -128,6 +187,83 @@ class CapabilityCatalogSchema(unittest.TestCase):
             for entry in data[section]
         }
         self.assertTrue(RUNTIME_OBSERVABILITY_RULE_IDS.issubset(ids))
+
+    def test_skill_rules_use_public_match_schema_and_cover_every_condition(self):
+        skills = load_catalog()["skills"]
+        conditions = set()
+        for rule in skills:
+            with self.subTest(rule_id=rule["id"]):
+                self.assertEqual(rule["scope"], "skill")
+                self.assertEqual(set(rule["match"]), {"requirement", "state"})
+                condition = (rule["match"]["requirement"], rule["match"]["state"])
+                self.assertNotIn(condition, conditions)
+                conditions.add(condition)
+
+                if condition == ("baseline", "satisfied"):
+                    self.assertEqual((rule["status"], rule["action"]), ("supported", "none"))
+                elif condition in LIMITED_SKILL_CONDITIONS:
+                    self.assertEqual(rule["status"], "limited")
+                    self.assertIn(rule["action"], {"document", "degrade", "diagnose"})
+                elif condition[1] in UNKNOWN_SKILL_STATES:
+                    self.assertEqual(rule["status"], "unknown")
+                    self.assertIn(rule["action"], {"document", "diagnose"})
+                else:
+                    self.assertEqual((rule["status"], rule["action"]), ("unsupported", "disable"))
+
+        self.assertEqual(conditions, EXPECTED_SKILL_CONDITIONS)
+
+    def test_ssh_bridge_is_a_transport_boundary_not_dynamic_skill_inventory(self):
+        data = load_catalog()
+        boundary = next(
+            rule
+            for rule in data["transport_rules"]
+            if rule["id"] == "transport.ssh.bridge-not-implemented"
+        )
+        self.assertEqual(boundary["scope"], "transport")
+        self.assertEqual(boundary["match"], {
+            "capability": "ssh_bridge",
+            "implementation": "not_available",
+        })
+        self.assertEqual((boundary["status"], boundary["action"]), ("limited", "document"))
+        self.assertTrue(any(rule["match"] == {
+            "requirement": "ssh",
+            "state": "unavailable",
+        } for rule in data["skills"]))
+
+    def test_static_catalog_contains_no_inventory_or_sensitive_runtime_evidence(self):
+        data = load_catalog()
+        for section in SECTIONS:
+            for rule in data[section]:
+                serialized = json.dumps(rule, ensure_ascii=False)
+                with self.subTest(section=section, rule_id=rule["id"]):
+                    self.assertIsNone(
+                        private_catalog_shape(serialized),
+                        f"private catalog shape in {rule['id']}",
+                    )
+                if section == "skills":
+                    self.assertTrue(all(
+                        evidence.startswith(("desktop/", "test/", "scripts/"))
+                        for evidence in rule["evidence"]
+                    ))
+
+        self.assertIsNone(private_catalog_shape(
+            "API key and private key support are capability descriptions, not values."
+        ))
+        self.assertIsNone(private_catalog_shape("API key:"))
+        for unsafe in (
+            "oauth_token",
+            "api_key",
+            "private_key",
+            "~/.ssh/config",
+            "/Users/example/private",
+            "/tmp/private",
+            ".claude-science/orgs/value",
+            "inventory.v1.json content_hash",
+            "-----BEGIN PRIVATE KEY-----",
+            "API key: sk-secret-value",
+        ):
+            with self.subTest(unsafe=unsafe):
+                self.assertIsNotNone(private_catalog_shape(unsafe))
 
     def test_dashscope_rules_use_exact_request_shape_hosts(self):
         data = load_catalog()
