@@ -548,20 +548,20 @@ mod tests {
         let (gateway, shim, catalog_shim) =
             status_runtime_identity("deepseek", "", String::new(), String::new());
         assert_eq!(gateway, "rust");
-        assert_eq!(shim, "off");
-        assert_eq!(catalog_shim, "off");
+        assert_eq!(shim, "rewrite");
+        assert_eq!(catalog_shim, "rewrite");
 
         let (gateway, shim, catalog_shim) =
             status_runtime_identity("deepseek", "secret-present", "rust".into(), "off".into());
         assert_eq!(gateway, "rust");
         assert_eq!(shim, "off");
-        assert_eq!(catalog_shim, "off");
+        assert_eq!(catalog_shim, "rewrite");
 
         let (gateway, shim, catalog_shim) =
             status_runtime_identity("deepseek", "secret-present", String::new(), String::new());
         assert_eq!(gateway, "");
         assert_eq!(shim, "");
-        assert_eq!(catalog_shim, "off");
+        assert_eq!(catalog_shim, "rewrite");
     }
 
     struct EnvGuard {

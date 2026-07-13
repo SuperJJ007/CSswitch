@@ -134,8 +134,15 @@ pub(crate) fn normalize_shim_mode(adapter: &str, raw: Option<&str>) -> &'static 
     }
 }
 
+pub(crate) fn managed_shim_mode(adapter: &str, raw: Option<&str>) -> &'static str {
+    if adapter == "deepseek" && raw.is_none() {
+        return "rewrite";
+    }
+    normalize_shim_mode(adapter, raw)
+}
+
 pub(crate) fn current_shim_mode_for_adapter(adapter: &str) -> &'static str {
-    normalize_shim_mode(
+    managed_shim_mode(
         adapter,
         std::env::var("CSSWITCH_TOOLUSE_SHIM").ok().as_deref(),
     )
@@ -253,10 +260,10 @@ pub(crate) fn relay_missing_model(adapter: &str, model: &str) -> bool {
 mod tests {
     use super::{
         adapter_for_profile, assert_format_supported, gateway_kind_for_adapter,
-        key_env_for_adapter, key_fingerprint, normalize_shim_mode, parse_endpoint, proxy_args_for,
-        proxy_fingerprint, proxy_fingerprint_with_runtime, reject_openai_custom_anthropic_base,
-        relay_missing_base_url, relay_missing_model, should_scratch_candidate,
-        status_upstream_endpoint, upstream_endpoint,
+        key_env_for_adapter, key_fingerprint, managed_shim_mode, normalize_shim_mode,
+        parse_endpoint, proxy_args_for, proxy_fingerprint, proxy_fingerprint_with_runtime,
+        reject_openai_custom_anthropic_base, relay_missing_base_url, relay_missing_model,
+        should_scratch_candidate, status_upstream_endpoint, upstream_endpoint,
     };
     use crate::config::Profile;
 
@@ -640,6 +647,16 @@ mod tests {
             "off"
         );
         assert_eq!(normalize_shim_mode("unknown", Some("rewrite")), "off");
+    }
+
+    #[test]
+    fn managed_deepseek_defaults_to_rewrite_without_changing_other_providers() {
+        assert_eq!(managed_shim_mode("deepseek", None), "rewrite");
+        assert_eq!(managed_shim_mode("deepseek", Some("off")), "off");
+        assert_eq!(managed_shim_mode("deepseek", Some("detect")), "detect");
+        assert_eq!(managed_shim_mode("deepseek", Some("")), "off");
+        assert_eq!(managed_shim_mode("qwen", None), "off");
+        assert_eq!(managed_shim_mode("relay", None), "off");
     }
 
     #[test]

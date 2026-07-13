@@ -227,7 +227,7 @@
       },
       "status": "limited",
       "action": "normalize",
-      "reason": "When explicitly enabled, the DSML shim can turn known leaked DSML tool calls back into Anthropic tool_use blocks; default runtime behavior remains off.",
+      "reason": "Managed DeepSeek runtimes enable the DSML shim by default so known leaked DSML tool calls become Anthropic tool_use blocks; explicit off and detect overrides remain available.",
       "evidence": [
         "desktop/gateway/src/dsml_shim.rs",
         "desktop/gateway/src/dsml_shim.rs",
