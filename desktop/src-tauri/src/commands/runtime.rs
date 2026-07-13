@@ -675,6 +675,10 @@ exit 0
 set -eu
 cmd="${1:-}"
 if [ "$#" -gt 0 ]; then shift; fi
+if [ "$cmd" = "--version" ]; then
+  echo "claude-science 0.0.0-csswitch-test"
+  exit 0
+fi
 data_dir=""
 port=""
 while [ "$#" -gt 0 ]; do
@@ -817,6 +821,7 @@ esac
         env_guard.set("HOME", &home);
         env_guard.set("CSSWITCH_REPO", &root);
         env_guard.set("SCIENCE_BIN", &fake_science);
+        env_guard.set("CSSWITCH_TEST_FAKE_SCIENCE_IDENTITY", "1");
         env_guard.set("CSSWITCH_FAKE_OPEN_LOG", &open_log);
         env_guard.set("CSSWITCH_DOCTOR_CHECK_REAL_HOME", "0");
         env_guard.set(
@@ -987,6 +992,7 @@ esac
         env_guard.set("HOME", &home);
         env_guard.set("CSSWITCH_REPO", &root);
         env_guard.set("SCIENCE_BIN", &fake_science);
+        env_guard.set("CSSWITCH_TEST_FAKE_SCIENCE_IDENTITY", "1");
         env_guard.set("CSSWITCH_FAKE_OPEN_LOG", &open_log);
         env_guard.set("CSSWITCH_DOCTOR_CHECK_REAL_HOME", "0");
         env_guard.set(

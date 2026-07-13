@@ -1262,6 +1262,8 @@ fn wait_log_contains(path: &Path, needle: &str) {
 #[test]
 #[ignore = "explicit installed Science local-MCP dialogue E2E; temp HOME/data-dir, public GitHub, local mock/browser only"]
 fn isolated_science_installs_attaches_and_persists_external_skill() {
+    use std::os::unix::fs::PermissionsExt;
+
     assert_eq!(
         std::env::var("CSSWITCH_REAL_SCIENCE_SKILL_INSTALL_MCP_E2E").as_deref(),
         Ok("1"),
@@ -1292,6 +1294,16 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     assert!(gateway.is_file(), "缺少本轮 gateway：{}", gateway.display());
     let gateway_port = free_port();
     let gateway_secret = "csswitch-e2e-secret";
+    let bridge_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let bridge_key = outer_home.join(".csswitch/runtime/skill-install-bridge.key");
+    fs::create_dir_all(bridge_key.parent().unwrap()).unwrap();
+    fs::set_permissions(
+        bridge_key.parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(&bridge_key, format!("{bridge_token}\n")).unwrap();
+    fs::set_permissions(&bridge_key, fs::Permissions::from_mode(0o600)).unwrap();
     let install_bridge =
         outer_home.join(format!("CSSwitch-Skill-Bridge-e2e-{}", std::process::id()));
     let provider = MockProvider::start(install_bridge.to_string_lossy().into_owned());
@@ -1305,6 +1317,7 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
         .env("CSSWITCH_UPSTREAM_URL", provider.endpoint())
         .env("CSSWITCH_SKILL_DATA_DIR", &data_dir)
         .env("CSSWITCH_SKILL_BRIDGE_DIR", &install_bridge)
+        .env("CSSWITCH_SKILL_BRIDGE_TOKEN", bridge_token)
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             File::create(root.join("gateway.stderr.log")).unwrap(),
@@ -1324,14 +1337,14 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
         "name": INSTALL_SERVER_NAME,
         "command": gateway.to_string_lossy(),
         "args": ["skill-install-mcp", "--bridge-dir", install_bridge.to_string_lossy(), "--tool-mode", "install"],
-        "env": {},
+        "env": {"CSSWITCH_SKILL_BRIDGE_KEY_FILE": bridge_key.to_string_lossy()},
         "description": format!("Install public GitHub Skills locally. {MANAGED_MARKER}")
     });
     let uninstaller = json!({
         "name": UNINSTALL_SERVER_NAME,
         "command": gateway.to_string_lossy(),
         "args": ["skill-install-mcp", "--bridge-dir", install_bridge.to_string_lossy(), "--tool-mode", "uninstall"],
-        "env": {},
+        "env": {"CSSWITCH_SKILL_BRIDGE_KEY_FILE": bridge_key.to_string_lossy()},
         "description": format!("Uninstall CSSwitch imported Skills locally. {MANAGED_MARKER}")
     });
     assert!(merge_registrations(&config, vec![installer, uninstaller]).unwrap());

@@ -266,8 +266,16 @@ pub(crate) fn one_click_login<R: Runtime>(
         .map_err(|e| format!("起沙箱失败：{e}"))?;
     if !status.success() {
         let tail = redact(&tail_file(&log_path("sandbox.log"), 600), &secret);
+        let mut no_child = None;
+        let mut no_url = None;
+        let cleanup = stop_sandbox(&app, &mut no_child, &mut no_url, Some(&launch_runtime));
         trace.finish("error=sandbox_launch_failed");
-        return Err(format!("起沙箱脚本失败。\n{tail}"));
+        let cleanup_note = if cleanup.is_ok() {
+            "已按本次 runtime/data-dir 尝试清理部分启动。"
+        } else {
+            "部分启动清理未能确认完成；请使用“全部停止”重试。"
+        };
+        return Err(format!("起沙箱脚本失败。{cleanup_note}\n{tail}"));
     }
 
     // From this point onward stop/status/url must use the exact binary selected

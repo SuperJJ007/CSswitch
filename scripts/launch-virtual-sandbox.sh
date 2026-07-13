@@ -11,6 +11,7 @@
 #   再起沙箱: scripts/launch-virtual-sandbox.sh [--port 8990] [--proxy-url http://127.0.0.1:18991]
 #   CSSwitch 桌面端通过 CSSWITCH_PROXY_URL 环境变量传递含 secret 的 URL，避免进入 argv。
 set -euo pipefail
+umask 077
 
 PROJ="${0:A:h:h}"
 SANDBOX_HOME="${SANDBOX_HOME:-$PROJ/.sandbox/home}"
@@ -32,6 +33,16 @@ is_safe_science_bin() {
     probe="${probe:h}"
   done
   [[ -f "$1" && -x "$1" ]]
+}
+
+path_contains_symlink() {
+  local probe="$1"
+  [[ "$probe" == /* ]] || return 0
+  while [[ "$probe" != "/" ]]; do
+    [[ -L "$probe" ]] && return 0
+    probe="${probe:h}"
+  done
+  return 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -59,6 +70,10 @@ if [[ "$_PROXY_PORT" =~ ^[0-9]+$ ]] && (( 10#${_PROXY_PORT} == PREVIEW_PORT )); 
 fi
 _dd_real="${DATA_DIR:A}"; _real_real="${REAL_DATA_DIR:A}"
 if [[ "$_dd_real" == "$_real_real" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
+if path_contains_symlink "$DATA_DIR"; then
+  echo "拒绝：Science data-dir 路径包含符号链接"
+  exit 1
+fi
 if [[ "$DRY_RUN" == "1" ]]; then echo "DRY-RUN OK：护栏通过，未启动沙箱。"; exit 0; fi
 
 # The selected runtime owns initialization and migration inside the isolated
@@ -67,6 +82,10 @@ if [[ "$DRY_RUN" == "1" ]]; then echo "DRY-RUN OK：护栏通过，未启动沙�
 # that identity, this script may use only the installed App and never an implicit
 # data-dir fallback.
 mkdir -p "$DATA_DIR"
+if path_contains_symlink "$DATA_DIR"; then
+  echo "拒绝：Science data-dir 路径在初始化期间发生符号链接变化"
+  exit 1
+fi
 BIN_SOURCE="backend-selected runtime"
 if [[ -z "$BIN" ]]; then
   BIN="$APP_BIN"
@@ -127,6 +146,10 @@ _NO_PROXY="127.0.0.1,localhost,::1"
 echo "  外联防卡 = Anthropic HTTPS fast-fail（经 $_FASTFAIL_PROXY，no_proxy=$_NO_PROXY）"
 echo
 
+if path_contains_symlink "$DATA_DIR"; then
+  echo "拒绝：Science data-dir 路径在启动前发生符号链接变化"
+  exit 1
+fi
 if ! HOME="$SANDBOX_HOME" \
   ANTHROPIC_BASE_URL="$PROXY_URL" \
   https_proxy="$_FASTFAIL_PROXY" HTTPS_PROXY="$_FASTFAIL_PROXY" \

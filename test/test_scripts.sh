@@ -42,6 +42,11 @@ ln -s "$OUTER_HOME/.claude-science" "$T/linkhome/.claude-science"
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/linkhome" SCIENCE_BIN="$FAKE_OK" "$ROOT/scripts/stop-science-sandbox.sh" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "真实目录"; then ok "stop rejects symlinked real data-dir collision"; else no "stop allowed symlinked real data-dir collision (rc=$rc): $out"; fi
 
+mkdir -p "$T/outside-data" "$T/arbitrary-linkhome"
+ln -s "$T/outside-data" "$T/arbitrary-linkhome/.claude-science"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/arbitrary-linkhome" SCIENCE_BIN="$FAKE_OK" "$ROOT/scripts/stop-science-sandbox.sh" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "stop rejects arbitrary symlinked data-dir"; else no "stop followed arbitrary symlinked data-dir (rc=$rc): $out"; fi
+
 # 7.7 端口归一化 + dry-run
 out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 08765 --dry-run 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "拒绝"; then ok "08765 rejected via int-normalize"; else no "08765 bypassed guard (rc=$rc)"; fi
@@ -57,6 +62,9 @@ if [ $rc -ne 0 ] && echo "$out" | grep -q "小于 65535"; then ok "preview port 
 
 out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9931 --proxy-url http://127.0.0.1:9932/path-secret --dry-run 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "Gateway 端口冲突"; then ok "preview port cannot collide with Gateway"; else no "preview/Gateway collision accepted (rc=$rc): $out"; fi
+
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/arbitrary-linkhome" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9934 --dry-run 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "launch rejects arbitrary symlinked data-dir"; else no "launch followed arbitrary symlinked data-dir (rc=$rc): $out"; fi
 
 CAPTURE_FILE="$T/launch-args"
 FAKE_CAPTURE="$T/fake-capture"

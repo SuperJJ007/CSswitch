@@ -51,17 +51,20 @@ class SkillRuntimeBoundary(unittest.TestCase):
 
     def test_launcher_never_clones_or_implicitly_selects_data_dir_runtime(self):
         launch = (ROOT / "scripts/launch-virtual-sandbox.sh").read_text()
-        selection = launch.split("# 优先级：", 1)[1].split(
+        selection = launch.split('BIN_SOURCE="backend-selected runtime"', 1)[1].split(
             "# Use a keychain scoped", 1
         )[0]
         self.assertIn('BIN="$APP_BIN"', selection)
         self.assertNotIn('BIN="$DATA_DIR/bin/claude-science"', launch)
         self.assertNotIn("for asset in bin conda runtime seed-assets", launch)
         self.assertNotIn("cp -Rc", launch)
-        self.assertIn("本脚本绝不自动选择它", selection)
+        self.assertIn("CSSWITCH_PROXY_URL", launch)
+        self.assertIn("--proxy-url", launch)
+        self.assertIn("path_contains_symlink", launch)
 
         stop = (ROOT / "scripts/stop-science-sandbox.sh").read_text()
         self.assertNotIn('BIN="$DATA_DIR/bin/claude-science"', stop)
+        self.assertIn("path_contains_symlink", stop)
 
     def test_fresh_data_dir_initializes_without_reading_real_science_home(self):
         with tempfile.TemporaryDirectory(
@@ -152,18 +155,30 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertNotIn("localStorage", js)
         self.assertIn("runtime_choice: Option<String>", runtime)
         self.assertIn("choice == Some(CACHED_ONCE_CHOICE)", science)
-        self.assertIn("if is_executable_file(app_bin)", science)
+        self.assertIn("safe_science_version(app_bin)", science)
+        self.assertIn('"cached_choice_required"', science)
 
     def test_science_runtime_identity_is_reused_for_serve_status_url_and_stop(self):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
         science = (ROOT / "desktop/src-tauri/src/runtime/science.rs").read_text()
         runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
         self.assertIn('.env("SCIENCE_BIN", &launch_runtime.path)', session)
+        self.assertIn('.env("CSSWITCH_PROXY_URL", &proxy_url)', session)
+        self.assertNotIn('.arg(&proxy_url)', session)
         self.assertIn("st.science_runtime = Some(launch_runtime.clone())", session)
         self.assertIn("sandbox_running_ours(sport, &launch_runtime)", session)
         self.assertIn("sandbox_url(sport, &launch_runtime)", session)
         self.assertIn('.env("SCIENCE_BIN", &runtime.path)', science)
         self.assertIn('"source": runtime.source.code()', runtime)
+
+    def test_browser_preview_ssh_command_keeps_backend_shell_boundary(self):
+        js = (ROOT / "desktop/src/main.js").read_text()
+        mock = js.split('case "ssh_tunnel_info": {', 1)[1].split(
+            'case "app_version":', 1
+        )[0]
+        self.assertIn("A-Za-z0-9._@", mock)
+        self.assertIn('const quotedTarget = "\'" + target + "\'"', mock)
+        self.assertNotIn("args.req.target) || \"user@server\"", mock)
 
     def test_launcher_ignores_large_external_tree_and_broken_legacy_store(self):
         with tempfile.TemporaryDirectory(

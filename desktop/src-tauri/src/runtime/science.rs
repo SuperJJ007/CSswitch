@@ -101,7 +101,11 @@ fn cached_science_bin(data_dir: &Path) -> PathBuf {
 }
 
 fn safe_science_version(path: &Path) -> Option<String> {
-    let output = Command::new(path).arg("--version").output().ok()?;
+    let output = Command::new(path)
+        .arg("--version")
+        .env("HOME", sandbox_home())
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -146,21 +150,24 @@ fn science_runtime_preflight_for_paths(
         if !is_explicit_executable_file(bin) {
             return Err("显式 SCIENCE_BIN 不是安全的绝对可执行文件；已拒绝回退".into());
         }
-        let identity = runtime_identity(bin.to_path_buf(), ScienceRuntimeSource::Explicit);
+        let version =
+            safe_science_version(bin).ok_or("显式 SCIENCE_BIN 未通过版本预检；已拒绝回退")?;
         return Ok(json!({
             "status": "installed_ready",
-            "selected_source": identity.source.code(),
-            "selected_version": identity.version,
+            "selected_source": ScienceRuntimeSource::Explicit.code(),
+            "selected_version": version,
             "cached_version": Value::Null,
             "download_url": SCIENCE_DOWNLOAD_URL,
         }));
     }
-    if is_executable_file(app_bin) {
-        let identity = runtime_identity(app_bin.to_path_buf(), ScienceRuntimeSource::InstalledApp);
+    if let Some(version) = is_executable_file(app_bin)
+        .then(|| safe_science_version(app_bin))
+        .flatten()
+    {
         return Ok(json!({
             "status": "installed_ready",
-            "selected_source": identity.source.code(),
-            "selected_version": identity.version,
+            "selected_source": ScienceRuntimeSource::InstalledApp.code(),
+            "selected_version": version,
             "cached_version": Value::Null,
             "download_url": SCIENCE_DOWNLOAD_URL,
         }));
@@ -216,16 +223,23 @@ fn select_science_runtime_for_paths(
         if !is_explicit_executable_file(bin) {
             return Err("显式 SCIENCE_BIN 不是安全的绝对可执行文件；已拒绝回退".into());
         }
-        return Ok(runtime_identity(
-            bin.to_path_buf(),
-            ScienceRuntimeSource::Explicit,
-        ));
+        let version =
+            safe_science_version(bin).ok_or("显式 SCIENCE_BIN 未通过版本预检；已拒绝回退")?;
+        return Ok(ScienceRuntimeIdentity {
+            path: bin.to_path_buf(),
+            source: ScienceRuntimeSource::Explicit,
+            version: Some(version),
+        });
     }
-    if is_executable_file(app_bin) {
-        return Ok(runtime_identity(
-            app_bin.to_path_buf(),
-            ScienceRuntimeSource::InstalledApp,
-        ));
+    if let Some(version) = is_executable_file(app_bin)
+        .then(|| safe_science_version(app_bin))
+        .flatten()
+    {
+        return Ok(ScienceRuntimeIdentity {
+            path: app_bin.to_path_buf(),
+            source: ScienceRuntimeSource::InstalledApp,
+            version: Some(version),
+        });
     }
     let cached = cached_science_bin(data_dir);
     let cached_version = is_executable_file(&cached)
@@ -268,7 +282,7 @@ fn runtime_probe_candidates() -> Result<Vec<ScienceRuntimeIdentity>, String> {
     }
     let mut candidates = Vec::new();
     let app = PathBuf::from(SCIENCE_BIN);
-    if is_executable_file(&app) {
+    if is_executable_file(&app) && safe_science_version(&app).is_some() {
         candidates.push(runtime_identity(app, ScienceRuntimeSource::InstalledApp));
     }
     let cached = cached_science_bin(&sandbox_data_dir());
@@ -377,6 +391,10 @@ fn listener_uses_runtime(port: u16, runtime: &ScienceRuntimeIdentity) -> bool {
     if pids.any(|other| other != pid) {
         return false;
     }
+    #[cfg(test)]
+    if test_listener_marker_matches(pid, runtime) {
+        return true;
+    }
     let Ok(expected) = runtime.path.canonicalize() else {
         return false;
     };
@@ -394,6 +412,26 @@ fn listener_uses_runtime(port: u16, runtime: &ScienceRuntimeIdentity) -> bool {
         .filter_map(|line| line.strip_prefix('n'))
         .filter_map(|path| Path::new(path).canonicalize().ok())
         .any(|path| path == expected)
+}
+
+#[cfg(test)]
+fn test_listener_marker_matches(pid: &str, runtime: &ScienceRuntimeIdentity) -> bool {
+    if std::env::var("CSSWITCH_TEST_FAKE_SCIENCE_IDENTITY")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return false;
+    }
+    let Some(configured) = std::env::var_os("SCIENCE_BIN").map(PathBuf::from) else {
+        return false;
+    };
+    if configured.canonicalize().ok() != runtime.path.canonicalize().ok() {
+        return false;
+    }
+    std::fs::read_to_string(sandbox_data_dir().join("fake-science/pid"))
+        .ok()
+        .is_some_and(|recorded| recorded.trim() == pid)
 }
 
 /// Return the sandbox UI URL, falling back to the plain localhost port.
@@ -783,6 +821,15 @@ mod tests {
             )
             .is_err(),
             "an explicit path with a symlinked parent must fail closed"
+        );
+
+        write_fake_bin(&app_bin, 0o755)?;
+        let failed_app_preflight = science_runtime_preflight_for_paths(&data_dir, None, &app_bin)?;
+        assert_eq!(failed_app_preflight["status"], "cached_choice_required");
+        assert!(
+            select_science_runtime_for_paths(&data_dir, None, &app_bin, None)
+                .expect_err("failed App preflight must offer, not implicitly use, cache")
+                .contains("SCIENCE_RUNTIME_CHOICE_REQUIRED")
         );
 
         fs::set_permissions(&app_bin, fs::Permissions::from_mode(0o644))?;

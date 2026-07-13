@@ -56,11 +56,14 @@ pub(crate) fn build_ssh_tunnel_plan(
     } else {
         format!(" -p {ssh_port}")
     };
+    // The whitelist excludes single quotes, so this also prevents IPv6
+    // brackets from being interpreted as a glob by zsh/bash on the client.
+    let quoted_target = format!("'{target}'");
     let command = format!(
         "ssh -F /dev/null -N -T{port_flag} -o StrictHostKeyChecking=ask \
          -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
          -L 127.0.0.1:{science_port}:127.0.0.1:{science_port} \
-         -L 127.0.0.1:{preview_port}:127.0.0.1:{preview_port} {target}"
+         -L 127.0.0.1:{preview_port}:127.0.0.1:{preview_port} {quoted_target}"
     );
     let runtime_path = match runtime_source {
         ScienceRuntimeSource::InstalledApp => {
@@ -80,7 +83,7 @@ pub(crate) fn build_ssh_tunnel_plan(
     // secret-free command asks the remote host for one only after the user runs
     // it on the SSH client; the token exists solely in that terminal's output.
     let login_command = format!(
-        "ssh -F /dev/null -T{port_flag} -o StrictHostKeyChecking=ask {target} \
+        "ssh -F /dev/null -T{port_flag} -o StrictHostKeyChecking=ask {quoted_target} \
          'safe_bin() {{ p=\"$1\"; while [ \"$p\" != / ]; do [ -L \"$p\" ] && return 1; p=${{p%/*}}; [ -n \"$p\" ] || p=/; done; [ -f \"$1\" ] && [ -x \"$1\" ]; }}; \
          H=\"$HOME/.csswitch/sandbox/home\"; B=\"{runtime_path}\"; \
          if ! safe_bin \"$B\"; then echo \"Claude Science binary unavailable\" >&2; exit 1; fi; \
@@ -114,7 +117,7 @@ mod tests {
             .starts_with("ssh -F /dev/null -N -T -o StrictHostKeyChecking=ask"));
         assert!(plan.command.contains("-L 127.0.0.1:8990:127.0.0.1:8990"));
         assert!(plan.command.contains("-L 127.0.0.1:8991:127.0.0.1:8991"));
-        assert!(plan.command.ends_with("alice@science.example"));
+        assert!(plan.command.ends_with("'alice@science.example'"));
         assert_eq!(plan.preview_port, 8991);
         assert!(
             !plan.command.contains("18991"),
@@ -138,7 +141,7 @@ mod tests {
         )
         .unwrap();
         assert!(plan.command.contains(" -p 2222 "));
-        assert!(plan.command.ends_with("alice@[2001:db8::1]"));
+        assert!(plan.command.ends_with("'alice@[2001:db8::1]'"));
         assert!(plan
             .login_command
             .contains(".claude-science/bin/claude-science"));

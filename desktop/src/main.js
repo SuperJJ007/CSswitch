@@ -112,15 +112,26 @@ function mockInvoke(cmd, args) {
       return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber" });
     case "boot_error":
       return Promise.resolve(null);
-    case "ssh_tunnel_info":
+    case "ssh_tunnel_info": {
+      const target = String((args.req && args.req.target) || "").trim();
+      const sshPort = Number(args.req && args.req.ssh_port);
+      if (!/^(?!-)[A-Za-z0-9._@:\[\]%-]{1,255}$/.test(target)) {
+        return Promise.reject("SSH 目标格式无效");
+      }
+      if (!Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535) {
+        return Promise.reject("SSH 端口必须是 1-65535");
+      }
+      const portFlag = sshPort === 22 ? "" : " -p " + sshPort;
+      const quotedTarget = "'" + target + "'";
       return Promise.resolve({
-        command: "ssh -F /dev/null -N -T -o StrictHostKeyChecking=ask -o ExitOnForwardFailure=yes -L 127.0.0.1:8990:127.0.0.1:8990 -L 127.0.0.1:8991:127.0.0.1:8991 " + ((args.req && args.req.target) || "user@server"),
-        login_command: "ssh -F /dev/null -T -o StrictHostKeyChecking=ask " + ((args.req && args.req.target) || "user@server") + " '<fixed Science url command>'",
+        command: "ssh -F /dev/null -N -T" + portFlag + " -o StrictHostKeyChecking=ask -o ExitOnForwardFailure=yes -L 127.0.0.1:8990:127.0.0.1:8990 -L 127.0.0.1:8991:127.0.0.1:8991 " + quotedTarget,
+        login_command: "ssh -F /dev/null -T" + portFlag + " -o StrictHostKeyChecking=ask " + quotedTarget + " '<fixed Science url command>'",
         science_port: 8990,
         preview_port: 8991,
         gateway_forwarded: false,
         warning: "预览模式：命令只转发 Science 与预览端口，不转发 Gateway。",
       });
+    }
     case "app_version":
       return Promise.resolve("0.0.0-preview");
     case "run_doctor":
@@ -1100,8 +1111,8 @@ function showRuntimeChoice(preflight) {
   const canUseCache = preflight && preflight.status === "cached_choice_required" && !!cachedVersion;
   els.runtimeUseCacheBtn.hidden = !canUseCache;
   els.runtimeChoiceText.textContent = canUseCache
-    ? "未找到已安装的 Claude Science App。发现可确认版本的历史缓存：" + cachedVersion + "。你可以仅本次使用它，或前往官方页面安装 / 更新 Science。此选择不会保存。"
-    : "未找到可用的 Claude Science App，历史缓存也无法确认版本。请先从官方页面安装 / 更新 Science。";
+    ? "未找到通过安全预检的 Claude Science App。发现可确认版本的历史缓存：" + cachedVersion + "。你可以仅本次使用它，或前往官方页面安装 / 更新 Science。此选择不会保存。"
+    : "未找到通过安全预检的 Claude Science App，历史缓存也无法确认版本。请先从官方页面安装 / 更新 Science。";
   els.runtimeChoiceSec.hidden = false;
 }
 
@@ -1140,8 +1151,8 @@ async function oneClick() {
     }
     showRuntimeChoice(preflight || { status: "missing" });
     setMsg(preflight && preflight.status === "cached_choice_required"
-      ? "Claude Science App 未安装。请选择是否仅本次使用已确认版本的缓存。"
-      : "Claude Science App 未安装，且没有可安全启动的缓存版本。", "err");
+      ? "Claude Science App 不可用或未通过预检。请选择是否仅本次使用已确认版本的缓存。"
+      : "Claude Science App 不可用或未通过预检，且没有可安全启动的缓存版本。", "err");
   } catch (e) {
     setMsg("Science 运行环境检查失败：" + e, "err");
   } finally {

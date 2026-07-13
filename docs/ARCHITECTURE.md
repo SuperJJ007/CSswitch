@@ -56,6 +56,6 @@ The remote-access helper does not request or return a short-lived Science login 
 
 Provider configuration, Gateway startup, isolated-login preparation, runtime preflight, port ownership, Science launch, and Science health/identity may fail one-click startup. A missing App without an explicitly authorized readable cache is a runtime preflight result, not a provider or Skill error. Skill counts, legacy store conflicts, inventory corruption, missing Skill catalog data, external `~/.claude/skills`, and route/MCP registration failures must not fail or restart Science.
 
-Science version discovery is fail-open with respect to an existing healthy daemon. A missing or non-runnable official app candidate falls back to the retained sandbox binary before launch. Once a newer binary has actually attempted to open the persistent data-dir, CSSwitch must not blindly start an older binary against a potentially migrated directory.
+Science version discovery is fail-open with respect to an existing healthy daemon. A missing or non-runnable official App candidate makes a readable retained sandbox binary eligible for explicit one-launch authorization; it is never selected implicitly. Once a newer binary has actually attempted to open the persistent data-dir, CSSwitch must not blindly start an older binary against a potentially migrated directory.
 
 The Skill Manager source remains recoverable from the `v0.4.3` tag and protected development worktrees, but it is not compiled, registered, packaged, or executed in the focused runtime.
