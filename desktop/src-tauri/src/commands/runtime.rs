@@ -528,9 +528,16 @@ pub(crate) async fn ssh_tunnel_info(
 }
 
 #[tauri::command]
-pub(crate) fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
-    // 显式退出统一交给 RunEvent::ExitRequested 清理，避免多个退出入口各自停代理。
-    app.exit(0);
+pub(crate) async fn quit_app(
+    app: tauri::AppHandle,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+) -> Result<(), String> {
+    let exit_app = app.clone();
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || stop_all_inner_cmd(app, state, lifecycle)).await?;
+    exit_app.exit(0);
     Ok(())
 }
 

@@ -179,6 +179,30 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("A-Za-z0-9._@", mock)
         self.assertIn('const quotedTarget = "\'" + target + "\'"', mock)
         self.assertNotIn("args.req.target) || \"user@server\"", mock)
+        self.assertIn("hadGeneratedAccess", js)
+        self.assertIn("SSH 访问命令已自动清除，请按需重新生成。", js)
+        self.assertIn("SSH 访问命令已清除，请按需重新生成。", js)
+
+    def test_explicit_exit_revokes_the_managed_science_target(self):
+        lib = (ROOT / "desktop/src-tauri/src/lib.rs").read_text()
+        runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
+        js = (ROOT / "desktop/src/main.js").read_text()
+
+        cleanup = lib.split("fn cleanup_for_exit", 1)[1].split(
+            "fn mark_boot_failed", 1
+        )[0]
+        self.assertLess(cleanup.index("stop_sandbox("), cleanup.index("st.stop_proxy()"))
+        quit_command = runtime.split("pub(crate) async fn quit_app", 1)[1].split(
+            "#[cfg(test)]", 1
+        )[0]
+        self.assertLess(
+            quit_command.index("stop_all_inner_cmd"), quit_command.index("exit_app.exit(0)")
+        )
+        quit_handler = js.split('els.quitBtn.addEventListener("click"', 1)[1].split(
+            "\n  });", 1
+        )[0]
+        self.assertIn("clearSshAccess()", quit_handler)
+        self.assertIn('setMsg("退出失败："', quit_handler)
 
     def test_launcher_ignores_large_external_tree_and_broken_legacy_store(self):
         with tempfile.TemporaryDirectory(

@@ -52,6 +52,8 @@ The CSSwitch Gateway binds loopback, and isolated Science is launched with an ex
 
 The remote-access helper does not request or return a short-lived Science login URL. The local Rust backend obtains separate one-time URLs for its bounded control-plane call and browser opening, keeps them in backend memory, and never serializes them into Tauri responses or status. The UI exposes only secret-free SSH commands and clears them together with the SSH target on mode/port/runtime changes or after three minutes. The second command requests its own URL over SSH after the user runs it, so that token appears only in the access-side terminal and never enters CSSwitch frontend state, configuration, clipboard-by-default, or logs.
 
+Closing the settings window only hides it and keeps the managed local chain running. Explicitly quitting CSSwitch first stops the isolated Science daemon and the Gateway, so an already-running client-side SSH tunnel loses its managed Science target. CSSwitch cannot terminate an SSH client process running on another device; the user still stops that command with Ctrl-C.
+
 ## Failure boundary
 
 Provider configuration, Gateway startup, isolated-login preparation, runtime preflight, port ownership, Science launch, and Science health/identity may fail one-click startup. A missing App without an explicitly authorized readable cache is a runtime preflight result, not a provider or Skill error. Skill counts, legacy store conflicts, inventory corruption, missing Skill catalog data, external `~/.claude/skills`, and route/MCP registration failures must not fail or restart Science.

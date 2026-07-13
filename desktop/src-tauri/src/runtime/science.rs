@@ -515,13 +515,20 @@ pub(crate) fn probe_sandbox_runtime(
     Ok((SandboxScienceState::Unknown, None))
 }
 
-fn recover_running_runtime(port: u16) -> Result<Option<ScienceRuntimeIdentity>, String> {
-    for runtime in runtime_probe_candidates()? {
-        if runtime_status(&runtime) == Some(true) && listener_uses_runtime(port, &runtime) {
-            return Ok(Some(runtime));
+fn stop_runtime_from_probe(
+    state: SandboxScienceState,
+    runtime: Option<ScienceRuntimeIdentity>,
+) -> Result<Option<ScienceRuntimeIdentity>, String> {
+    match (state, runtime) {
+        (SandboxScienceState::Stopped, _) => Ok(None),
+        (SandboxScienceState::RunningHealthy, Some(runtime)) => Ok(Some(runtime)),
+        (SandboxScienceState::RunningHealthy, None) => {
+            Err("Science 状态为运行中，但无法确认其 binary 身份；已拒绝按端口停止".into())
+        }
+        (SandboxScienceState::Unknown, _) => {
+            Err("无法确认当前 Science daemon 使用的 binary；已拒绝按端口停止".into())
         }
     }
-    Ok(None)
 }
 
 /// Check that the sandbox Science associated with our data-dir is running.
@@ -552,8 +559,13 @@ pub(crate) fn stop_sandbox<R: Runtime>(
             let port = config::load_from(&config::default_dir())
                 .map_err(|e| format!("读取 Science 端口配置失败：{e}"))?
                 .sandbox_port;
-            recovered = recover_running_runtime(port)?
-                .ok_or("无法确认当前 Science daemon 使用的 binary；已拒绝按端口停止")?;
+            let (state, runtime) = probe_sandbox_runtime(port)?;
+            let Some(runtime) = stop_runtime_from_probe(state, runtime)? else {
+                kill_child(sandbox);
+                *sandbox_url = None;
+                return Ok(());
+            };
+            recovered = runtime;
             &recovered
         }
     };
@@ -607,8 +619,8 @@ mod tests {
         classify_known_runtime_state, classify_sandbox_state, first_http_url, runtime_status_value,
         sandbox_home, sandbox_running_ours, sandbox_url, science_runtime_preflight_for_paths,
         science_status_running, select_science_runtime_for_paths, settings_change_needs_teardown,
-        trusted_science_status, SandboxScienceState, ScienceRuntimeIdentity, ScienceRuntimeSource,
-        CACHED_ONCE_CHOICE,
+        stop_runtime_from_probe, trusted_science_status, SandboxScienceState,
+        ScienceRuntimeIdentity, ScienceRuntimeSource, CACHED_ONCE_CHOICE,
     };
 
     // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
@@ -718,6 +730,16 @@ mod tests {
             Some(false),
             "a stopped daemon may be reported with a non-zero CLI exit"
         );
+    }
+
+    #[test]
+    fn stop_probe_is_idempotent_only_for_confirmed_stopped_state() {
+        assert_eq!(
+            stop_runtime_from_probe(SandboxScienceState::Stopped, None).unwrap(),
+            None
+        );
+        assert!(stop_runtime_from_probe(SandboxScienceState::Unknown, None).is_err());
+        assert!(stop_runtime_from_probe(SandboxScienceState::RunningHealthy, None).is_err());
     }
 
     #[test]

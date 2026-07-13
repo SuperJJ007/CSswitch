@@ -643,7 +643,12 @@ async function persistPorts() {
   }
 }
 
-function clearSshAccess() {
+function clearSshAccess(clearedMessage) {
+  const hadGeneratedAccess = !!(
+    (els.sshCommand && els.sshCommand.value) ||
+    (els.sshLoginCommand && els.sshLoginCommand.value) ||
+    (els.sshResult && !els.sshResult.hidden)
+  );
   if (sshAccessClearTimer) clearTimeout(sshAccessClearTimer);
   sshAccessClearTimer = null;
   if (els.sshTarget) els.sshTarget.value = "";
@@ -651,6 +656,7 @@ function clearSshAccess() {
   if (els.sshLoginCommand) els.sshLoginCommand.value = "";
   if (els.sshWarning) els.sshWarning.textContent = "";
   if (els.sshResult) els.sshResult.hidden = true;
+  if (clearedMessage && hadGeneratedAccess) setMsg(clearedMessage);
 }
 
 async function generateSshAccess() {
@@ -678,7 +684,10 @@ async function generateSshAccess() {
     els.sshWarning.textContent = info.warning || "";
     els.sshResult.hidden = false;
     setMsg("SSH 命令已生成。一次性链接只会在访问端终端执行登录命令后出现。", "ok");
-    sshAccessClearTimer = setTimeout(clearSshAccess, 180000);
+    sshAccessClearTimer = setTimeout(
+      () => clearSshAccess("SSH 访问命令已自动清除，请按需重新生成。"),
+      180000
+    );
   } catch (e) {
     setMsg("生成 SSH 访问资料失败：" + e, "err");
   } finally {
@@ -1296,7 +1305,7 @@ function wire() {
   els.sandboxPort.addEventListener("change", persistPorts);
   els.sshGenerateBtn.addEventListener("click", generateSshAccess);
   els.advSec.addEventListener("toggle", () => {
-    if (!els.advSec.open) clearSshAccess();
+    if (!els.advSec.open) clearSshAccess("SSH 访问命令已清除，请按需重新生成。");
   });
   els.sshCopyCommandBtn.addEventListener("click", () => copySshField(els.sshCommand, "隧道命令"));
   els.sshCopyLoginCommandBtn.addEventListener("click", () => copySshField(els.sshLoginCommand, "登录命令"));
@@ -1355,7 +1364,15 @@ function wire() {
   els.logsBtn.addEventListener("click", () =>
     call("open_logs").catch((e) => setMsg("打开日志失败：" + e, "err"))
   );
-  els.quitBtn.addEventListener("click", () => call("quit_app").catch(() => {}));
+  els.quitBtn.addEventListener("click", () => {
+    clearSshAccess();
+    setBusy(true);
+    setMsg("正在停止代理与隔离 Science…");
+    call("quit_app").catch((e) => {
+      setBusy(false);
+      setMsg("退出失败：" + e + "请先使用“全部停止”重试。", "err");
+    });
+  });
 }
 
 window.addEventListener("DOMContentLoaded", async () => {

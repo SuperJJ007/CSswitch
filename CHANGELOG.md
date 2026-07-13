@@ -14,6 +14,7 @@
 ### Safety
 
 - The CSSwitch Gateway and Science remain loopback-only by default. SSH instructions never forward the Gateway port, explicitly keep host-key checking enabled, and ignore SSH config files so hidden user-configured forwards cannot be activated by the helper.
+- Explicit quit now stops the isolated Science daemon before the Gateway so an already-running SSH tunnel loses its managed target; merely closing the settings window still hides it without stopping the local chain.
 
 ## [0.4.4] — 2026-07-12
 
