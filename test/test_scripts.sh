@@ -42,12 +42,64 @@ ln -s "$OUTER_HOME/.claude-science" "$T/linkhome/.claude-science"
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/linkhome" SCIENCE_BIN="$FAKE_OK" "$ROOT/scripts/stop-science-sandbox.sh" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "真实目录"; then ok "stop rejects symlinked real data-dir collision"; else no "stop allowed symlinked real data-dir collision (rc=$rc): $out"; fi
 
+mkdir -p "$T/outside-data" "$T/arbitrary-linkhome"
+ln -s "$T/outside-data" "$T/arbitrary-linkhome/.claude-science"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/arbitrary-linkhome" SCIENCE_BIN="$FAKE_OK" "$ROOT/scripts/stop-science-sandbox.sh" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "stop rejects arbitrary symlinked data-dir"; else no "stop followed arbitrary symlinked data-dir (rc=$rc): $out"; fi
+
 # 7.7 端口归一化 + dry-run
 out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 08765 --dry-run 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "拒绝"; then ok "08765 rejected via int-normalize"; else no "08765 bypassed guard (rc=$rc)"; fi
 
 out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9931 --dry-run 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && echo "$out" | grep -q "DRY-RUN OK"; then ok "valid port passes guards in dry-run"; else no "valid port dry-run failed (rc=$rc): $out"; fi
+
+out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 8764 --dry-run 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "预览端口"; then ok "preview port cannot collide with reserved 8765"; else no "preview port reached reserved 8765 (rc=$rc): $out"; fi
+
+out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 65535 --dry-run 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "小于 65535"; then ok "preview port overflow rejected"; else no "preview port overflow accepted (rc=$rc): $out"; fi
+
+out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9931 --proxy-url http://127.0.0.1:9932/path-secret --dry-run 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "Gateway 端口冲突"; then ok "preview port cannot collide with Gateway"; else no "preview/Gateway collision accepted (rc=$rc): $out"; fi
+
+mkdir -p "$T/no-ssh-home"
+out="$(HOME="$T/no-ssh-home" SANDBOX_HOME="$T/vh-no-ssh" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9935 --dry-run 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "未找到系统 ~/.ssh/config"; then ok "SSH bridge fails closed without system config"; else no "SSH bridge accepted missing system config (rc=$rc): $out"; fi
+
+BRIDGE_HOME="$T/bridge-home"
+mkdir -p "$BRIDGE_HOME/.ssh"
+printf 'Host bridge-alias\n  HostName 127.0.0.1\n  Port 2222\n' > "$BRIDGE_HOME/.ssh/config"
+out="$(CSSWITCH_SYSTEM_SSH_CONFIG="$BRIDGE_HOME/.ssh/config" "$ROOT/scripts/ssh-bridge/ssh" -G bridge-alias 2>/dev/null)"; rc=$?
+if [ $rc -eq 0 ] && echo "$out" | grep -qx 'hostname 127.0.0.1' && echo "$out" | grep -qx 'port 2222'; then ok "SSH bridge injects the authorized config with -F"; else no "SSH bridge did not load authorized config (rc=$rc)"; fi
+out="$(env -u CSSWITCH_SYSTEM_SSH_CONFIG "$ROOT/scripts/ssh-bridge/ssh" -G bridge-alias 2>&1)"; rc=$?
+if [ $rc -eq 126 ] && echo "$out" | grep -q "缺少有效"; then ok "SSH bridge rejects missing authorization env"; else no "SSH bridge ran without authorization env (rc=$rc)"; fi
+
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/arbitrary-linkhome" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9934 --dry-run 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "launch rejects arbitrary symlinked data-dir"; else no "launch followed arbitrary symlinked data-dir (rc=$rc): $out"; fi
+
+CAPTURE_FILE="$T/launch-args"
+CAPTURE_ENV="$T/launch-env"
+FAKE_CAPTURE="$T/fake-capture"
+mkdir -p "$OUTER_HOME/.claude-science/runtime"
+mkdir -p "$OUTER_HOME/.ssh"
+printf 'must-not-copy\n' > "$OUTER_HOME/.claude-science/runtime/real-user-sentinel"
+printf 'Host test-only\n  HostName 127.0.0.1\n' > "$OUTER_HOME/.ssh/config"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$CAPTURE_FILE"\nif [ -n "${CAPTURE_ENV:-}" ]; then printf "PATH=%%s\\nSSH_CONFIG=%%s\\nHOME=%%s\\n" "$PATH" "${CSSWITCH_SYSTEM_SSH_CONFIG:-}" "$HOME" > "$CAPTURE_ENV"; fi\nexit 0\n' > "$FAKE_CAPTURE"
+chmod +x "$FAKE_CAPTURE"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CAPTURE_ENV="$CAPTURE_ENV" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && grep -qx -- '--host' "$CAPTURE_FILE" && grep -qx -- '127.0.0.1' "$CAPTURE_FILE" && grep -qx -- '--sandbox-port' "$CAPTURE_FILE" && grep -qx -- '9941' "$CAPTURE_FILE"; then ok "launch pins loopback host and explicit Science preview port"; else no "launch omitted explicit loopback/preview port (rc=$rc): $out"; fi
+if grep -Fq "PATH=$ROOT/scripts/ssh-bridge:" "$CAPTURE_ENV" && grep -Fxq "SSH_CONFIG=$OUTER_HOME/.ssh/config" "$CAPTURE_ENV" && grep -Fxq "HOME=$T/vh-capture" "$CAPTURE_ENV"; then ok "launch scopes SSH bridge to the isolated Science environment"; else no "launch omitted isolated SSH bridge environment"; fi
+if [ ! -e "$T/vh-capture/.claude-science/runtime/real-user-sentinel" ]; then ok "launch never copies real Science runtime data"; else no "launch copied real Science data into sandbox"; fi
+if ! echo "$out" | grep -Fq "$T/vh-capture" && ! echo "$out" | grep -Fq "$FAKE_CAPTURE"; then ok "launch log redacts sandbox and binary paths"; else no "launch log exposed sensitive paths: $out"; fi
+
+python3 -c 'import socket,time; s=socket.socket(); s.bind(("127.0.0.1",29992)); s.listen(); time.sleep(10)' &
+PREVIEW_HOLDER=$!
+sleep 0.2
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-preview-conflict" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 29991 --skip-oauth-forge 2>&1)"; rc=$?
+kill "$PREVIEW_HOLDER" 2>/dev/null || true
+wait "$PREVIEW_HOLDER" 2>/dev/null || true
+if [ $rc -ne 0 ] && echo "$out" | grep -q "预览端口.*占用"; then ok "launch rejects occupied preview listener without takeover"; else no "launch ignored occupied preview listener (rc=$rc): $out"; fi
 
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-link" SCIENCE_BIN="$FAKE_LINK" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9932 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "launch rejects explicit Science symlink"; else no "launch accepted explicit Science symlink (rc=$rc): $out"; fi

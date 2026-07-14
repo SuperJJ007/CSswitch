@@ -1,38 +1,38 @@
-# CSSwitch 0.4.4 升级与回滚 / Upgrade and rollback
+# CSSwitch 0.5.0 升级与回滚 / Upgrade and rollback
 
-本说明适用于 macOS Apple Silicon 的 CSSwitch 0.4.4。此版本移除 Skill Manager 的编译与启动耦合，继续复用 Science 持久化 data-dir，并保留 0.4.1 的精确旧 proxy 清理。
+本说明适用于 macOS Apple Silicon 的 CSSwitch 0.5.0。此版本继续复用 Science 持久化 data-dir，增加外部 Skill 安装/隔离卸载桥和可选的系统 SSH 配置授权，并保留精确的旧 proxy 清理。
 
-This guide applies to CSSwitch 0.4.4 for macOS Apple Silicon. This release removes Skill Manager from the compiled startup path, keeps reusing Science's persistent data-dir, and preserves the exact legacy-proxy cleanup from 0.4.1.
+This guide applies to CSSwitch 0.5.0 for macOS Apple Silicon. It keeps reusing Science's persistent data-dir, adds the external Skill install/quarantine bridge and optional system SSH configuration grant, and preserves exact legacy-proxy cleanup.
 
 ## 升级前 / Before upgrading
 
 1. 在 CSSwitch 中停止当前第三方链路，然后退出 CSSwitch。
 2. 备份整个 `~/.csswitch/`，包括配置、日志和 Skill Manager store/inventory。
 3. 不要删除 `~/.csswitch/sandbox/`。覆盖安装 app 不应删除该目录，但手工删除会影响隔离 Science 状态与历史数据。
-4. 确认下载文件名和目标版本是 `CSSwitch_0.4.4_aarch64.dmg` / `0.4.4`。
+4. 确认下载文件名和目标版本是 `CSSwitch_0.5.0_aarch64.dmg` / `0.5.0`。
 
 1. Stop the active third-party path in CSSwitch, then quit CSSwitch.
 2. Back up all of `~/.csswitch/`, including configuration, logs, and Skill Manager store/inventory.
 3. Do not delete `~/.csswitch/sandbox/`. Replacing the app should not remove it, but manual deletion can remove isolated Science state and history.
-4. Confirm that the download and target version are `CSSwitch_0.4.4_aarch64.dmg` / `0.4.4`.
+4. Confirm that the download and target version are `CSSwitch_0.5.0_aarch64.dmg` / `0.5.0`.
 
 ## 覆盖安装 / In-place install
 
 1. 打开 DMG，把 CSSwitch 拖入「应用程序」并选择替换旧版。
-2. 首次打开如果被 macOS 阻止，在 Finder 中右键 CSSwitch，选择「打开」。0.4.4 当前为 ad-hoc 签名且未公证；这不等于 Developer ID、notarization 或 Gatekeeper 已验证。
+2. 首次打开如果被 macOS 阻止，在 Finder 中右键 CSSwitch，选择「打开」。0.5.0 当前为 ad-hoc 签名且未公证；这不等于 Developer ID、notarization 或 Gatekeeper 已验证。
 3. 打开 CSSwitch，确认已有 profile 仍存在，再执行一次「设为当前」。
 4. 先用最小请求验证常用 provider，再恢复日常工作。
 
 1. Open the DMG, drag CSSwitch into Applications, and replace the older copy.
-2. If macOS blocks the first launch, right-click CSSwitch in Finder and choose “Open.” The current 0.4.4 package is ad-hoc signed and not notarized; this is not Developer ID, notarization, or Gatekeeper verification.
+2. If macOS blocks the first launch, right-click CSSwitch in Finder and choose “Open.” The current 0.5.0 package is ad-hoc signed and not notarized; this is not Developer ID, notarization, or Gatekeeper verification.
 3. Open CSSwitch, confirm that existing profiles remain, then run “Set active” once.
 4. Send one minimal request through your usual provider before resuming normal work.
 
 ## 回滚 / Rollback
 
-0.4.4 保持 v2 配置 schema，但回滚仍应先备份整个 `~/.csswitch/`。退出 CSSwitch，确认 app 与 `csswitch-gateway` 均已停止，然后用上一稳定版 `.dmg` 覆盖 `/Applications/CSSwitch.app`。不要同时运行两个版本，也不要把 0.4.4 的 sidecar 单独复制进旧版 app。回滚不会删除 Science data-dir 或旧 Skill Manager 数据。
+0.5.0 保持 v2 配置 schema，但回滚仍应先备份整个 `~/.csswitch/`。退出 CSSwitch，确认 app 与 `csswitch-gateway` 均已停止，然后用上一稳定版 `.dmg` 覆盖 `/Applications/CSSwitch.app`。不要同时运行两个版本，也不要把 0.5.0 的 sidecar 单独复制进旧版 app。回滚不会删除 Science data-dir、已安装 Skill、隔离回收内容或旧 Skill Manager 数据。
 
-Version 0.4.4 keeps the v2 configuration schema, but back up all of `~/.csswitch/` before rollback. Quit CSSwitch, confirm that both the app and `csswitch-gateway` have stopped, then replace `/Applications/CSSwitch.app` using the previous stable DMG. Do not run two versions at once or copy the 0.4.4 sidecar into an older app. Rollback does not delete the Science data-dir or legacy Skill Manager data.
+Version 0.5.0 keeps the v2 configuration schema, but back up all of `~/.csswitch/` before rollback. Quit CSSwitch, confirm that both the app and `csswitch-gateway` have stopped, then replace `/Applications/CSSwitch.app` using the previous stable DMG. Do not run two versions at once or copy the 0.5.0 sidecar into an older app. Rollback does not delete the Science data-dir, installed Skills, quarantined content, or legacy Skill Manager data.
 
 回滚只替换应用程序，不自动回退或删除 `~/.csswitch` 数据。若旧版无法读取升级后的配置，请退出旧版，把备份的 `config.json` 恢复到原位并保持文件权限为 `0600`。不要在 CSSwitch 或 Science 运行时修改配置文件。
 

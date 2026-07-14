@@ -21,7 +21,7 @@ use crate::runtime::science::{
     science_runtime_preflight as runtime_preflight, settings_change_needs_teardown, stop_sandbox,
     SCIENCE_DOWNLOAD_URL,
 };
-use crate::runtime::settings::validate_runtime_ports;
+use crate::runtime::settings::{system_ssh_config_path, validate_runtime_ports};
 use crate::runtime::system::open_in_browser;
 use crate::{config, lock, proc, run_blocking, AppState, SharedAppState, SharedLifecycle};
 
@@ -79,6 +79,7 @@ fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
     let runtime = st.science_runtime.clone();
     let result = stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, runtime.as_ref());
     if result.is_ok() {
+        st.science_confirmed_stopped = runtime;
         st.science_runtime = None;
     }
     result
@@ -152,10 +153,12 @@ pub(crate) fn open_official() -> Result<(), String> {
 pub(crate) struct UiSettings {
     proxy_port: u16,
     sandbox_port: u16,
+    #[serde(default)]
+    reuse_system_ssh: bool,
 }
 
-/// 端口设置（provider/连接改走 profile CRUD + set_active_profile）。
-/// 经串行器（修 P1-c）：端口一旦变化，正在跑的代理绑在旧端口、正在跑的沙箱又烘死了旧代理 URL，
+/// 运行设置（端口 + 系统 SSH 配置授权；provider/连接改走 profile CRUD + set_active_profile）。
+/// 经串行器（修 P1-c）：端口或 SSH 授权一旦变化，正在跑的沙箱都必须拆掉，
 /// 与新端口不一致；此处把这条陈旧链路拆掉（只停我们的沙箱、绝不碰 8765），逼下次「一键开始」按新端口重建，
 /// 杜绝「复用旧沙箱指向死端口、UI 却报沿用不变」。
 #[tauri::command]
@@ -177,6 +180,9 @@ fn set_settings_inner(
     cfg: UiSettings,
 ) -> Result<(), String> {
     validate_runtime_ports(cfg.proxy_port, cfg.sandbox_port)?;
+    if cfg.reuse_system_ssh {
+        system_ssh_config_path()?;
+    }
     lifecycle.with_serialized(|| {
         let dir = config::default_dir();
         let old = config::load_from(&dir).map_err(|e| e.to_string())?;
@@ -185,7 +191,7 @@ fn set_settings_inner(
             cfg.proxy_port,
             old.sandbox_port,
             cfg.sandbox_port,
-        );
+        ) || old.reuse_system_ssh != cfg.reuse_system_ssh;
         // 拆链路【先】于落盘，且停沙箱结果必须据实处理（修增量 P1）：停不掉就【不改端口】——
         // 否则会留下「config 已是新端口、旧沙箱仍在旧端口指向旧代理」的不一致态，下次一键还会复用这条死链路。
         // 保持端口不变则一切仍自洽（旧沙箱指旧代理端口、下次一键在旧端口重建代理，链路照通）。
@@ -193,7 +199,7 @@ fn set_settings_inner(
             let mut st = lock(&state);
             stop_sandbox_state(&app, &mut st).map_err(|e| {
                 format!(
-                    "端口未更改：无法停止指向旧端口的沙箱（{e}），为避免留下失效链路，端口保持不变。请手动停止沙箱或重启 app 后重试。（真实实例 8765 未受影响）"
+                    "设置未更改：无法停止仍使用旧端口或旧 SSH 授权的沙箱（{e}）。请手动停止沙箱或重启 app 后重试。（真实实例 8765 未受影响）"
                 )
             })?;
             lifecycle.bump_generation(); // 停成功后作废在途启动
@@ -203,6 +209,7 @@ fn set_settings_inner(
         config::update(&dir, move |c| {
             c.proxy_port = cfg.proxy_port;
             c.sandbox_port = cfg.sandbox_port;
+            c.reuse_system_ssh = cfg.reuse_system_ssh;
         })
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -330,8 +337,17 @@ pub(crate) fn one_click_login_cmd(
 }
 
 #[tauri::command]
-pub(crate) async fn science_runtime_preflight() -> Result<Value, String> {
-    run_blocking(runtime_preflight).await
+pub(crate) async fn science_runtime_preflight(
+    state: State<'_, SharedAppState>,
+) -> Result<Value, String> {
+    let (version_cache, confirmed_stopped) = {
+        let st = lock(state.inner());
+        (
+            st.science_version_cache.clone(),
+            st.science_confirmed_stopped.clone(),
+        )
+    };
+    run_blocking(move || runtime_preflight(&version_cache, confirmed_stopped.as_ref())).await
 }
 
 #[tauri::command]
@@ -447,7 +463,6 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         object.insert(
             "runtime".into(),
             json!({
-                "path": runtime.path,
                 "source": runtime.source.code(),
                 "version": runtime.version,
             }),
@@ -477,9 +492,16 @@ pub(crate) fn open_url(state: State<'_, SharedAppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
-    // 显式退出统一交给 RunEvent::ExitRequested 清理，避免多个退出入口各自停代理。
-    app.exit(0);
+pub(crate) async fn quit_app(
+    app: tauri::AppHandle,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+) -> Result<(), String> {
+    let exit_app = app.clone();
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || stop_all_inner_cmd(app, state, lifecycle)).await?;
+    exit_app.exit(0);
     Ok(())
 }
 
@@ -502,7 +524,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
         thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Instant, SystemTime, UNIX_EPOCH},
     };
     use tauri::Manager;
 
@@ -536,20 +558,20 @@ mod tests {
         let (gateway, shim, catalog_shim) =
             status_runtime_identity("deepseek", "", String::new(), String::new());
         assert_eq!(gateway, "rust");
-        assert_eq!(shim, "off");
-        assert_eq!(catalog_shim, "off");
+        assert_eq!(shim, "rewrite");
+        assert_eq!(catalog_shim, "rewrite");
 
         let (gateway, shim, catalog_shim) =
             status_runtime_identity("deepseek", "secret-present", "rust".into(), "off".into());
         assert_eq!(gateway, "rust");
         assert_eq!(shim, "off");
-        assert_eq!(catalog_shim, "off");
+        assert_eq!(catalog_shim, "rewrite");
 
         let (gateway, shim, catalog_shim) =
             status_runtime_identity("deepseek", "secret-present", String::new(), String::new());
         assert_eq!(gateway, "");
         assert_eq!(shim, "");
-        assert_eq!(catalog_shim, "off");
+        assert_eq!(catalog_shim, "rewrite");
     }
 
     struct EnvGuard {
@@ -624,6 +646,13 @@ exit 0
 set -eu
 cmd="${1:-}"
 if [ "$#" -gt 0 ]; then shift; fi
+if [ -n "${CSSWITCH_FAKE_SCIENCE_CALL_LOG:-}" ]; then
+  printf '%s\n' "$cmd" >> "$CSSWITCH_FAKE_SCIENCE_CALL_LOG"
+fi
+if [ "$cmd" = "--version" ]; then
+  echo "claude-science 0.0.0-csswitch-test"
+  exit 0
+fi
 data_dir=""
 port=""
 while [ "$#" -gt 0 ]; do
@@ -660,6 +689,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"fake science")
+socketserver.TCPServer.allow_reuse_address = True
 with open(pidfile, "w", encoding="utf-8") as f:
     f.write(str(os.getpid()))
 with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
@@ -730,6 +760,36 @@ esac
         panic!("mock service on port {port} remained reachable");
     }
 
+    fn call_count(path: &Path, command: &str) -> usize {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == command)
+            .count()
+    }
+
+    fn stop_test_sandbox<R: tauri::Runtime>(
+        handle: &tauri::AppHandle<R>,
+        state: &SharedAppState,
+        sandbox_port: u16,
+    ) {
+        {
+            let mut st = lock(state);
+            let AppState {
+                sandbox,
+                sandbox_url,
+                science_runtime,
+                science_confirmed_stopped,
+                ..
+            } = &mut *st;
+            let runtime = science_runtime.clone();
+            assert!(science::stop_sandbox(handle, sandbox, sandbox_url, runtime.as_ref()).is_ok());
+            *science_confirmed_stopped = runtime;
+            *science_runtime = None;
+        }
+        wait_http_unreachable(sandbox_port);
+    }
+
     fn kill_tracked_proxy(state: &SharedAppState, proxy_port: u16) {
         let mut proxy_child = {
             let mut st = lock(state);
@@ -757,6 +817,8 @@ esac
         fs::create_dir_all(&home).unwrap();
         let fake_science = write_test_bins(&bin_dir).canonicalize().unwrap();
         let open_log = tmp.join("open.log");
+        let science_call_log = tmp.join("science-call.log");
+        let route_config_log = tmp.join("route-config.log");
         let mock_upstream_port = start_mock_upstream();
         let proxy_port = free_port();
         let sandbox_port = free_port();
@@ -766,7 +828,10 @@ esac
         env_guard.set("HOME", &home);
         env_guard.set("CSSWITCH_REPO", &root);
         env_guard.set("SCIENCE_BIN", &fake_science);
+        env_guard.set("CSSWITCH_TEST_FAKE_SCIENCE_IDENTITY", "1");
         env_guard.set("CSSWITCH_FAKE_OPEN_LOG", &open_log);
+        env_guard.set("CSSWITCH_FAKE_SCIENCE_CALL_LOG", &science_call_log);
+        env_guard.set("CSSWITCH_TEST_THIRD_PARTY_CONFIG_LOG", &route_config_log);
         env_guard.set("CSSWITCH_DOCTOR_CHECK_REAL_HOME", "0");
         env_guard.set(
             "PATH",
@@ -815,7 +880,10 @@ esac
         )
         .expect("first one-click should start proxy and sandbox");
         assert_eq!(first["action"], "started");
-        assert_eq!(first["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        assert!(
+            first.get("url").is_none(),
+            "one-time URL must stay backend-only"
+        );
         wait_http_health(sandbox_port);
         let fake_state_dir = home
             .join(".csswitch")
@@ -828,6 +896,10 @@ esac
             fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
             "1"
         );
+        assert_eq!(call_count(&science_call_log, "--version"), 1);
+        assert_eq!(call_count(&science_call_log, "status"), 1);
+        assert_eq!(call_count(&science_call_log, "url"), 2);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 1);
 
         let second = sandbox_session::one_click_login(
             handle.clone(),
@@ -837,7 +909,10 @@ esac
         )
         .expect("second one-click should reuse running sandbox");
         assert_eq!(second["action"], "reopened");
-        assert_eq!(second["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        assert!(
+            second.get("url").is_none(),
+            "one-time URL must stay backend-only"
+        );
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("pid")).unwrap(),
             first_pid
@@ -845,6 +920,95 @@ esac
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
             "1"
+        );
+        assert_eq!(call_count(&science_call_log, "--version"), 1);
+        assert_eq!(call_count(&science_call_log, "status"), 2);
+        assert_eq!(call_count(&science_call_log, "url"), 3);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 1);
+
+        let route_check = lifecycle
+            .with_serialized(|| sandbox_session::force_third_party_reconcile(&handle, &state));
+        assert_eq!(route_check.as_deref(), Ok("Skill 路由已强制核验并同步。"));
+        assert_eq!(call_count(&science_call_log, "--version"), 2);
+        assert_eq!(call_count(&science_call_log, "status"), 3);
+        assert_eq!(call_count(&science_call_log, "url"), 4);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 2);
+
+        stop_test_sandbox(&handle, &state, sandbox_port);
+        let mut cold_start_ms = Vec::new();
+        for cycle in 0..5 {
+            let (version_cache, confirmed_stopped) = {
+                let st = lock(&state);
+                (
+                    st.science_version_cache.clone(),
+                    st.science_confirmed_stopped.clone(),
+                )
+            };
+            let preflight =
+                science::science_runtime_preflight(&version_cache, confirmed_stopped.as_ref())
+                    .expect("confirmed stop should make preflight ready without status CLI");
+            assert_eq!(preflight["status"], "installed_ready");
+            let started_at = Instant::now();
+            let restarted = sandbox_session::one_click_login(
+                handle.clone(),
+                state.clone(),
+                lifecycle.as_ref(),
+                None,
+            )
+            .expect("normal cold start should not re-probe or reconfigure");
+            cold_start_ms.push(started_at.elapsed().as_millis());
+            assert_eq!(restarted["action"], "started");
+            if cycle < 4 {
+                stop_test_sandbox(&handle, &state, sandbox_port);
+            }
+        }
+        let mut sorted_cold_start_ms = cold_start_ms.clone();
+        sorted_cold_start_ms.sort_unstable();
+        eprintln!(
+            "focused cold starts ms={cold_start_ms:?} median_ms={}",
+            sorted_cold_start_ms[2]
+        );
+        assert_eq!(call_count(&science_call_log, "--version"), 2);
+        assert_eq!(call_count(&science_call_log, "status"), 3);
+        assert_eq!(call_count(&science_call_log, "url"), 9);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 2);
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
+            "6"
+        );
+
+        stop_test_sandbox(&handle, &state, sandbox_port);
+        let upgraded_script = fs::read_to_string(&fake_science)
+            .unwrap()
+            .replace("0.0.0-csswitch-test", "0.0.1-csswitch-test");
+        write_executable(&fake_science, &upgraded_script);
+        let (version_cache, confirmed_stopped) = {
+            let st = lock(&state);
+            (
+                st.science_version_cache.clone(),
+                st.science_confirmed_stopped.clone(),
+            )
+        };
+        assert_eq!(
+            science::science_runtime_preflight(&version_cache, confirmed_stopped.as_ref()).unwrap()
+                ["status"],
+            "installed_ready"
+        );
+        let upgraded = sandbox_session::one_click_login(
+            handle.clone(),
+            state.clone(),
+            lifecycle.as_ref(),
+            None,
+        )
+        .expect("binary replacement should re-probe and reconcile once");
+        assert_eq!(upgraded["action"], "started");
+        assert_eq!(call_count(&science_call_log, "--version"), 3);
+        assert_eq!(call_count(&science_call_log, "status"), 3);
+        assert_eq!(call_count(&science_call_log, "url"), 11);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 3);
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
+            "7"
         );
 
         let status = super::status(app.state::<SharedAppState>());
@@ -930,6 +1094,7 @@ esac
         env_guard.set("HOME", &home);
         env_guard.set("CSSWITCH_REPO", &root);
         env_guard.set("SCIENCE_BIN", &fake_science);
+        env_guard.set("CSSWITCH_TEST_FAKE_SCIENCE_IDENTITY", "1");
         env_guard.set("CSSWITCH_FAKE_OPEN_LOG", &open_log);
         env_guard.set("CSSWITCH_DOCTOR_CHECK_REAL_HOME", "0");
         env_guard.set(
@@ -979,7 +1144,10 @@ esac
         )
         .expect("first one-click should start proxy and sandbox");
         assert_eq!(first["action"], "started");
-        assert_eq!(first["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        assert!(
+            first.get("url").is_none(),
+            "one-time URL must stay backend-only"
+        );
         wait_http_health(proxy_port);
         wait_http_health(sandbox_port);
         let fake_state_dir = home
@@ -1033,7 +1201,10 @@ esac
             .unwrap()
             .starts_with("已用新配置重启代理，Science 沿用不变，已重新打开 Science。"));
         assert_eq!(recovered["external_skill_installer"]["status"], "WARNING");
-        assert_eq!(recovered["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        assert!(
+            recovered.get("url").is_none(),
+            "one-time URL must stay backend-only"
+        );
         wait_http_health(proxy_port);
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("pid")).unwrap(),

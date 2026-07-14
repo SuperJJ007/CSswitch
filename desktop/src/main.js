@@ -35,6 +35,7 @@ const mockStore = {
   active_id: "",
   proxy_port: 18991,
   sandbox_port: 8990,
+  reuse_system_ssh: false,
   mode: "proxy",
   profiles: [
     { id: "p-demo1", name: "我的 GLM", template_id: "glm", category: "cn_official", api_format: "anthropic", base_url: "https://open.bigmodel.cn/api/anthropic", model: "glm-4.6", key: "••••••1234", icon: "glm", icon_color: "#2E6BE6", website_url: "https://open.bigmodel.cn", sort_index: 1, notes: "" },
@@ -48,6 +49,7 @@ function mockInvoke(cmd, args) {
       return Promise.resolve({
         schema_version: mockStore.schema_version, active_id: mockStore.active_id,
         proxy_port: mockStore.proxy_port, sandbox_port: mockStore.sandbox_port,
+        reuse_system_ssh: mockStore.reuse_system_ssh,
         mode: mockStore.mode, templates: MOCK_TEMPLATES,
         profiles: mockStore.profiles.map((p) => ({ ...p })),
       });
@@ -97,13 +99,17 @@ function mockInvoke(cmd, args) {
     case "fetch_models":
       return Promise.resolve({ models: [{ id: "glm-4.6", supports_tools: true }, { id: "glm-5", supports_tools: null }], source: "live", error_kind: null, upstream_status: 200 });
     case "set_settings":
-      if (args.cfg) { mockStore.proxy_port = args.cfg.proxy_port; mockStore.sandbox_port = args.cfg.sandbox_port; }
+      if (args.cfg) {
+        mockStore.proxy_port = args.cfg.proxy_port;
+        mockStore.sandbox_port = args.cfg.sandbox_port;
+        mockStore.reuse_system_ssh = !!args.cfg.reuse_system_ssh;
+      }
       return Promise.resolve(null);
     case "set_mode":
       mockStore.mode = args.mode;
       return Promise.resolve(null);
     case "one_click_login":
-      return Promise.resolve({ url: "http://127.0.0.1:8990", msg: "（预览模式：假装已就绪）", action: "started" });
+      return Promise.resolve({ msg: "（预览模式：假装已就绪）", action: "started" });
     case "science_runtime_preflight":
       return Promise.resolve({ status: "installed_ready", selected_source: "installed_app", selected_version: "0.0.0-preview", cached_version: null, download_url: "https://claude.com/download" });
     case "open_science_download_page":
@@ -133,7 +139,7 @@ let doctorInFlight = false;
 let statusRecoveryMsg = "";
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
-let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990 };
+let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990, reuse_system_ssh: false };
 let pendingSkipActivateId = null;   // set_active 校验含糊时，允许「跳过验证」再切
 let pendingConfirm = null;          // 危险操作（清 key / 删除）的「再点一次确认」态
 
@@ -377,7 +383,7 @@ function startPortSaveFeedback(changed) {
 function startDoctorFeedback() {
   clearBusyMsgTimers();
   setMsg("自检中：正在运行本地诊断脚本…");
-  scheduleBusyMsg(3500, { kind: "doctor" }, "自检仍在运行。它只检查本地依赖、端口和当前配置摘要，不会读取真实 Science HOME，也不会传出、打印或展示完整 key。");
+  scheduleBusyMsg(3500, { kind: "doctor" }, "自检仍在运行。它会检查本地依赖、端口、配置摘要和 CSSwitch 管理的 Skill 路由；不会读取真实 Science HOME，也不会传出、打印或展示完整 key。");
 }
 
 function setBusy(on, op) {
@@ -392,7 +398,7 @@ function setBusy(on, op) {
     els.connSaveBtn, els.connFetchBtn, els.connClearBtn, els.connCancelBtn,
     els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn,
     // 端口输入也纳入忙碌禁用：忙碌中改端口会与在途操作竞态（修 P1-c 前端侧）。
-    els.proxyPort, els.sandboxPort,
+    els.proxyPort, els.sandboxPort, els.reuseSystemSsh,
   ].forEach((b) => b && (b.disabled = on));
   if (els.doctorBtn) els.doctorBtn.disabled = on && !activationBusy;
   // 模式切换按钮同样禁用：忙碌中切官方会与「一键开始」竞态（修 P1-b 前端侧）。
@@ -406,11 +412,12 @@ function setBusy(on, op) {
 function syncActivationControls() {
   const writeLocked = busy;
   [
-    els.newBtn, els.proxyPort, els.sandboxPort,
+    els.newBtn, els.proxyPort, els.sandboxPort, els.reuseSystemSsh,
     els.connClearBtn, els.metaSaveBtn,
   ].forEach((b) => b && (b.disabled = writeLocked));
   if (els.modeSeg) els.modeSeg.querySelectorAll(".seg-btn").forEach((b) => (b.disabled = writeLocked));
   if (els.skipActivateBtn) els.skipActivateBtn.disabled = busy;
+  if (els.reuseSystemSsh) els.reuseSystemSsh.disabled = busy || activationInFlight;
   syncProfileBusyState();
   refreshWizGate();
   refreshConnGate();
@@ -476,8 +483,10 @@ async function loadConfig() {
     configState.active_id = cfg.active_id || "";
     configState.proxy_port = cfg.proxy_port ?? 18991;
     configState.sandbox_port = cfg.sandbox_port ?? 8990;
+    configState.reuse_system_ssh = !!cfg.reuse_system_ssh;
     els.proxyPort.value = configState.proxy_port;
     els.sandboxPort.value = configState.sandbox_port;
+    els.reuseSystemSsh.checked = configState.reuse_system_ssh;
     applyMode(cfg.mode === "official" ? "official" : "proxy");
     renderList();
     showView("list");
@@ -588,23 +597,29 @@ async function heroClick() {
   else await oneClick();
 }
 
-// ── 端口设置（替旧 set_config；纯端口，不含 provider/连接）──
-async function persistPorts() {
+// ── 运行设置（端口 + 系统 SSH 配置授权；不含 provider/连接）──
+async function persistRuntimeSettings() {
   if (busy) return; // 忙碌中不改端口（防与在途操作竞态；输入亦已禁用，此为双保险）。修 P1-c
   const p = parseInt(els.proxyPort.value, 10) || 18991;
   const s = parseInt(els.sandboxPort.value, 10) || 8990;
-  const changed = p !== configState.proxy_port || s !== configState.sandbox_port;
+  const reuseSystemSsh = !!els.reuseSystemSsh.checked;
+  const portsChanged = p !== configState.proxy_port || s !== configState.sandbox_port;
+  const sshChanged = reuseSystemSsh !== configState.reuse_system_ssh;
+  const changed = portsChanged || sshChanged;
   // 本次端口提交全程置忙：仅靠开头的 `if (busy) return` 只挡「已在忙时进入」，挡不住本函数在途
   // 时其它操作（切模式/一键/连接编辑）启动。置忙 + 禁用控件才能保证操作顺序符合用户预期。修 GPT 三轮 P2
   setBusy(true, { kind: "ports" });
   startPortSaveFeedback(changed);
   try {
-    await call("set_settings", { cfg: { proxy_port: p, sandbox_port: s } });
+    await call("set_settings", { cfg: { proxy_port: p, sandbox_port: s, reuse_system_ssh: reuseSystemSsh } });
     configState.proxy_port = p;
     configState.sandbox_port = s;
+    configState.reuse_system_ssh = reuseSystemSsh;
     // 后端在端口变化时会拆掉旧代理/沙箱（否则会复用指向旧端口的死链路），如实告知需重开。修 P1-c
     if (changed) {
-      setMsg("端口已保存。改端口会重置正在运行的代理/沙箱，请重新「一键开始」。", "ok");
+      setMsg(sshChanged
+        ? "SSH 授权设置已保存。正在运行的代理/沙箱已重置，请重新「一键开始」。"
+        : "端口已保存。改端口会重置正在运行的代理/沙箱，请重新「一键开始」。", "ok");
       await refreshStatus();
     } else {
       setMsg("端口未变化。", "ok");
@@ -613,6 +628,7 @@ async function persistPorts() {
     // 出错＝端口未落盘（校验不过 / 停旧沙箱失败）：把输入框还原成实际生效值，避免显示未保存的数字。
     els.proxyPort.value = configState.proxy_port;
     els.sandboxPort.value = configState.sandbox_port;
+    els.reuseSystemSsh.checked = configState.reuse_system_ssh;
     setMsg(String(e), "err");
   } finally {
     setBusy(false);
@@ -1025,8 +1041,8 @@ function showRuntimeChoice(preflight) {
   const canUseCache = preflight && preflight.status === "cached_choice_required" && !!cachedVersion;
   els.runtimeUseCacheBtn.hidden = !canUseCache;
   els.runtimeChoiceText.textContent = canUseCache
-    ? "未找到已安装的 Claude Science App。发现可确认版本的历史缓存：" + cachedVersion + "。你可以仅本次使用它，或前往官方页面安装 / 更新 Science。此选择不会保存。"
-    : "未找到可用的 Claude Science App，历史缓存也无法确认版本。请先从官方页面安装 / 更新 Science。";
+    ? "未找到通过安全预检的 Claude Science App。发现可确认版本的历史缓存：" + cachedVersion + "。你可以仅本次使用它，或前往官方页面安装 / 更新 Science。此选择不会保存。"
+    : "未找到通过安全预检的 Claude Science App，历史缓存也无法确认版本。请先从官方页面安装 / 更新 Science。";
   els.runtimeChoiceSec.hidden = false;
 }
 
@@ -1037,7 +1053,7 @@ async function runOneClick(runtimeChoice) {
   try {
     const r = await call("one_click_login", { runtimeChoice: runtimeChoice || null });
     // 透传后端据实回传的 msg（已重开 / 已用新配置重启 / 沿用原对话 / 已启动 / 打开失败请手动打开）。
-    setMsg((r.msg || "已就绪，正在打开面板…") + "\n" + (r.url || ""), "ok");
+    setMsg(r.msg || "已就绪，正在打开面板…", "ok");
     await refreshStatus();
   } catch (e) {
     setMsg("一键开始失败：" + e, "err");
@@ -1063,8 +1079,8 @@ async function oneClick() {
     }
     showRuntimeChoice(preflight || { status: "missing" });
     setMsg(preflight && preflight.status === "cached_choice_required"
-      ? "Claude Science App 未安装。请选择是否仅本次使用已确认版本的缓存。"
-      : "Claude Science App 未安装，且没有可安全启动的缓存版本。", "err");
+      ? "Claude Science App 不可用或未通过预检。请选择是否仅本次使用已确认版本的缓存。"
+      : "Claude Science App 不可用或未通过预检，且没有可安全启动的缓存版本。", "err");
   } catch (e) {
     setMsg("Science 运行环境检查失败：" + e, "err");
   } finally {
@@ -1114,7 +1130,7 @@ async function runDoctor() {
   doctorInFlight = true;
   if (els.doctorBtn) els.doctorBtn.disabled = true;
   if (activationBusy) {
-    setMsg("自检中：配置后台应用仍在继续。自检只读取当前配置摘要和本地依赖状态。");
+    setMsg("自检中：配置后台应用仍在继续。完成后会核验 CSSwitch 管理的 Skill 路由。");
   } else {
     setBusy(true, { kind: "doctor" });
     startDoctorFeedback();
@@ -1185,7 +1201,7 @@ function wire() {
     "oneClickBtn", "stopBtn", "ltProxy", "ltSandbox", "ltUpstream",
     "runtimeChoiceSec", "runtimeChoiceText", "runtimeUseCacheBtn", "runtimeDownloadBtn", "runtimeChoiceCancelBtn",
     "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
-    "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "advSec",
+    "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "reuseSystemSsh", "advSec",
     "listSec", "profileList", "newBtn", "skipActivateBtn",
     "wizSec", "wizTemplate", "wizTemplateChips", "wizTplLabel", "wizTplHint", "wizName", "wizBase", "wizBaseHint",
     "wizFetchBtn", "wizModelInfo", "wizModel", "wizModelHint", "wizKey", "wizSaveBtn", "wizCancelBtn",
@@ -1199,8 +1215,9 @@ function wire() {
     b.addEventListener("click", () => switchMode(b.dataset.mode))
   );
 
-  els.proxyPort.addEventListener("change", persistPorts);
-  els.sandboxPort.addEventListener("change", persistPorts);
+  els.proxyPort.addEventListener("change", persistRuntimeSettings);
+  els.sandboxPort.addEventListener("change", persistRuntimeSettings);
+  els.reuseSystemSsh.addEventListener("change", persistRuntimeSettings);
 
   // 列表行内操作（事件委托；忙碌时忽略）。
   els.profileList.addEventListener("click", (e) => {
@@ -1256,7 +1273,14 @@ function wire() {
   els.logsBtn.addEventListener("click", () =>
     call("open_logs").catch((e) => setMsg("打开日志失败：" + e, "err"))
   );
-  els.quitBtn.addEventListener("click", () => call("quit_app").catch(() => {}));
+  els.quitBtn.addEventListener("click", () => {
+    setBusy(true);
+    setMsg("正在停止代理与隔离 Science…");
+    call("quit_app").catch((e) => {
+      setBusy(false);
+      setMsg("退出失败：" + e + "请先使用“全部停止”重试。", "err");
+    });
+  });
 }
 
 window.addEventListener("DOMContentLoaded", async () => {

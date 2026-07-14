@@ -51,17 +51,20 @@ class SkillRuntimeBoundary(unittest.TestCase):
 
     def test_launcher_never_clones_or_implicitly_selects_data_dir_runtime(self):
         launch = (ROOT / "scripts/launch-virtual-sandbox.sh").read_text()
-        selection = launch.split("# 优先级：", 1)[1].split(
+        selection = launch.split('BIN_SOURCE="backend-selected runtime"', 1)[1].split(
             "# Use a keychain scoped", 1
         )[0]
         self.assertIn('BIN="$APP_BIN"', selection)
         self.assertNotIn('BIN="$DATA_DIR/bin/claude-science"', launch)
         self.assertNotIn("for asset in bin conda runtime seed-assets", launch)
         self.assertNotIn("cp -Rc", launch)
-        self.assertIn("本脚本绝不自动选择它", selection)
+        self.assertIn("CSSWITCH_PROXY_URL", launch)
+        self.assertIn("--proxy-url", launch)
+        self.assertIn("path_contains_symlink", launch)
 
         stop = (ROOT / "scripts/stop-science-sandbox.sh").read_text()
         self.assertNotIn('BIN="$DATA_DIR/bin/claude-science"', stop)
+        self.assertIn("path_contains_symlink", stop)
 
     def test_fresh_data_dir_initializes_without_reading_real_science_home(self):
         with tempfile.TemporaryDirectory(
@@ -152,18 +155,60 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertNotIn("localStorage", js)
         self.assertIn("runtime_choice: Option<String>", runtime)
         self.assertIn("choice == Some(CACHED_ONCE_CHOICE)", science)
-        self.assertIn("if is_executable_file(app_bin)", science)
+        self.assertIn("safe_science_version(app_bin)", science)
+        self.assertIn('"cached_choice_required"', science)
 
     def test_science_runtime_identity_is_reused_for_serve_status_url_and_stop(self):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
         science = (ROOT / "desktop/src-tauri/src/runtime/science.rs").read_text()
         runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
         self.assertIn('.env("SCIENCE_BIN", &launch_runtime.path)', session)
+        self.assertIn('.env("CSSWITCH_PROXY_URL", &proxy_url)', session)
+        self.assertNotIn('.arg(&proxy_url)', session)
         self.assertIn("st.science_runtime = Some(launch_runtime.clone())", session)
         self.assertIn("sandbox_running_ours(sport, &launch_runtime)", session)
         self.assertIn("sandbox_url(sport, &launch_runtime)", session)
         self.assertIn('.env("SCIENCE_BIN", &runtime.path)', science)
         self.assertIn('"source": runtime.source.code()', runtime)
+
+    def test_system_ssh_bridge_is_opt_in_and_replaces_tunnel_entry(self):
+        js = (ROOT / "desktop/src/main.js").read_text()
+        html = (ROOT / "desktop/src/index.html").read_text()
+        launch = (ROOT / "scripts/launch-virtual-sandbox.sh").read_text()
+        wrapper = (ROOT / "scripts/ssh-bridge/ssh").read_text()
+        session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
+        runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
+
+        self.assertNotIn("ssh_tunnel_info", js + runtime)
+        self.assertNotIn("生成 SSH 访问命令", html)
+        self.assertIn("reuseSystemSsh", js + html)
+        self.assertIn("reuse_system_ssh", js + runtime)
+        self.assertIn('CSSWITCH_REUSE_SYSTEM_SSH', launch + session)
+        self.assertIn('CSSWITCH_SYSTEM_SSH_CONFIG', launch + wrapper)
+        self.assertIn('exec /usr/bin/ssh -F "$config" "$@"', wrapper)
+        self.assertNotIn("ln -s", launch)
+        self.assertNotIn("cp -R", launch)
+
+    def test_explicit_exit_revokes_the_managed_science_target(self):
+        lib = (ROOT / "desktop/src-tauri/src/lib.rs").read_text()
+        runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
+        js = (ROOT / "desktop/src/main.js").read_text()
+
+        cleanup = lib.split("fn cleanup_for_exit", 1)[1].split(
+            "fn mark_boot_failed", 1
+        )[0]
+        self.assertLess(cleanup.index("stop_sandbox("), cleanup.index("st.stop_proxy()"))
+        quit_command = runtime.split("pub(crate) async fn quit_app", 1)[1].split(
+            "#[cfg(test)]", 1
+        )[0]
+        self.assertLess(
+            quit_command.index("stop_all_inner_cmd"), quit_command.index("exit_app.exit(0)")
+        )
+        quit_handler = js.split('els.quitBtn.addEventListener("click"', 1)[1].split(
+            "\n  });", 1
+        )[0]
+        self.assertNotIn("ssh_tunnel_info", quit_handler)
+        self.assertIn('setMsg("退出失败："', quit_handler)
 
     def test_launcher_ignores_large_external_tree_and_broken_legacy_store(self):
         with tempfile.TemporaryDirectory(

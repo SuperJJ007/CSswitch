@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
@@ -16,6 +16,8 @@ use crate::{
     dsml_shim::{DsmlDetector, DsmlStreamRewriter},
     messages, models, openai_chat, openai_responses, policy,
 };
+
+const BRIDGE_REPLAY_WINDOW_SECONDS: u64 = 185;
 
 struct RequestHead {
     method: String,
@@ -842,7 +844,7 @@ fn start_skill_install_bridge(cfg: &GatewayConfig) -> Result<(), String> {
     let data_dir = data_dir.clone();
     let bridge_token = bridge_token.clone();
     thread::spawn(move || {
-        let mut used_request_ids = HashSet::new();
+        let mut used_request_ids = HashMap::new();
         loop {
             let entries = match std::fs::read_dir(&bridge) {
                 Ok(entries) => entries,
@@ -874,7 +876,18 @@ fn start_skill_install_bridge(cfg: &GatewayConfig) -> Result<(), String> {
                             &request,
                         )
                         .is_err()
-                            || !used_request_ids.insert(id.to_string())
+                            || bridge_request_is_replay(
+                                &mut used_request_ids,
+                                id,
+                                request
+                                    .get("issued_at")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or_default(),
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            )
                         {
                             bridge_request_failed()
                         } else {
@@ -903,6 +916,17 @@ fn start_skill_install_bridge(cfg: &GatewayConfig) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+#[cfg(unix)]
+fn bridge_request_is_replay(
+    used: &mut HashMap<String, u64>,
+    id: &str,
+    issued_at: u64,
+    now: u64,
+) -> bool {
+    used.retain(|_, issued| now.saturating_sub(*issued) <= BRIDGE_REPLAY_WINDOW_SECONDS);
+    used.insert(id.to_string(), issued_at).is_some()
 }
 
 #[cfg(unix)]
@@ -1025,7 +1049,7 @@ pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::io::{Cursor, Error, ErrorKind, Read};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1033,7 +1057,7 @@ mod tests {
     use serde_json::{json, Map, Value};
 
     #[cfg(unix)]
-    use super::read_regular_bridge_request;
+    use super::{bridge_request_is_replay, read_regular_bridge_request};
     use super::{
         forward_stream_body, stream_error_event, KimiServerToolFilter, RequestNonceGenerator,
         StreamFilter, StreamTermination,
@@ -1050,6 +1074,16 @@ mod tests {
 
     struct CountingEofReader {
         reads: usize,
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_replay_window_rejects_duplicates_and_prunes_expired_ids() {
+        let mut used = HashMap::new();
+        assert!(!bridge_request_is_replay(&mut used, "first", 100, 100));
+        assert!(bridge_request_is_replay(&mut used, "first", 100, 101));
+        assert!(!bridge_request_is_replay(&mut used, "second", 286, 286));
+        assert_eq!(used.len(), 1, "expired replay ids must not grow forever");
     }
 
     #[cfg(unix)]

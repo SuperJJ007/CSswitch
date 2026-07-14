@@ -2,15 +2,33 @@ use std::process::Command;
 
 use crate::runtime::provider::adapter_for_profile;
 use crate::runtime::system::{asset_root, open_in_browser};
-use crate::{config, run_blocking};
+use crate::{config, run_blocking, SharedAppState, SharedLifecycle};
 
 #[tauri::command]
-pub(crate) async fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
-    run_blocking(move || run_doctor_inner_cmd(app)).await
+pub(crate) async fn run_doctor(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedAppState>,
+    lifecycle: tauri::State<'_, SharedLifecycle>,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || {
+        let mut output = run_doctor_inner_cmd(&app)?;
+        let route = lifecycle.with_serialized(|| {
+            crate::runtime::sandbox_session::force_third_party_reconcile(&app, &state)
+        });
+        output.push_str("\n[Skill 路由] ");
+        match route {
+            Ok(message) => output.push_str(&message),
+            Err(error) => output.push_str(&format!("核验失败：{error}")),
+        }
+        Ok(output)
+    })
+    .await
 }
 
-fn run_doctor_inner_cmd(app: tauri::AppHandle) -> Result<String, String> {
-    let root = asset_root(&app).ok_or("找不到 scripts/doctor.sh（打包资源或仓库根均未命中）。")?;
+fn run_doctor_inner_cmd(app: &tauri::AppHandle) -> Result<String, String> {
+    let root = asset_root(app).ok_or("找不到 scripts/doctor.sh（打包资源或仓库根均未命中）。")?;
     let cfg = doctor_config_from(&config::default_dir())?;
     let doctor = root.join("scripts/doctor.sh");
     // 生效 profile 的展示名（template_id）+ adapter + 有无 key；无生效配置则留空。
@@ -31,7 +49,7 @@ fn run_doctor_inner_cmd(app: tauri::AppHandle) -> Result<String, String> {
         .env("CSSWITCH_KEY_PRESENT", if has_key { "1" } else { "0" })
         .env("CSSWITCH_PROXY_PORT", cfg.proxy_port.to_string())
         .env("CSSWITCH_SANDBOX_PORT", cfg.sandbox_port.to_string());
-    if let Some(gateway) = crate::runtime::proxy_lifecycle::gateway_bin_path(&app) {
+    if let Some(gateway) = crate::runtime::proxy_lifecycle::gateway_bin_path(app) {
         cmd.env("CSSWITCH_GATEWAY_BIN", gateway);
     }
     let out = cmd.output().map_err(|e| e.to_string())?;

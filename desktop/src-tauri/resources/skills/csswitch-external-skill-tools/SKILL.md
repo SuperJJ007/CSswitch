@@ -6,8 +6,8 @@ description: "CSSwitch 外部 Skill 安装与卸载的强制路由。MUST use in
 # CSSwitch external Skill tools
 
 This Skill only routes external Skill operations. It is not an authoring or
-publishing workflow. For every request in scope, use the matching CSSwitch MCP
-connector and do not load `customize`.
+publishing workflow. For every request in scope, use the CSSwitch external Skill
+connector and its matching tool. Do not load `customize`.
 
 ## Install or import
 
@@ -37,13 +37,13 @@ Never use Add Skill ZIP or `marketplace.importSkills` as a fallback.
    default or hard-coded Skill name.
 2. If no exact name is present, or more than one installed name could apply, ask
    the user. Never infer a filesystem path.
-3. Load the generated connector Skill `mcp-csswitch-skill-uninstaller`.
+3. Load the generated connector Skill `mcp-csswitch-skill-installer`.
 4. Follow that connector's API and call `uninstall_external_skill` with the
    exact `skill_name`. The equivalent REPL call is:
 
 ```python
 host.mcp(
-    "csswitch-skill-uninstaller",
+    "csswitch-skill-installer",
     "uninstall_external_skill",
     skill_name=skill_name,
 )

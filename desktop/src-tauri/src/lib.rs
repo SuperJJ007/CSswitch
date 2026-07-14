@@ -9,7 +9,7 @@
 //! （deepseek | qwen | relay | openai-custom | openai-responses），再传给 Rust gateway。
 //!
 //! 铁律相关：key 只在内存与 0600 的 config.json；回显前端只给掩码；沙箱端口/目录护栏
-//! 由被调脚本负责（对 8765 与真实目录失败关闭）；退 app 默认停代理、保留沙箱。
+//! 由被调脚本负责（对 8765 与真实目录失败关闭）；关窗只隐藏，显式退出停代理与沙箱。
 
 mod commands;
 mod config;
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{Emitter, Manager};
 
-use runtime::system::kill_child;
+use runtime::{science::stop_sandbox, system::kill_child};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaunchPath {
@@ -90,6 +90,10 @@ pub(crate) struct AppState {
     pub(crate) sandbox_url: Option<String>,
     /// 当前 CSSwitch Science daemon 的实际 binary 身份，仅存内存；绝不形成版本偏好。
     pub(crate) science_runtime: Option<runtime::science::ScienceRuntimeIdentity>,
+    /// CSSwitch 自己成功停止后的单次快速启动令牌；下一次启动消费，App 重启即丢弃。
+    pub(crate) science_confirmed_stopped: Option<runtime::science::ScienceRuntimeIdentity>,
+    /// Science 版本探测缓存与 daemon 身份分离；停止 daemon 后仍可复用未变化二进制的版本。
+    pub(crate) science_version_cache: runtime::science::ScienceVersionCache,
     boot: BootState,
     pub(crate) boot_error: Option<String>,
 }
@@ -185,6 +189,15 @@ fn install_menu(app: &tauri::App) -> tauri::Result<()> {
 fn cleanup_for_exit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let state = app.state::<SharedAppState>();
     let mut st = lock(state.inner());
+    if let Some(runtime) = st.science_runtime.clone() {
+        let stop_result = {
+            let st = &mut *st;
+            stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, Some(&runtime))
+        };
+        if stop_result.is_ok() {
+            st.science_runtime = None;
+        }
+    }
     st.stop_proxy();
 }
 
@@ -300,7 +313,7 @@ pub fn run() {
             // 悬空 active 归一化为空。迁移逻辑并入 config::load_from（不再单独跑 relay_presets）。
             let _ = config::load_from(&config::default_dir());
 
-            // 关窗隐藏配置面板，不销毁窗口、不停止后台链路。显式退出统一清理代理。
+            // 关窗隐藏配置面板，不销毁窗口、不停止后台链路。显式退出清理代理与沙箱。
             if let Some(win) = app.get_webview_window("main") {
                 let w = win.clone();
                 win.on_window_event(move |ev| {

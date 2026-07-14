@@ -92,6 +92,10 @@ pub struct Config {
     pub proxy_port: u16,
     #[serde(default = "default_sandbox_port")]
     pub sandbox_port: u16,
+    /// 用户显式授权隔离 Science 通过系统 OpenSSH 读取 `~/.ssh/config`。
+    /// 默认关闭；不复制或链接 `.ssh`，只在启动时注入受控 PATH wrapper。
+    #[serde(default)]
+    pub reuse_system_ssh: bool,
     /// 代理的 path-secret。**持久化**并跨代理重启/切 profile/重开 app 复用，
     /// 这样已在跑的沙箱（其 ANTHROPIC_BASE_URL 里嵌了该 secret）不会因代理换 secret 而 403。
     /// 首次为空，由后端生成一次后写回。
@@ -113,6 +117,7 @@ impl Default for Config {
             active_id: String::new(),
             proxy_port: default_proxy_port(),
             sandbox_port: default_sandbox_port(),
+            reuse_system_ssh: false,
             secret: String::new(),
             mode: default_mode(),
             pending_notice: None,
@@ -242,6 +247,7 @@ pub fn migrate_v1_to_v2(mut legacy: crate::config_legacy::ConfigV1) -> Config {
         active_id,
         proxy_port: legacy.proxy_port,
         sandbox_port: legacy.sandbox_port,
+        reuse_system_ssh: false,
         secret: legacy.secret,
         mode: legacy.mode,
         pending_notice: None,
@@ -545,6 +551,7 @@ mod tests {
         assert!(c.profiles.is_empty());
         assert_eq!(c.active_id, "");
         assert_eq!(c.proxy_port, 18991);
+        assert!(!c.reuse_system_ssh);
         assert_eq!(c.mode, "proxy");
     }
 

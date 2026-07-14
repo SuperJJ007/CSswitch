@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.4"><img src="https://img.shields.io/badge/release-v0.4.4-2ea44f.svg" alt="CSSwitch v0.4.4"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.5.0"><img src="https://img.shields.io/badge/release-v0.5.0-2ea44f.svg" alt="CSSwitch v0.5.0"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -24,9 +24,7 @@ It is built for more than developers. You need Claude Science, a third-party API
 
 [Download latest release](../../releases/latest) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.4.4:** One-click startup no longer scans external Skills, reads legacy store/inventory, or reconciles deployments. Upgrades keep using `~/.csswitch/sandbox/home/.claude-science` without migrating, deleting, or overwriting existing Science data. See the [architecture contract](./docs/ARCHITECTURE.md).
-
-> **0.4.5 local test build:** CSSwitch attaches one fixed external-Skill route to Science's default Agent, directing install and uninstall requests to two scoped connectors. Install avoids catalog-controlled `host.skills.edit/publish`, then uses Science's native `host.agents.attach_skill` and verifies the Skill; uninstall quarantines only a CSSwitch import, then uses native `detach_skill`, without calling `host.skills.delete` or manually deleting files. The first operation shows an MCP confirmation and a read-write grant for a dedicated bridge directory. With only a Skill name, the Agent may search for candidates but must not install an ambiguous guess; the bridge itself always requires an exact URL. See [External Skill install bridge](./docs/EXTERNAL_SKILL_INSTALL.md).
+> **0.5.0:** In third-party mode, one combined local connector installs or uninstalls external Skills. Installation requires an exact public GitHub directory URL and, after Science approval, performs the bounded copy, native Agent attachment, and verification. Uninstall quarantines only CSSwitch-owned imports before native detachment. This release also avoids redundant Science version and Skill-route work on repeated starts and adds an explicit opt-in for isolated Science to use the system `~/.ssh/config`. See the [External Skill install bridge](./docs/EXTERNAL_SKILL_INSTALL.md) and [architecture contract](./docs/ARCHITECTURE.md).
 
 ## Contents
 
@@ -72,7 +70,7 @@ Claude Science sandbox
 - Click "一键开始" (Start) to launch the proxy, prepare the sandbox, and open Science.
 - Show the actual selected model name in Science instead of a vague `claude` or `opus` label.
 - Switch back to "Official Claude" without interfering with your real Claude login.
-- Reuse Science's persistent data-dir; Skill state is no longer a CSSwitch startup gate. The 0.4.5 local test build can install a public GitHub Skill directory from conversation; native import/publish may still depend on the Anthropic catalog.
+- Reuse Science's persistent data-dir; Skill state is not a CSSwitch startup gate. Version 0.5.0 can install a Skill from an exact public GitHub URL and safely quarantine CSSwitch-owned imports through the same connector.
 - CSSwitch inherits the Science version currently installed in `/Applications/Claude Science.app`; it does not compare, pin, upgrade, or downgrade that version. After the App updates, the next launch uses the updated App executable with the same persistent data-dir.
 - If the Science App is missing, CSSwitch never starts a data-dir cache silently. Only an executable cache with a readable version can be authorized for this launch once; the choice is not saved. Otherwise the UI offers the [official Claude download page](https://claude.com/download) or cancel.
 
@@ -108,7 +106,7 @@ To use Science with its official service configuration, switch to "官方 Claude
 
 ## Upgrading from an older version
 
-Version 0.4.4 keeps the existing v2 configuration format and reuses `~/.csswitch/sandbox/home/.claude-science`, so existing Science organizations, projects, and Skills are not migrated or overwritten when Skill Manager is removed. Legacy CSSwitch Skill store/inventory files remain untouched but no longer participate in startup; external `~/.claude/skills` trees are no longer synchronized into Science.
+Version 0.5.0 keeps the existing v2 configuration format and reuses `~/.csswitch/sandbox/home/.claude-science`, so existing Science organizations, projects, and Skills are not migrated or overwritten. Legacy CSSwitch Skill store/inventory files remain untouched but no longer participate in startup; external `~/.claude/skills` trees are not synchronized into Science.
 
 For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/upgrade-and-rollback.md).
 
@@ -146,6 +144,8 @@ CSSwitch's core boundary is simple: third-party model mode keeps credentials, da
 - The isolated Science instance uses its own HOME, ports, and data directory.
 - Third-party API keys are stored in `~/.csswitch/config.json` with `0600` file permissions.
 - Keys are not displayed in application logs, and the local gateway listens only on loopback.
+- “Allow isolated Science to use system SSH configuration” is off by default. When enabled, it only makes real `~/.ssh/config` available to system OpenSSH calls made by Science. CSSwitch does not copy or link all of `.ssh`, start `sshd`, change the firewall, or expose a `0.0.0.0` listener. Native OpenSSH `Include`, key, Agent, and command rules still apply, so this is an explicit trust grant.
+- New isolated Science launches prefer the binary from the locally installed official Claude Science app. If the App is unavailable, a readable retained sandbox copy is used only after explicit one-launch authorization; the choice is not persisted. CSSwitch does not download Science and keeps `--no-auto-update`.
 - Official Claude mode tears down the third-party proxy path before handing you back to the real Science app.
 
 ## Current limitations
@@ -154,6 +154,7 @@ CSSwitch is not an official Claude service, and third-party model mode does not 
 
 - Anthropic-hosted remote MCP services are unavailable, including `pubmed`, `clinical-trials`, `chembl`, `biorxiv`, and other `*.mcp.claude.com` services.
 - Directory connectors, remote plugins, and cloud features that require real Claude account authorization may show session expired, unavailable, or skipped.
+- Science's native GitHub import, Skill publishing, and draft deletion may still query the Anthropic account catalog. CSSwitch does not emulate OAuth or that catalog; version 0.5.0 supports only exact public GitHub URLs and quarantine removal, not deterministic name search, updates/overwrite, permanent-delete/restore UI, private repositories, or publishing.
 - Third-party models differ in tool use, long context, thinking, image, and streaming compatibility. Native Anthropic endpoints are usually more reliable than OpenAI translation paths.
 - The macOS package is not notarized yet, so the first launch requires manual approval.
 - The inference gateway is a bundled Rust sidecar; no runtime Python fallback is shipped.

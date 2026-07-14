@@ -105,6 +105,14 @@
           <div class="fld"><label for="proxyPort">代理端口</label><input id="proxyPort" inputmode="numeric" value="18991" /></div>
           <div class="fld"><label for="sandboxPort">沙箱端口</label><input id="sandboxPort" inputmode="numeric" value="8990" /></div>
         </div>
+        <div class="remote-access">
+          <label class="ssh-bridge-toggle" for="reuseSystemSsh">
+            <input id="reuseSystemSsh" type="checkbox" />
+            <span>允许隔离 Science 使用系统 SSH 配置</span>
+          </label>
+          <div class="hint">启用后，Science 调用系统 OpenSSH 时会读取你的 <code>~/.ssh/config</code>。Include、IdentityFile、IdentityAgent、ProxyCommand 和 Match exec 按 OpenSSH 原规则生效；CSSwitch 不复制或链接整个 <code>.ssh</code>，也不启动 sshd 或开放端口。</div>
+          <div class="hint">这相当于授权该隔离 Science 实例使用你已有的 SSH 身份；更改后需要重新「一键开始」。</div>
+        </div>
       </details>
 
       <!-- 反馈消息：有真实反馈（表单错误 / 回滚 / 保存结果 / 自检）才显示，空闲不占位。 -->

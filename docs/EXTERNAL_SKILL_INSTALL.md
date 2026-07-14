@@ -1,6 +1,6 @@
-# External Skill install bridge (0.4.5 local test build)
+# External Skill install bridge (0.5.0)
 
-This is a narrow bridge for a missing third-party-mode workflow. It is not a Skill Manager and is not part of the published 0.4.4 release.
+This is a narrow bridge for a missing third-party-mode workflow. It is not a Skill Manager.
 
 ## User behavior
 
@@ -11,7 +11,7 @@ The primary Science request is:
 https://github.com/owner/repo/tree/ref/path
 ```
 
-Science first loads the attached `csswitch-external-skill-tools` routing Skill. It directs the Agent to the generated `mcp-csswitch-skill-installer` connector Skill, whose only tool is `install_external_skill`. After the normal MCP confirmation, the Agent requests read-write access to a dedicated `~/CSSwitch-Skill-Bridge-*` directory, submits a one-time request, and reads the response.
+Science first loads the attached `csswitch-external-skill-tools` routing Skill. It directs the Agent to the generated `mcp-csswitch-skill-installer` connector Skill, which exposes `install_external_skill` and `uninstall_external_skill`. After the normal MCP confirmation, the Agent requests read-write access to a dedicated `~/CSSwitch-Skill-Bridge-*` directory, submits a one-time request, and reads the response.
 
 File copy is not reported as a usable installation. A successful copy returns `FILES_COMMITTED_ATTACH_REQUIRED` with the exact Skill name. The Agent must then call:
 
@@ -23,7 +23,7 @@ and load `skill_name` with `skill()` before reporting it usable. This uses Scien
 
 If the user supplies only a name, the MCP tool returns `NEED_SOURCE_URL` without writing files. The Agent may use its normal search capability to find candidate public repositories, but it must not install an ambiguous guess. The bridge itself never searches for or guesses a repository and always requires an exact URL.
 
-For removal, the routing Skill directs Science to the separate `mcp-csswitch-skill-uninstaller` connector. Its only tool is `uninstall_external_skill`. It accepts an exact Skill name only when the directory carries a valid CSSwitch `.import-origin`, moves the complete directory to `~/.csswitch/sandbox/skill-trash/`, and returns `QUARANTINED_DETACH_REQUIRED`. The Agent must then call:
+For removal, the routing Skill directs Science to the same connector's `uninstall_external_skill` tool. It accepts an exact Skill name only when the directory carries a valid CSSwitch `.import-origin`, moves the complete directory to `~/.csswitch/sandbox/skill-trash/`, and returns `QUARANTINED_DETACH_REQUIRED`. The Agent must then call:
 
 ```python
 host.agents.detach_skill("OPERON", skill_name)
@@ -35,17 +35,17 @@ and verify that `skill()` no longer loads it. It must not fall back to catalog-g
 
 MCP connection alone did not make natural-language selection deterministic. A real UI conversation asking to remove an imported Skill repeatedly selected bundled `customize`, called catalog-gated `host.skills.delete`, then attempted manual deletion in the wrong visible `~/.claude-science` directory. Connector descriptions and auto-attachment were insufficient.
 
-The current design therefore installs one tiny standard Skill, `csswitch-external-skill-tools`, and attaches it to the default `OPERON` Agent. It contains routing instructions only: install and uninstall must use the matching scoped connector, never `customize`, `host.skills.*`, shell deletion, or filesystem probing. The route is written atomically with a `csswitch-system-bridge` ownership marker. Existing same-name user or modified content is never overwritten. The route itself is not removable through the external-Skill uninstaller because its marker is not a user import.
+The current design therefore installs one tiny standard Skill, `csswitch-external-skill-tools`, and attaches it to the default `OPERON` Agent. It contains routing instructions only: install and uninstall must use the matching tool on the CSSwitch connector, never `customize`, `host.skills.*`, shell deletion, or filesystem probing. The route is written atomically with a `csswitch-system-bridge` ownership marker. Existing same-name user or modified content is never overwritten. The route itself is not removable through the external-Skill uninstaller because its marker is not a user import.
 
 After Science is healthy, CSSwitch obtains a dedicated one-time URL from the official `claude-science url --data-dir ...` command and uses the same local nonce/cookie/CSRF flow as the Science UI to attach this fixed route to `OPERON`. The gateway subcommand accepts only loopback HTTP, a valid one-time nonce, the fixed Agent, and the fixed route name. The nonce is passed through the child environment rather than argv, and a fresh one-time URL is generated for the browser afterward. There is no OAuth emulation, private bearer token, or database write. This bounded UI control-plane contract is an upstream compatibility risk and is covered by focused tests.
 
 ## Data flow and trust boundary
 
 1. CSSwitch starts its normal authenticated local gateway and creates a mode-0700 bridge directory derived from the existing persistent CSSwitch secret. A separate mode-0600 bridge signing key is derived from both that secret and the per-process Gateway launch identity, so restarting Gateway invalidates requests signed for the previous process.
-2. Before Science starts, CSSwitch atomically merges two managed stdio entries into `<data-dir>/mcp/local-mcp.json`: install-only and uninstall-only. Their environment contains only the path to the private key file, never the key value. CSSwitch also atomically ensures the fixed route Skill. Existing unrelated entries and unknown fields are preserved; malformed, same-name unmanaged, or modified route content fails soft.
-3. Science exposes each connector as an auto-generated connector Skill. MCP remains sandboxed and does not receive direct access to the Science organization directory.
+2. Before Science starts, CSSwitch atomically merges one managed stdio entry into `<data-dir>/mcp/local-mcp.json`. It exposes both install and uninstall tools; its environment contains only the path to the private key file, never the key value. CSSwitch removes only the obsolete uninstaller entry carrying its own management marker and also atomically ensures the fixed route Skill. Existing unrelated entries and unknown fields are preserved; malformed, same-name unmanaged, or modified route content fails soft.
+3. Science exposes the connector as an auto-generated connector Skill. MCP remains sandboxed and does not receive direct access to the Science organization directory.
 4. After health and identity checks, CSSwitch uses a dedicated one-time local Science URL to attach the fixed route Skill to `OPERON`; failure only degrades the external-Skill feature and never fails Science startup.
-5. A matching natural-language request loads the route, then the scoped connector. The user grants the dedicated bridge directory through Science's `request_host_access` flow.
+5. A matching natural-language request loads the route, then the combined connector. The user grants the dedicated bridge directory through Science's `request_host_access` flow.
 6. For install, `edit_file` submits a bounded, HMAC-signed request containing a random ID and short expiry. The host accepts only a same-owner, non-symlink regular request file, rejects stale, modified, mismatched, or replayed requests, then re-reads `active-org.json`, resolves the GitHub ref/path, downloads the complete directory, validates limits and paths, writes a version-1 `.import-origin`, and atomically renames it into `orgs/<active-org>/skills/<skill-name>` without overwriting an existing directory.
 7. The Agent calls Science's native `host.agents.attach_skill`, then verifies the `skill()` result.
 8. For uninstall, the gateway validates the exact name and CSSwitch marker, then atomically moves the directory into quarantine. The Agent calls native `detach_skill`, then verifies it is no longer loadable.
@@ -56,7 +56,7 @@ The connector does not bypass Science's sandbox. Direct MCP writes, MCP loopback
 
 Confirmed by focused tests:
 
-- separate install-only and uninstall-only MCP schemas and registration;
+- one combined MCP schema with distinct install and uninstall tools, plus safe migration of the old managed uninstaller entry;
 - Chinese and English discovery descriptions;
 - name-only `NEED_SOURCE_URL` with no file write;
 - public GitHub URL/ref/path resolution and complete multi-file download;
@@ -79,7 +79,7 @@ Confirmed by the 2026-07-13 isolated real-Science E2E using a temporary HOME/dat
 - `host.agents.attach_skill("OPERON", "internal-comms")` persisted the binding;
 - `skill("internal-comms")` returned imported Skill metadata and complete instructions in the current conversation;
 - after stopping and restarting Science with the same temporary data-dir, a new conversation loaded the same imported Skill again;
-- a later conversation containing only `请卸载 internal-comms` discovered and loaded `csswitch-external-skill-tools`, then loaded `mcp-csswitch-skill-uninstaller`;
+- a later conversation containing only `请卸载 internal-comms` discovered and loaded `csswitch-external-skill-tools`, then loaded the same `mcp-csswitch-skill-installer` connector used for installation;
 - the Agent called `uninstall_external_skill`, the host quarantined the marked directory, native `detach_skill` removed the binding, and `skill("internal-comms")` no longer loaded;
 - the natural-language uninstall round did not call `host.skills.delete`, `skills.deleteDraft`, bash, or manual filesystem deletion;
 - no real OAuth token, API key, Keychain credential, SSH material, or real Science organization data was used.
@@ -108,7 +108,7 @@ An artifact can carry a prompt document and may imitate a prompt-only Skill when
 
 - Installer registration and every Skill failure are warning-only for CSSwitch startup.
 - A running Science instance is inspected read-only; changed MCP configuration requires a Science restart.
-- The fixed route is re-attached idempotently on one-click open when registration is already current. Route attachment failure remains warning-only.
+- Successful route reconciliation is persisted by Science version, connector registration, and CSSwitch route revision. Normal repeated one-click opens skip attach/readback while that marker remains current; first configuration, relevant version/registration changes, and explicit self-check reconcile again. Failure remains warning-only and never updates the marker.
 - Host-access denial is final for that request. The Agent must report it, not retry alternate paths or fall back to authoring/catalog APIs.
 - `.import-origin`, local MCP loading, the local nonce/CSRF Agent-Skill endpoint, and `host.agents.attach_skill/detach_skill` behavior are observed Science contracts. Re-run the focused E2E after every bundled Science upgrade.
 - CSSwitch does not pin a Science version in the persistent data-dir. Normal selection is a valid explicit development `SCIENCE_BIN` override or the currently installed Science App. If the App is missing, a readable cache requires explicit one-launch UI authorization and is never persisted as a preference.
@@ -120,6 +120,6 @@ An artifact can carry a prompt document and may imitate a prompt-only Skill when
 
 No OAuth or catalog emulation; no Science binary patch; no private Science bearer use; no direct database writes; no bundled `customize` modification; no general Science control client; no Skill Manager, store, inventory, catalog, deployer, sync, general backup, update/overwrite, permanent deletion, restore UI, version manager, private-repository credentials, Python/R environment management, or domain libraries.
 
-## Accurate 0.4.5 wording
+## Accurate 0.5.0 wording
 
-“CSSwitch 0.4.5 local test build inherits the user's currently installed Claude Science App and adds a fixed routing Skill plus scoped local install and uninstall connectors. In an isolated real-Science UI test with the Anthropic catalog degraded, a URL request installed a complete public GitHub Skill into the active organization through a user-approved bridge, attached and loaded it immediately, and loaded it again after restart. A later name-only uninstall request selected the CSSwitch route, quarantined only the CSSwitch-owned import, detached it, and verified it no longer loaded without catalog-gated delete or shell removal. App-missing cache use requires explicit one-launch authorization. Name-only web source selection remains provider-dependent; private repositories, updates, overwrite, permanent deletion/restore UI, and each Skill's own domain function execution are not claimed.”
+“CSSwitch 0.5.0 inherits the user's currently installed Claude Science App and adds a fixed routing Skill plus one combined local install/uninstall connector. A URL request can install a complete public GitHub Skill into the active organization through a user-approved bridge, then attach and load it with Science's native Agent APIs. Uninstall quarantines only CSSwitch-owned imports before native detachment, without catalog-gated delete or shell removal. App-missing cache use requires explicit one-launch authorization. Name-only web source selection remains provider-dependent; private repositories, updates, overwrite, permanent deletion/restore UI, and each Skill's own domain function execution are not claimed.”

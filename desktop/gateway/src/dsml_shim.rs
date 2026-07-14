@@ -1121,6 +1121,56 @@ mod tests {
     }
 
     #[test]
+    fn repl_host_mcp_leak_becomes_tool_use() {
+        let code = r#"import json
+
+result = host.mcp(
+    "csswitch-skill-installer",
+    "install_external_skill",
+    source_url="https://github.com/anthropics/skills/tree/main/skills/internal-comms"
+)
+
+print(json.dumps(result, indent=2, ensure_ascii=False))"#;
+        let block = wrap(
+            "｜｜",
+            "repl",
+            &[
+                ("code", " string=\"true\"", code),
+                (
+                    "human_description",
+                    " string=\"true\"",
+                    "Installing internal-comms skill from GitHub",
+                ),
+            ],
+        );
+        let mut known_tools = Map::new();
+        known_tools.insert(
+            "repl".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                    "human_description": {"type": "string"}
+                },
+                "required": ["code"]
+            }),
+        );
+
+        let segments = segment_dsml_text(&block, &known_tools);
+        let Segment::ToolUse(call) = &segments[0] else {
+            panic!("expected repl tool segment");
+        };
+        assert_eq!(call.name, "repl");
+        assert_eq!(
+            call.input,
+            json!({
+                "code": code,
+                "human_description": "Installing internal-comms skill from GitHub"
+            })
+        );
+    }
+
+    #[test]
     fn issue8_multiple_wrappers_and_function_calls_alias_match_python() {
         let pipe = "｜｜";
         let q1 = "site:https://www.ncbi.nlm.nih.gov/geo/ \"GSE207177\"";

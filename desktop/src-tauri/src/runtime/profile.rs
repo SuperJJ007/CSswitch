@@ -113,7 +113,8 @@ pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> 
     Ok(json!({
         "schema_version": cfg.schema_version, "active_id": cfg.active_id, "profiles": profiles,
         "templates": build_list_templates(), "proxy_port": cfg.proxy_port,
-        "sandbox_port": cfg.sandbox_port, "mode": cfg.mode, "pending_notice": notice,
+        "sandbox_port": cfg.sandbox_port, "reuse_system_ssh": cfg.reuse_system_ssh,
+        "mode": cfg.mode, "pending_notice": notice,
     }))
 }
 

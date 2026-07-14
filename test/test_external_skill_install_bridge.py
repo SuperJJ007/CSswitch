@@ -312,7 +312,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         self.assertIn("失败只降级该工具，绝不阻断 Science 启动", session)
         self.assertNotIn("register_before_science_start(&app, &auth_dir)?", session)
 
-    def test_route_is_ensured_and_scoped_connectors_are_registered(self):
+    def test_route_is_ensured_and_combined_connector_is_registered(self):
         route = (
             ROOT / "desktop/src-tauri/src/runtime/external_skill_route.rs"
         ).read_text()
@@ -324,8 +324,13 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         self.assertIn("csswitch-system-bridge", route)
         self.assertIn("route_skill_matches(&target)?", route)
         self.assertIn("rename_no_replace(&temp, &target)?", route)
-        self.assertIn('\"--tool-mode\", \"install\"', bridge)
-        self.assertIn('\"--tool-mode\", \"uninstall\"', bridge)
+        self.assertIn(
+            '"args": ["skill-install-mcp", "--bridge-dir", bridge],', bridge
+        )
+        self.assertIn(
+            "merge_registrations_and_remove(config, expected, &[UNINSTALL_SERVER_NAME])",
+            bridge,
+        )
 
     def test_route_forces_dynamic_connector_uninstall_without_science_or_shell_fallback(self):
         route = (
@@ -333,8 +338,9 @@ class ExternalSkillInstallBridge(unittest.TestCase):
             / "desktop/src-tauri/resources/skills/csswitch-external-skill-tools/SKILL.md"
         ).read_text()
         self.assertIn("mcp-csswitch-skill-installer", route)
-        self.assertIn("mcp-csswitch-skill-uninstaller", route)
-        self.assertIn('"csswitch-skill-uninstaller"', route)
+        self.assertIn('"csswitch-skill-installer"', route)
+        self.assertNotIn("mcp-csswitch-skill-uninstaller", route)
+        self.assertNotIn('"csswitch-skill-uninstaller"', route)
         self.assertIn("Never call `host.skills.delete`", route)
         self.assertIn("manual filesystem deletion", route)
         self.assertIn("There is no\n   default or hard-coded Skill name", route)
@@ -352,10 +358,12 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         self.assertIn('x-operon-csrf', gateway)
         self.assertIn('CSSWITCH_SCIENCE_CONTROL_URL', bridge)
         self.assertNotIn('.arg(control_url)', bridge)
-        self.assertIn('let control_url = sandbox_url(sport, &running_runtime);', session)
-        self.assertIn('let control_url = sandbox_url(sport, &launch_runtime);', session)
-        self.assertIn('attach_route_best_effort(&app, installer, &control_url)', session)
-        self.assertIn('// the browser receives a fresh URL below.', session)
+        self.assertIn("let control_url = sandbox_url(port, runtime);", session)
+        self.assertIn(
+            "configure_third_party_after_science_start(app, &control_url)", session
+        )
+        self.assertIn("let url = sandbox_url(sport, &launch_runtime);", session)
+        self.assertIn("A dedicated control URL is only", session)
 
     def test_skill_installer_targets_active_org_and_never_version_runtime(self):
         installer = (ROOT / "desktop/gateway/src/skill_install.rs").read_text()

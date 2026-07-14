@@ -1,0 +1,10 @@
+#!/bin/zsh
+set -eu
+
+config="${CSSWITCH_SYSTEM_SSH_CONFIG:-}"
+if [[ -z "$config" || "$config" != /* ]]; then
+  echo "CSSwitch SSH bridge 缺少有效的系统 SSH config 授权" >&2
+  exit 126
+fi
+
+exec /usr/bin/ssh -F "$config" "$@"

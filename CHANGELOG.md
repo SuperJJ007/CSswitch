@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.5.0] — 2026-07-14
+
+### Added
+
+- Added a user-approved bridge for installing a complete public GitHub Skill directory from an exact URL and attaching it to Science's default Agent. The same combined local connector can quarantine and detach only CSSwitch-owned imports.
+- Added an opt-in setting that lets isolated Science invoke system OpenSSH with the user's real `~/.ssh/config`. CSSwitch does not copy or link `.ssh`, start `sshd`, enable Remote Login, change the firewall, or expose a public listener.
+
+### Changed
+
+- New isolated Science launches prefer the binary from the locally installed official Claude Science app. A readable retained sandbox binary is offered only as a one-launch fallback when the App is unavailable and the user explicitly authorizes it; the choice is not persisted.
+- Kept Science `--no-auto-update`: CSSwitch neither downloads Science nor calls its self-updater. Existing healthy daemons are reused and are never force-restarted merely because the installed app changed.
+- Combined external Skill install and uninstall into one MCP process. Existing CSSwitch-managed two-connector registrations are migrated automatically; unrelated user registrations are preserved.
+- Cached Science version probes by executable fingerprint and persisted successful Skill-route reconciliation state, so repeated one-click opens skip redundant CLI and control-plane work until the runtime or registration changes.
+- Hardened DeepSeek DSML tool-call normalization for third-party Science conversations.
+
+### Safety
+
+- The CSSwitch Gateway and Science remain bound to loopback. Version 0.5.0 does not add a `0.0.0.0` switch or a public-network entry point.
+- System SSH reuse is off by default and is an explicit trust grant: normal OpenSSH `Include`, `IdentityFile`, `IdentityAgent`, `ProxyCommand`, and `Match exec` behavior may apply when enabled.
+- Skill installation still requires Science's host-access approval, exact public source URL, bounded authenticated requests, and native Agent attach/detach. It does not emulate OAuth/catalog access, overwrite existing Skills, or directly edit Science databases.
+- Explicit quit stops the managed Science daemon before the Gateway; merely closing the settings window keeps the local chain running.
+
+### Upgrade notes
+
+- Version 0.5.0 keeps the v2 configuration schema and reuses `~/.csswitch/sandbox/home/.claude-science`; existing organizations, projects, Skills, and legacy Skill Manager files are retained.
+- The release remains Apple Silicon only, ad-hoc signed, and not notarized. Name-only Skill source discovery is provider-dependent; private repositories, updates/overwrite, and permanent-delete/restore UI are not included.
+
 ## [0.4.4] — 2026-07-12
 
 ### Changed

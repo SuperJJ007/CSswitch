@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "CSSwitch",
-  "version": "0.4.5",
+  "version": "0.5.0",
   "identifier": "com.csswitch.menubar",
   "build": {
     "frontendDist": "../src"
@@ -41,6 +41,7 @@
     "resources": {
       "../../scripts/doctor.sh": "scripts/doctor.sh",
       "../../scripts/launch-virtual-sandbox.sh": "scripts/launch-virtual-sandbox.sh",
+      "../../scripts/ssh-bridge/ssh": "scripts/ssh-bridge/ssh",
       "../../scripts/stop-science-sandbox.sh": "scripts/stop-science-sandbox.sh",
       "../../scripts/verify-proxy.sh": "scripts/verify-proxy.sh"
     },

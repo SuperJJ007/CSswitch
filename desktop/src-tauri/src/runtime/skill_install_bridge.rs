@@ -13,6 +13,9 @@ use crate::runtime::proxy_lifecycle::gateway_bin_path;
 const INSTALL_SERVER_NAME: &str = "csswitch-skill-installer";
 const UNINSTALL_SERVER_NAME: &str = "csswitch-skill-uninstaller";
 const MANAGED_MARKER: &str = "[managed-by:csswitch]";
+const ROUTE_STATE_FILE: &str = ".csswitch-route-state.json";
+const ROUTE_STATE_SCHEMA: u64 = 1;
+const ROUTE_POLICY_REVISION: u64 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RegistrationStatus {
@@ -82,32 +85,109 @@ pub(crate) fn inspect_while_science_running<R: Runtime>(
     }
 }
 
-/// Attach the fixed routing Skill through Science's own local control plane.
+/// Configure the isolated third-party Science profile through its local control plane.
 ///
 /// The one-time URL is passed via the child environment (never argv), and the
-/// gateway command accepts only the fixed route name and loopback origins.
-pub(crate) fn attach_route_after_science_start<R: Runtime>(
+/// gateway command accepts only the fixed policy and loopback origins.
+pub(crate) fn configure_third_party_after_science_start<R: Runtime>(
     app: &tauri::AppHandle<R>,
     control_url: &str,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(log) = std::env::var_os("CSSWITCH_TEST_THIRD_PARTY_CONFIG_LOG") {
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        let mut file = options
+            .open(log)
+            .map_err(|_| "无法写入第三方配置测试计数")?;
+        file.write_all(b"configure-third-party\n")
+            .map_err(|_| "无法写入第三方配置测试计数")?;
+        return Ok(());
+    }
     let gateway = gateway_bin_path(app).ok_or("找不到 csswitch-gateway sidecar")?;
     let output = Command::new(gateway)
         .arg("science-control")
-        .arg("attach-route")
+        .arg("configure-third-party")
         .env("CSSWITCH_SCIENCE_CONTROL_URL", control_url)
         .output()
-        .map_err(|_| "启动本地 Science 路由绑定命令失败")?;
+        .map_err(|_| "启动本地 Science 第三方能力配置命令失败")?;
     if !output.status.success() {
-        return Err("Science 未接受 CSSwitch 路由 Skill 绑定".into());
+        return Err("Science 未接受 CSSwitch 第三方能力配置".into());
     }
-    let value: Value =
-        serde_json::from_slice(&output.stdout).map_err(|_| "本地 Science 路由绑定响应非法")?;
-    if value.get("status").and_then(Value::as_str) != Some("ATTACHED")
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "本地 Science 第三方能力配置响应非法")?;
+    let connectors = value
+        .get("connector_ids")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if value.get("status").and_then(Value::as_str) != Some("CONFIGURED")
         || value.get("skill_name").and_then(Value::as_str) != Some(SKILL_NAME)
+        || connectors != ["local:csswitch-skill-installer"]
+        || value.get("disabled_skill").and_then(Value::as_str) != Some("customize")
+        || value.get("custom_prompt_managed").and_then(Value::as_bool) != Some(true)
     {
-        return Err("本地 Science 路由绑定结果不完整".into());
+        return Err("本地 Science 第三方能力配置结果不完整".into());
     }
     Ok(())
+}
+
+fn expected_route_state(science_version: &str) -> Value {
+    json!({
+        "schema": ROUTE_STATE_SCHEMA,
+        "csswitch_version": env!("CARGO_PKG_VERSION"),
+        "science_version": science_version,
+        "route_revision": ROUTE_POLICY_REVISION,
+    })
+}
+
+fn route_state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(ROUTE_STATE_FILE)
+}
+
+pub(crate) fn route_configuration_is_current(
+    data_dir: &Path,
+    science_version: &str,
+) -> Result<bool, String> {
+    let path = route_state_path(data_dir);
+    reject_symlink_path(&path)?;
+    let body = match fs::read(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("读取 Skill 路由状态失败：{error}")),
+    };
+    let Ok(current) = serde_json::from_slice::<Value>(&body) else {
+        return Ok(false);
+    };
+    Ok(current == expected_route_state(science_version))
+}
+
+pub(crate) fn invalidate_route_configuration(data_dir: &Path) -> Result<(), String> {
+    let path = route_state_path(data_dir);
+    reject_symlink_path(&path)?;
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            File::open(data_dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("同步 Skill 路由状态目录失败：{error}"))?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("清除 Skill 路由状态失败：{error}")),
+    }
+}
+
+pub(crate) fn mark_route_configuration_current(
+    data_dir: &Path,
+    science_version: &str,
+) -> Result<(), String> {
+    reject_symlink_path(data_dir)?;
+    if !data_dir.is_dir() {
+        return Err("Science data-dir 不可用，无法记录 Skill 路由状态".into());
+    }
+    let path = route_state_path(data_dir);
+    reject_symlink_path(&path)?;
+    write_route_state_atomic(&path, &expected_route_state(science_version))
 }
 
 fn registration_inputs<R: Runtime>(
@@ -128,22 +208,13 @@ fn registration_inputs<R: Runtime>(
     let command = gateway.to_string_lossy();
     let bridge = bridge_dir.to_string_lossy();
     let bridge_key_file = bridge_key_file.to_string_lossy();
-    let expected = vec![
-        json!({
-            "name": INSTALL_SERVER_NAME,
-            "command": command,
-            "args": ["skill-install-mcp", "--bridge-dir", bridge, "--tool-mode", "install"],
-            "env": {"CSSWITCH_SKILL_BRIDGE_KEY_FILE": bridge_key_file},
-            "description": format!("安装、导入、添加外部 Skill；install/import/add an external public GitHub Skill. Use install_external_skill instead of host.skills.edit/publish. {MANAGED_MARKER}")
-        }),
-        json!({
-            "name": UNINSTALL_SERVER_NAME,
-            "command": command,
-            "args": ["skill-install-mcp", "--bridge-dir", bridge, "--tool-mode", "uninstall"],
-            "env": {"CSSWITCH_SKILL_BRIDGE_KEY_FILE": bridge_key_file},
-            "description": format!("卸载、删除、移除 CSSwitch 导入的外部 Skill；uninstall/delete/remove a CSSwitch-imported external Skill. Use uninstall_external_skill instead of host.skills.delete or skills.deleteDraft. {MANAGED_MARKER}")
-        }),
-    ];
+    let expected = vec![json!({
+        "name": INSTALL_SERVER_NAME,
+        "command": command,
+        "args": ["skill-install-mcp", "--bridge-dir", bridge],
+        "env": {"CSSWITCH_SKILL_BRIDGE_KEY_FILE": bridge_key_file},
+        "description": format!("安装或卸载外部 Skill；install/import/add an external public GitHub Skill with install_external_skill, or remove a CSSwitch-imported Skill with uninstall_external_skill. Do not use host.skills.*. {MANAGED_MARKER}")
+    })];
     Ok((config, expected))
 }
 
@@ -185,7 +256,7 @@ fn merge_registrations(config: &Path, expected: Vec<Value>) -> Result<bool, Stri
 }
 
 fn merge_runtime_registration(config: &Path, expected: Vec<Value>) -> Result<bool, String> {
-    merge_registrations_and_remove(config, expected, &[])
+    merge_registrations_and_remove(config, expected, &[UNINSTALL_SERVER_NAME])
 }
 
 fn merge_registrations_and_remove(
@@ -304,6 +375,48 @@ fn write_config_atomic(path: &Path, value: &Value) -> Result<(), String> {
     result
 }
 
+fn write_route_state_atomic(path: &Path, value: &Value) -> Result<(), String> {
+    let parent = path.parent().ok_or("Skill 路由状态缺少父目录")?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".csswitch-route-state.{}-{suffix}",
+        std::process::id()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp)
+            .map_err(|error| format!("创建 Skill 路由状态临时文件失败：{error}"))?;
+        serde_json::to_writer(&mut file, value)
+            .map_err(|error| format!("编码 Skill 路由状态失败：{error}"))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("写入 Skill 路由状态失败：{error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("同步 Skill 路由状态失败：{error}"))?;
+        fs::rename(&temp, path).map_err(|error| format!("提交 Skill 路由状态失败：{error}"))?;
+        #[cfg(unix)]
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .map_err(|error| format!("收紧 Skill 路由状态权限失败：{error}"))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("同步 Skill 路由状态目录失败：{error}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 fn reject_symlink_path(path: &Path) -> Result<(), String> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -354,70 +467,71 @@ mod tests {
     }
 
     #[test]
-    fn batch_registration_adds_distinct_scoped_connectors_atomically() {
-        let root = temp_dir("two-connectors");
+    fn runtime_registration_preserves_unmanaged_legacy_name() {
+        let root = temp_dir("preserve-unmanaged-uninstaller");
         let config = root.join("local-mcp.json");
-        let installer = expected_named(INSTALL_SERVER_NAME, "/app/gateway", &root);
-        let mut uninstaller = expected_named(UNINSTALL_SERVER_NAME, "/app/gateway", &root);
-        uninstaller["args"] = json!([
-            "skill-install-mcp",
-            "--bridge-dir",
-            "/tmp/CSSwitch-Skill-Bridge-test",
-            "--tool-mode",
-            "uninstall"
-        ]);
-        assert!(
-            merge_registrations(&config, vec![installer.clone(), uninstaller.clone()]).unwrap()
-        );
-        assert!(
-            !merge_registrations(&config, vec![installer.clone(), uninstaller.clone()]).unwrap()
-        );
+        let user_uninstaller = json!({
+            "name": UNINSTALL_SERVER_NAME,
+            "command": "user-owned-tool",
+            "description": "not managed by CSSwitch"
+        });
+        fs::write(
+            &config,
+            serde_json::to_vec(&json!({"servers": [user_uninstaller.clone()]})).unwrap(),
+        )
+        .unwrap();
+        let combined = expected_named(INSTALL_SERVER_NAME, "/app/gateway", &root);
+        assert!(merge_runtime_registration(&config, vec![combined.clone()]).unwrap());
         let saved: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
         assert_eq!(saved["servers"].as_array().unwrap().len(), 2);
-        assert_eq!(saved["servers"][0], installer);
-        assert_eq!(saved["servers"][1], uninstaller);
+        assert_eq!(saved["servers"][0], user_uninstaller);
+        assert_eq!(saved["servers"][1], combined);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn runtime_registration_migrates_combined_connector_to_scoped_pair() {
-        let root = temp_dir("split-connectors");
+    fn runtime_registration_migrates_scoped_pair_to_combined_connector() {
+        let root = temp_dir("combine-connectors");
         let config = root.join("local-mcp.json");
-        let old_installer = expected_named(INSTALL_SERVER_NAME, "/old/gateway", &root);
-        fs::write(
-            &config,
-            serde_json::to_vec(&json!({
-                "servers": [old_installer, {"name":"other","command":"other"}]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let mut installer = expected_named(INSTALL_SERVER_NAME, "/new/gateway", &root);
-        installer["args"] = json!([
+        let mut old_installer = expected_named(INSTALL_SERVER_NAME, "/old/gateway", &root);
+        old_installer["args"] = json!([
             "skill-install-mcp",
             "--bridge-dir",
             "/tmp/CSSwitch-Skill-Bridge-test",
             "--tool-mode",
             "install"
         ]);
-        let mut uninstaller = expected_named(UNINSTALL_SERVER_NAME, "/new/gateway", &root);
-        uninstaller["args"] = json!([
+        let mut old_uninstaller = expected_named(UNINSTALL_SERVER_NAME, "/old/gateway", &root);
+        old_uninstaller["args"] = json!([
             "skill-install-mcp",
             "--bridge-dir",
             "/tmp/CSSwitch-Skill-Bridge-test",
             "--tool-mode",
             "uninstall"
         ]);
-        assert!(
-            merge_runtime_registration(&config, vec![installer.clone(), uninstaller.clone()])
-                .unwrap()
-        );
+        fs::write(
+            &config,
+            serde_json::to_vec(&json!({
+                "servers": [
+                    old_installer,
+                    {"name":"other","command":"other"},
+                    old_uninstaller
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let combined = expected_named(INSTALL_SERVER_NAME, "/new/gateway", &root);
+        assert!(merge_runtime_registration(&config, vec![combined.clone()]).unwrap());
+        assert!(!merge_runtime_registration(&config, vec![combined.clone()]).unwrap());
         let saved: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
         let servers = saved["servers"].as_array().unwrap();
-        assert_eq!(servers.len(), 3);
-        assert_eq!(servers[0], installer);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0], combined);
         assert_eq!(servers[1]["name"], "other");
-        assert_eq!(servers[2], uninstaller);
+        assert!(!servers.iter().any(|server| {
+            server.get("name").and_then(Value::as_str) == Some(UNINSTALL_SERVER_NAME)
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -476,6 +590,59 @@ mod tests {
         assert!(fs::read_to_string(&config).unwrap().contains("user-tool"));
         fs::write(&config, b"{broken").unwrap();
         assert!(merge_registration(&config, expected("/app/gateway", &root)).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn route_state_is_persistent_versioned_and_secret_free() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("route-state");
+        assert!(!route_configuration_is_current(&root, "science-v1").unwrap());
+        mark_route_configuration_current(&root, "science-v1").unwrap();
+        assert!(route_configuration_is_current(&root, "science-v1").unwrap());
+        assert!(!route_configuration_is_current(&root, "science-v2").unwrap());
+
+        let path = route_state_path(&root);
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("token"));
+        assert!(!body.contains("nonce"));
+        assert!(!body.contains("CSSwitch-Skill-Bridge"));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        invalidate_route_configuration(&root).unwrap();
+        assert!(!path.exists());
+        assert!(!route_configuration_is_current(&root, "science-v1").unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_or_unsafe_route_state_never_counts_as_configured() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("route-state-invalid");
+        let path = route_state_path(&root);
+        fs::write(&path, b"{broken").unwrap();
+        assert!(!route_configuration_is_current(&root, "science-v1").unwrap());
+        fs::remove_file(&path).unwrap();
+        let target = root.join("outside-state");
+        fs::write(&target, b"{}").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(route_configuration_is_current(&root, "science-v1").is_err());
+        assert!(invalidate_route_configuration(&root).is_err());
+        assert!(mark_route_configuration_current(&root, "science-v1").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_route_state_write_does_not_create_success_marker() {
+        let root = temp_dir("route-state-failure");
+        let missing = root.join("missing-data-dir");
+        assert!(mark_route_configuration_current(&missing, "science-v1").is_err());
+        assert!(!route_state_path(&missing).exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

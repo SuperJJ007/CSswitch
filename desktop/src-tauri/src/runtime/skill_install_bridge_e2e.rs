@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use super::{merge_registrations, INSTALL_SERVER_NAME, MANAGED_MARKER, UNINSTALL_SERVER_NAME};
+use super::{merge_registrations, INSTALL_SERVER_NAME, MANAGED_MARKER};
 use crate::runtime::external_skill_route::ensure_route_skill;
 
 const INSTALL_URL: &str = "https://github.com/anthropics/skills/tree/main/skills/internal-comms";
@@ -131,7 +131,7 @@ struct Observation {
     skill_loaded_after_restart: bool,
     route_skill_discovered: bool,
     route_skill_loaded: bool,
-    uninstaller_skill_loaded: bool,
+    uninstall_connector_skill_loaded: bool,
     uninstall_repl_calls: usize,
     uninstall_status_seen: bool,
     detach_called: bool,
@@ -528,9 +528,9 @@ fn route_uninstall_request(
     let last_is_tool_result =
         last_content.is_some_and(|content| json_has_type(content, "tool_result"));
     let has_route_docs = json_contains(value, "This Skill only routes external Skill operations");
-    let has_uninstaller_docs = json_contains(
+    let has_connector_docs = json_contains(
         value,
-        "<skill-metadata name=\"mcp-csswitch-skill-uninstaller\"",
+        "<skill-metadata name=\"mcp-csswitch-skill-installer\"",
     );
 
     if last_is_tool_result {
@@ -631,11 +631,11 @@ fn route_uninstall_request(
                 ),
             );
         }
-        if has_uninstaller_docs {
+        if has_connector_docs {
             let mut locked = observation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            locked.uninstaller_skill_loaded = true;
+            locked.uninstall_connector_skill_loaded = true;
             locked.uninstall_repl_calls += 1;
             locked.invoked_tools.push("repl".into());
             return (
@@ -643,7 +643,7 @@ fn route_uninstall_request(
                 tool_use_sse(
                     "repl",
                     &json!({
-                        "code": "result = host.mcp(\"csswitch-skill-uninstaller\", \"uninstall_external_skill\", skill_name=\"internal-comms\")\nprint(result)",
+                        "code": "result = host.mcp(\"csswitch-skill-installer\", \"uninstall_external_skill\", skill_name=\"internal-comms\")\nprint(result)",
                         "human_description": "Uninstalling external Skill"
                     }),
                 ),
@@ -660,19 +660,19 @@ fn route_uninstall_request(
                 tool_use_sse(
                     "skill",
                     &json!({
-                        "skill": "mcp-csswitch-skill-uninstaller",
-                        "human_description": "Loading CSSwitch uninstaller"
+                        "skill": "mcp-csswitch-skill-installer",
+                        "human_description": "Loading CSSwitch external Skill connector"
                     }),
                 ),
             );
         }
     }
 
-    if has_uninstaller_docs {
+    if has_connector_docs {
         let mut locked = observation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        locked.uninstaller_skill_loaded = true;
+        locked.uninstall_connector_skill_loaded = true;
         locked.uninstall_repl_calls += 1;
         locked.invoked_tools.push("repl".into());
         return (
@@ -680,7 +680,7 @@ fn route_uninstall_request(
             tool_use_sse(
                 "repl",
                 &json!({
-                    "code": "result = host.mcp(\"csswitch-skill-uninstaller\", \"uninstall_external_skill\", skill_name=\"internal-comms\")\nprint(result)",
+                    "code": "result = host.mcp(\"csswitch-skill-installer\", \"uninstall_external_skill\", skill_name=\"internal-comms\")\nprint(result)",
                     "human_description": "Uninstalling external Skill"
                 }),
             ),
@@ -697,8 +697,8 @@ fn route_uninstall_request(
             tool_use_sse(
                 "skill",
                 &json!({
-                    "skill": "mcp-csswitch-skill-uninstaller",
-                    "human_description": "Loading CSSwitch uninstaller"
+                    "skill": "mcp-csswitch-skill-installer",
+                    "human_description": "Loading CSSwitch external Skill connector"
                 }),
             ),
         );
@@ -1020,12 +1020,12 @@ fn science_url(guard: &ScienceGuard) -> Result<String, String> {
     Err("Science URL 未就绪".into())
 }
 
-fn attach_route_via_control(guard: &ScienceGuard, gateway: &Path) -> Result<(), String> {
+fn configure_third_party_via_control(guard: &ScienceGuard, gateway: &Path) -> Result<(), String> {
     let control_url = science_url(guard)?;
     let mut command = safe_command(gateway, &guard.sandbox_home, &guard.safe_bin);
     command
         .arg("science-control")
-        .arg("attach-route")
+        .arg("configure-third-party")
         .env("CSSWITCH_SCIENCE_CONTROL_URL", control_url);
     let output = output_with_timeout(&mut command, Duration::from_secs(10))?;
     if !output.status.success() {
@@ -1036,8 +1036,8 @@ fn attach_route_via_control(guard: &ScienceGuard, gateway: &Path) -> Result<(), 
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("路由 Skill 控制面响应非法：{error}"))?;
-    if value.get("status").and_then(Value::as_str) != Some("ATTACHED") {
-        return Err("路由 Skill 未返回 ATTACHED".into());
+    if value.get("status").and_then(Value::as_str) != Some("CONFIGURED") {
+        return Err("Science 第三方能力配置未返回 CONFIGURED".into());
     }
     Ok(())
 }
@@ -1262,6 +1262,8 @@ fn wait_log_contains(path: &Path, needle: &str) {
 #[test]
 #[ignore = "explicit installed Science local-MCP dialogue E2E; temp HOME/data-dir, public GitHub, local mock/browser only"]
 fn isolated_science_installs_attaches_and_persists_external_skill() {
+    use std::os::unix::fs::PermissionsExt;
+
     assert_eq!(
         std::env::var("CSSWITCH_REAL_SCIENCE_SKILL_INSTALL_MCP_E2E").as_deref(),
         Ok("1"),
@@ -1292,6 +1294,16 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     assert!(gateway.is_file(), "缺少本轮 gateway：{}", gateway.display());
     let gateway_port = free_port();
     let gateway_secret = "csswitch-e2e-secret";
+    let bridge_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let bridge_key = outer_home.join(".csswitch/runtime/skill-install-bridge.key");
+    fs::create_dir_all(bridge_key.parent().unwrap()).unwrap();
+    fs::set_permissions(
+        bridge_key.parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(&bridge_key, format!("{bridge_token}\n")).unwrap();
+    fs::set_permissions(&bridge_key, fs::Permissions::from_mode(0o600)).unwrap();
     let install_bridge =
         outer_home.join(format!("CSSwitch-Skill-Bridge-e2e-{}", std::process::id()));
     let provider = MockProvider::start(install_bridge.to_string_lossy().into_owned());
@@ -1305,6 +1317,7 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
         .env("CSSWITCH_UPSTREAM_URL", provider.endpoint())
         .env("CSSWITCH_SKILL_DATA_DIR", &data_dir)
         .env("CSSWITCH_SKILL_BRIDGE_DIR", &install_bridge)
+        .env("CSSWITCH_SKILL_BRIDGE_TOKEN", bridge_token)
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             File::create(root.join("gateway.stderr.log")).unwrap(),
@@ -1323,18 +1336,11 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     let installer = json!({
         "name": INSTALL_SERVER_NAME,
         "command": gateway.to_string_lossy(),
-        "args": ["skill-install-mcp", "--bridge-dir", install_bridge.to_string_lossy(), "--tool-mode", "install"],
-        "env": {},
-        "description": format!("Install public GitHub Skills locally. {MANAGED_MARKER}")
+        "args": ["skill-install-mcp", "--bridge-dir", install_bridge.to_string_lossy()],
+        "env": {"CSSWITCH_SKILL_BRIDGE_KEY_FILE": bridge_key.to_string_lossy()},
+        "description": format!("Install or uninstall external Skills locally. {MANAGED_MARKER}")
     });
-    let uninstaller = json!({
-        "name": UNINSTALL_SERVER_NAME,
-        "command": gateway.to_string_lossy(),
-        "args": ["skill-install-mcp", "--bridge-dir", install_bridge.to_string_lossy(), "--tool-mode", "uninstall"],
-        "env": {},
-        "description": format!("Uninstall CSSwitch imported Skills locally. {MANAGED_MARKER}")
-    });
-    assert!(merge_registrations(&config, vec![installer, uninstaller]).unwrap());
+    assert!(merge_registrations(&config, vec![installer]).unwrap());
 
     let science_bin = std::env::var_os("CSSWITCH_REAL_SCIENCE_BIN")
         .map(PathBuf::from)
@@ -1390,7 +1396,7 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     wait_port(port);
     assert_installed_runtime_identity(&guard, &science_version);
     wait_log_contains(&science_stderr, "MCP warmup complete");
-    attach_route_via_control(&guard, &gateway).unwrap();
+    configure_third_party_via_control(&guard, &gateway).unwrap();
 
     let chat = open_chat(&mut guard).unwrap();
     send_prompt(
@@ -1488,8 +1494,8 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
         "the CSSwitch route Skill was not loaded: {uninstalled:?}"
     );
     assert!(
-        uninstalled.uninstaller_skill_loaded,
-        "the scoped uninstaller connector Skill was not loaded: {uninstalled:?}"
+        uninstalled.uninstall_connector_skill_loaded,
+        "the combined external Skill connector was not loaded: {uninstalled:?}"
     );
     assert_eq!(uninstalled.uninstall_repl_calls, 1);
     assert!(uninstalled.uninstall_status_seen);
