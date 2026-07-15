@@ -22,9 +22,9 @@ It is built for more than developers. You need Claude Science, a third-party API
 
 > The current app mainly targets macOS Apple Silicon. Because the app is not notarized yet, macOS may ask you to right-click and choose "Open" the first time.
 
-[Download latest release](../../releases/latest) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
+[Download latest release](../../releases/latest) · [Documentation](./docs/README.md) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.6.0:** External Skills can now be installed from an exact public GitHub URL or a local `.zip` / `.skill` file selected in the desktop panel. Slow GitHub downloads expose single-request progress, terminal cleanup, and restart interruption recovery. Uninstalling any bundle member first returns the complete affected Skill list and requires confirmation for whole-bundle removal; partial physical deletion is not supported. Legacy v0.5.0 connector routes migrate automatically while user MCP entries and unknown fields are preserved. See the [External Skill install bridge](./docs/EXTERNAL_SKILL_INSTALL.md) and [architecture contract](./docs/ARCHITECTURE.md).
+> **0.6.0:** External Skills can now be installed from an exact public GitHub URL or a local `.zip` / `.skill` file selected in the desktop panel. Slow GitHub downloads expose single-request progress, terminal cleanup, and restart interruption recovery. Uninstalling any bundle member first returns the complete affected Skill list and requires confirmation for whole-bundle removal; partial physical deletion is not supported. Legacy v0.5.0 connector routes migrate automatically while user MCP entries and unknown fields are preserved. See the [external Skill bridge](./docs/features/external-skill-bridge.md), [system SSH contract](./docs/features/system-ssh.md), and [architecture contract](./docs/architecture/overview.md).
 
 ## Contents
 
@@ -137,13 +137,13 @@ Installing the exact same fixed GitHub commit or local archive again verifies an
 
 Ask the CSSwitch uninstaller to remove a Skill from Science. A single-Skill removal only handles a directory carrying a valid CSSwitch import marker, quarantines it, and completes Agent detachment. If the target belongs to a bundle, the first call only returns the bundle name, complete affected-Skill list, and confirmation ID; no files are removed until the user explicitly confirms whole-bundle removal. Cancellation must not invoke the uninstall tool again, and this version does not physically delete only one bundle member.
 
-See the [External Skill install bridge](./docs/EXTERNAL_SKILL_INSTALL.md) for detailed statuses, limits, recovery behavior, and troubleshooting.
+See the [external Skill bridge](./docs/features/external-skill-bridge.md) for detailed statuses, limits, recovery behavior, and troubleshooting.
 
 ## Upgrading from an older version
 
 Version 0.6.0 keeps the existing v2 configuration format and reuses `~/.csswitch/sandbox/home/.claude-science`, so existing Science organizations, projects, and Skills are not migrated or overwritten. Legacy v0.5.0 external-Skill connectors are merged automatically while user-created MCP entries and unknown fields are preserved. Legacy CSSwitch Skill store/inventory files remain untouched but no longer participate in startup; external `~/.claude/skills` trees are not synchronized into Science.
 
-For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/upgrade-and-rollback.md).
+For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/operations/upgrade-and-rollback.md).
 
 ## Supported model sources
 
@@ -226,6 +226,8 @@ Please remove API keys, tokens, email addresses, private URLs, and any sensitive
 ## Development
 
 Users do not need to run CSSwitch from source. This section is for debugging and contributors.
+
+Maintainers can use the [documentation index](./docs/README.md) for architecture, testing, release operations, feature contracts, and versioned evidence.
 
 ```bash
 cd desktop

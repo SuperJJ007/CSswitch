@@ -22,9 +22,9 @@ CSSwitch 是一个给 Claude Science 使用的本地配置转换器。它把 Sci
 
 > 当前版本主要支持 macOS Apple Silicon。首次打开未公证的 `.dmg` 应用时，macOS 可能需要你右键选择「打开」。
 
-[下载最新版](../../releases/latest) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
+[下载最新版](../../releases/latest) · [项目文档](./docs/README.md) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.6.0：** 外部 Skill 安装现在支持准确的公开 GitHub URL 和主面板本地 `.zip` / `.skill` 两条路线；GitHub 慢下载提供单请求进度、终态清理和重启中断恢复。bundle 从任意成员卸载时，必须先返回完整受影响 Skill 列表并由用户确认整包卸载，不做部分物理删除。v0.5.0 的旧 connector 路由会自动迁移，用户 MCP 配置和未知字段保持原样。详见 [外部 Skill 安装桥](./docs/EXTERNAL_SKILL_INSTALL.md)和[架构说明](./docs/ARCHITECTURE.md)。
+> **0.6.0：** 外部 Skill 安装现在支持准确的公开 GitHub URL 和主面板本地 `.zip` / `.skill` 两条路线；GitHub 慢下载提供单请求进度、终态清理和重启中断恢复。bundle 从任意成员卸载时，必须先返回完整受影响 Skill 列表并由用户确认整包卸载，不做部分物理删除。v0.5.0 的旧 connector 路由会自动迁移，用户 MCP 配置和未知字段保持原样。详见[外部 Skill bridge](./docs/features/external-skill-bridge.md)、[系统 SSH](./docs/features/system-ssh.md)和[架构说明](./docs/architecture/overview.md)。
 
 ## 目录
 
@@ -137,13 +137,13 @@ CSSwitch 0.6.0 提供 GitHub 和本地文件两条安装路线。两条路线使
 
 在 Science 中要求 CSSwitch 卸载器卸载某个 Skill。单 Skill 只会处理带有 CSSwitch 导入标记的目录，并在隔离后完成 Agent 解绑。若目标属于 bundle，首次调用只返回 bundle 名称、完整受影响 Skill 列表和确认 ID，不会删除文件；只有用户明确确认后才整包解绑和隔离。取消时不应再次调用卸载工具，当前版本也不支持只物理删除一个 bundle 成员。
 
-更完整的状态、限制、恢复行为和故障排查见 [外部 Skill 安装桥](./docs/EXTERNAL_SKILL_INSTALL.md)。
+更完整的状态、限制、恢复行为和故障排查见[外部 Skill bridge](./docs/features/external-skill-bridge.md)。
 
 ## 从旧版升级
 
 0.6.0 保留现有 v2 配置格式并继续复用 `~/.csswitch/sandbox/home/.claude-science`，因此已有 Science 组织、项目和 Skill 不会被迁移或覆盖。v0.5.0 的旧外部 Skill connector 会合并迁移；用户自建 MCP 项和未知配置字段保持不变。旧 `~/.csswitch/` Skill store/inventory 会原样保留但不再参与启动；外部 `~/.claude/skills` 也不会自动同步到 Science。
 
-完整步骤、备份位置和回滚边界见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
+完整步骤、备份位置和回滚边界见[升级与回滚说明](./docs/operations/upgrade-and-rollback.md)。
 
 ## 支持的模型来源
 
@@ -230,6 +230,8 @@ README 目前提供：
 ## 开发与构建
 
 用户不需要从源码运行。以下内容只给想调试或参与开发的人。
+
+维护者可从[项目文档总入口](./docs/README.md)查看架构、测试、发布、功能合同和版本证据。
 
 ```bash
 cd desktop
