@@ -53,47 +53,12 @@ host.mcp(
 )
 ```
 
-If the result is `BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED`, do not call any
-uninstall or detach tool again yet. Show the user the returned `bundle_name`
-and complete `affected_skill_names` list, explain that the operation is
-whole-bundle only, and ask for an explicit confirm or cancel decision. If the
-user cancels, stop without another tool call. If the user explicitly confirms,
-call the same tool once more with the same `skill_name` and the exact returned
-`bundle_id` as `confirm_bundle_id`:
-
-```python
-host.mcp(
-    "csswitch-skill-installer",
-    "uninstall_external_skill",
-    skill_name=skill_name,
-    confirm_bundle_id=bundle_id,
-)
-```
-
-The confirmed call re-finds and re-verifies the installed bundle. If it returns
-a new `BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED`, show the new membership and ask
-again. Never infer or retain an older bundle ID, never confirm on the user's
-behalf, and never offer partial physical deletion of bundle members.
-
 Never call `host.skills.delete`, `skills.deleteDraft`, `host.skills.edit`, shell
 commands, Python filesystem APIs, or manual filesystem deletion as a fallback.
 Do not locate similarly named directories outside the CSSwitch-managed Science
 data directory. If the MCP call fails, report that failure and stop.
 
 ## Result handling
-
-For `HOST_ACCESS_REQUIRED`, submit the returned `request.payload` exactly once
-under its original request ID. Then use `poll_external_skill_request` with that
-same `request_id`; omit `last_sequence` on the first call, and pass the previous
-`PROCESSING.sequence` on later calls. The polling tool waits inside the gateway
-and returns bounded `phase`, heartbeat timestamps, elapsed time, and
-`deadline_at`, or the final response. Do not read the bridge files repeatedly,
-run `sleep`, or start a shell/Python polling loop. Never write the request again
-and never call the install/uninstall tool again merely because a bundle is still
-downloading. Success, failure, timeout, and interrupted-host recovery all arrive
-as a final response after `.processing` is cleared.
-`REQUEST_INTERRUPTED` is final and retryable through one new MCP call; CSSwitch
-will verify any possible committed state before changing files again.
 
 For `INSTALLED_ATTACHED_VERIFY_REQUIRED`, call `skill(skill_name)` in the current
 conversation. Report the Skill usable only if that call succeeds. For
@@ -107,7 +72,6 @@ manually.
 
 For single-Skill uninstall, follow the native detach step explicitly returned
 by the connector, then verify that `skill(skill_name)` no longer loads. A
-`BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED` result is non-mutating and requires the
-explicit two-step flow above. A `BUNDLE_UNINSTALLED_DETACHED` result already
-means the entire owning bundle was batch-detached and quarantined; do not detach
-its members again. Report every response faithfully.
+`BUNDLE_UNINSTALLED_DETACHED` result already means the entire owning bundle was
+batch-detached and quarantined; do not detach its members again. Report every
+response faithfully.

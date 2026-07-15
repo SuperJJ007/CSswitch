@@ -41,6 +41,44 @@ pub(crate) struct ScienceRuntimeIdentity {
     pub(crate) version: Option<String>,
 }
 
+impl ScienceRuntimeIdentity {
+    pub(crate) fn skill_install_host_context(
+        &self,
+        sandbox_port: u16,
+    ) -> Result<csswitch_skill_install_core::ScienceHostContext, String> {
+        let canonical = self
+            .path
+            .canonicalize()
+            .map_err(|_| "Science binary 不可用，无法启用 Skill attach control")?;
+        if canonical != self.path {
+            return Err("Science binary 不是 canonical path，无法启用 Skill attach control".into());
+        }
+        let version = self
+            .version
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("Science 版本未确认，无法启用 Skill attach control")?
+            .clone();
+        let fingerprint = science_executable_fingerprint(&canonical)
+            .ok_or("Science binary 指纹不可用，无法启用 Skill attach control")?;
+        Ok(csswitch_skill_install_core::ScienceHostContext {
+            binary: canonical,
+            version,
+            fingerprint: csswitch_skill_install_core::ScienceExecutableFingerprint {
+                device: fingerprint.device,
+                inode: fingerprint.inode,
+                size: fingerprint.size,
+                modified_seconds: fingerprint.modified_seconds,
+                modified_nanoseconds: fingerprint.modified_nanoseconds,
+                mode: fingerprint.mode,
+            },
+            home: sandbox_home(),
+            data_dir: sandbox_data_dir(),
+            sandbox_port,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ScienceExecutableFingerprint {
     device: u64,

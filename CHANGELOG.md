@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.6.0] — 2026-07-16
+
+### Added
+
+- Added local `.zip` / `.skill` import through the desktop file picker, using the same bounded package validation, atomic commit, and native OPERON attachment as the GitHub route.
+- Added bundle manifests, transaction journals, complete affected-Skill confirmation, and whole-bundle quarantine. Partial physical deletion is intentionally unsupported.
+- Added single-request GitHub download progress, a fixed-commit tree/raw fallback when the archive stream cannot complete safely, terminal bridge responses, and interrupted-request recovery after a Gateway restart.
+
+### Changed
+
+- Repeated installation of the same verified fixed commit reuses every member without another download and reports `REUSED_VERIFIED` per Skill.
+- Legacy v0.5.0 external-Skill routes migrate to the combined connector without discarding user MCP entries or unknown configuration fields.
+- Bundle attachment and detachment use one OPERON batch update followed by a read-back of all affected Skills.
+
+### Safety and upgrade notes
+
+- GitHub installation never auto-retries or creates a replacement request after a terminal response. Request, status, and `.processing` files are cleared after success, failure, timeout, or restart recovery.
+- Version 0.6.0 keeps the v2 profile format and reuses the existing isolated Science data-dir. It does not write SQLite, inventory, catalog, or the removed Skill Manager.
+- The release remains Apple Silicon only, ad-hoc signed, and not notarized. Public GitHub availability and provider tool-use quality remain external dependencies.
+
 ## [0.5.0] — 2026-07-14
 
 ### Added

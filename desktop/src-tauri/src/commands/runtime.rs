@@ -237,7 +237,7 @@ fn start_proxy_inner_cmd<R: tauri::Runtime>(
     lifecycle.with_serialized(|| {
         let trace = OperationTrace::start(OperationKind::StartProxy, "command=start_proxy");
         let (port, _secret, _action) =
-            ensure_proxy(&app, &state, lifecycle.as_ref(), Some(&trace))?;
+            ensure_proxy(&app, &state, lifecycle.as_ref(), None, Some(&trace))?;
         trace.finish(format!("ok port={port}"));
         Ok(json!({ "port": port }))
     })

@@ -1,4 +1,5 @@
 use std::fs::{self, File, OpenOptions};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -81,6 +82,7 @@ pub(crate) fn configure_skill_install_host(
     data_dir: &Path,
     secret: &str,
     launch_id: &str,
+    science_context: Option<&csswitch_skill_install_core::ScienceHostContext>,
 ) -> Result<(), String> {
     let bridge_dir = skill_install_bridge_dir(secret)?;
     let bridge_token = skill_install_bridge_token(secret, launch_id)?;
@@ -88,7 +90,26 @@ pub(crate) fn configure_skill_install_host(
     cmd.env("CSSWITCH_SKILL_DATA_DIR", data_dir)
         .env("CSSWITCH_SKILL_BRIDGE_DIR", bridge_dir)
         .env("CSSWITCH_SKILL_BRIDGE_TOKEN", bridge_token);
+    if let Some(context) = science_context {
+        let encoded = serde_json::to_string(context)
+            .map_err(|_| "无法编码 Science Skill attach host context")?;
+        cmd.env("CSSWITCH_SCIENCE_HOST_CONTEXT", encoded);
+    } else {
+        cmd.env_remove("CSSWITCH_SCIENCE_HOST_CONTEXT");
+    }
     Ok(())
+}
+
+fn proxy_fingerprint_with_science_context(
+    base: u64,
+    context: Option<&csswitch_skill_install_core::ScienceHostContext>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    base.hash(&mut hasher);
+    serde_json::to_vec(&context)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 fn skill_install_bridge_token(secret: &str, launch_id: &str) -> Result<String, String> {
@@ -313,6 +334,7 @@ pub(crate) fn ensure_proxy<R: Runtime>(
     app: &tauri::AppHandle<R>,
     state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
+    science_runtime: Option<&crate::runtime::science::ScienceRuntimeIdentity>,
     trace: Option<&OperationTrace>,
 ) -> Result<(u16, String, ProxyAction), String> {
     let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
@@ -320,7 +342,7 @@ pub(crate) fn ensure_proxy<R: Runtime>(
         .active_profile()
         .cloned()
         .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
-    start_proxy_for(app, state, lifecycle, &profile, trace)
+    start_proxy_for(app, state, lifecycle, &profile, science_runtime, trace)
 }
 
 /// Start or reuse a proxy for a specific profile, without reading the active profile.
@@ -331,6 +353,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
     state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
     profile: &config::Profile,
+    science_runtime: Option<&crate::runtime::science::ScienceRuntimeIdentity>,
     trace: Option<&OperationTrace>,
 ) -> Result<(u16, String, ProxyAction), String> {
     assert_format_supported(profile)?;
@@ -350,10 +373,36 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 
     let shim_mode = current_shim_mode_for_adapter(&launch.adapter);
     let gateway_kind = "rust";
-    let key_fp = proxy_fingerprint_with_runtime(profile, &launch, gateway_kind, shim_mode);
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
     let port = cfg.proxy_port;
+    let science_context = match science_runtime {
+        Some(runtime) => Some(runtime.skill_install_host_context(cfg.sandbox_port)?),
+        None => {
+            let remembered = {
+                let st = lock(state);
+                st.science_runtime.clone().map(|runtime| {
+                    let port = if st.sandbox_port == 0 {
+                        cfg.sandbox_port
+                    } else {
+                        st.sandbox_port
+                    };
+                    (runtime, port)
+                })
+            };
+            remembered.and_then(|(runtime, sandbox_port)| {
+                (sandbox_port == cfg.sandbox_port
+                    && crate::runtime::science::probe_known_runtime(sandbox_port, &runtime)
+                        == crate::runtime::science::SandboxScienceState::RunningHealthy)
+                    .then(|| runtime.skill_install_host_context(sandbox_port).ok())
+                    .flatten()
+            })
+        }
+    };
+    let key_fp = proxy_fingerprint_with_science_context(
+        proxy_fingerprint_with_runtime(profile, &launch, gateway_kind, shim_mode),
+        science_context.as_ref(),
+    );
 
     let secret = if !cfg.secret.is_empty() {
         cfg.secret.clone()
@@ -464,6 +513,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             &crate::runtime::science::sandbox_home().join(".claude-science"),
             &secret,
             &launch_id,
+            science_context.as_ref(),
         )
         .is_ok();
         for (k, v) in formal_proxy_env(&launch) {

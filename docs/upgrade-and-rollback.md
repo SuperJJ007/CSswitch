@@ -4,4 +4,4 @@
 
 See [docs/operations/upgrade-and-rollback.md](operations/upgrade-and-rollback.md).
 
-此兼容指针计划保留到 v0.5.0 之后的下一个正式发布。
+v0.6.0 继续保留此兼容入口；正文只在新路径维护。

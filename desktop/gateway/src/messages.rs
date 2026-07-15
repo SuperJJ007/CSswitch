@@ -476,6 +476,7 @@ mod tests {
             skill_data_dir: None,
             skill_bridge_dir: None,
             skill_bridge_token: None,
+            science_host_context: None,
         }
     }
 

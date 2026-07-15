@@ -1,6 +1,6 @@
 # CSSwitch 架构总览
 
-本文是 v0.5.0 当前架构合同，只保留产品边界、所有权、数据流和失败边界。版本固定的调查结果见[证据目录](../evidence/README.md)。
+本文是 v0.6.0 当前架构合同，只保留产品边界、所有权、数据流和失败边界。版本固定的调查结果见[证据目录](../evidence/README.md)。
 
 ## 产品边界
 
@@ -10,7 +10,7 @@ CSSwitch 是 Claude Science 的 provider 配置转换器、本地 inference gate
 - 管理 Rust CSSwitch Gateway 生命周期；
 - 准备隔离登录状态并复用持久 Science data-dir；
 - 选择、启动、复用、打开和停止正确的 Science runtime；
-- 提供两个窄范围可选 bridge：公开 GitHub 外部 Skill 安装 / 隔离卸载，以及显式授权的系统 SSH 配置复用。
+- 提供两个窄范围可选 bridge：准确公开 GitHub URL 与主面板本地 `.zip` / `.skill` 的外部 Skill 安装、整包确认卸载，以及显式授权的系统 SSH 配置复用。
 
 Science 仍拥有项目、组织、原生 Skills、runtime 资源、Agent 绑定与升级。CSSwitch 不模拟 Anthropic OAuth / catalog，也不扩展成 Skill Manager、Science 下载器或远程访问服务。外部 Skill bridge 失败不阻断一键启动；系统 SSH 默认关闭，但用户一旦启用，其 config / wrapper 安全校验就是 fail-closed 启动条件。
 
@@ -37,6 +37,7 @@ CSSwitch profile
 | 持久 Science 状态 | `~/.csswitch/sandbox/home/.claude-science` | Science |
 | 版本 runtime 资源 | `<data-dir>/runtime/<version>/` | Science |
 | 组织与 Skills | `<data-dir>/orgs/<active-org>/...` | Science 组织 |
+| 外部 Skill bundle manifest / journal | `~/.csswitch/sandbox/skill-bundles/<org>/` | CSSwitch |
 | provider capability 元数据 | `catalog/capabilities.v1.json` | CSSwitch |
 | v0.4.2 / v0.4.3 legacy Skill store / inventory | 原样保留但不参与当前 runtime | 非当前运行路径 |
 
@@ -58,7 +59,7 @@ CSSwitch profile
 
 ### 外部 Skill bridge
 
-一个 bundled routing Skill 将安装 / 卸载请求送到合并 connector；host worker 只把用户批准的公开 GitHub Skill 写入 active org，或隔离带 CSSwitch ownership marker 的导入。Science 原生 `attach_skill` / `detach_skill` 和 `skill()` 决定 Agent 可用性。详见[功能合同](../features/external-skill-bridge.md)。
+一个 bundled routing Skill 将安装 / 卸载请求送到合并 connector。GitHub 路线只接受准确的公开 URL，本地路线只接受用户在系统 picker 中选择的 `.zip` / `.skill`；共享 package core 负责结构识别、限额、路径安全、摘要与原子提交。单 Skill 使用原生绑定与回读，bundle 批量绑定直接成员并保留 `_shared` 等支持资源。bundle 从任意成员发起卸载时必须先返回完整受影响 Skill 清单和整包确认，确认后才批量解绑并整包隔离，不提供成员级物理删除。所有操作都只针对 active org 且不覆盖同名目录，CSSwitch ownership 由 marker、路径摘要和 bundle manifest 证明，不写 Science 数据库。详见[功能合同](../features/external-skill-bridge.md)。
 
 ### 系统 SSH bridge
 

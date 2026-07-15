@@ -37,16 +37,14 @@ class SkillRuntimeBoundary(unittest.TestCase):
 
     def test_gateway_starts_only_after_config_and_science_state_prechecks(self):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
-        state_check = session.index("let remembered_runtime =")
+        state_check = session.index("let (remembered_runtime, confirmed_stopped)")
         self.assertLess(session.index("config::load_from(&dir)"), state_check)
         self.assertNotIn("ensure_proxy(", session[:state_check])
 
         runtime_selection = session.index("let launch_runtime: ScienceRuntimeIdentity")
         self.assertGreater(runtime_selection, state_check)
         launch_check = session.index("if !launch.is_file()")
-        normal_proxy = session.index(
-            "let (pport, secret, proxy_action) = ensure_proxy", state_check
-        )
+        normal_proxy = session.index("let (pport, secret, proxy_action) =", state_check)
         self.assertGreater(normal_proxy, launch_check)
 
     def test_launcher_never_clones_or_implicitly_selects_data_dir_runtime(self):
@@ -155,7 +153,8 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertNotIn("localStorage", js)
         self.assertIn("runtime_choice: Option<String>", runtime)
         self.assertIn("choice == Some(CACHED_ONCE_CHOICE)", science)
-        self.assertIn("safe_science_version(app_bin)", science)
+        self.assertIn("fn safe_science_version(path: &Path)", science)
+        self.assertIn("version_cache.version(app_bin)", science)
         self.assertIn('"cached_choice_required"', science)
 
     def test_science_runtime_identity_is_reused_for_serve_status_url_and_stop(self):
@@ -166,7 +165,8 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn('.env("CSSWITCH_PROXY_URL", &proxy_url)', session)
         self.assertNotIn('.arg(&proxy_url)', session)
         self.assertIn("st.science_runtime = Some(launch_runtime.clone())", session)
-        self.assertIn("sandbox_running_ours(sport, &launch_runtime)", session)
+        self.assertIn("probe_known_runtime(sport, &runtime)", session)
+        self.assertIn("sandbox_listener_matches_runtime(sport, &launch_runtime)", session)
         self.assertIn("sandbox_url(sport, &launch_runtime)", session)
         self.assertIn('.env("SCIENCE_BIN", &runtime.path)', science)
         self.assertIn('"source": runtime.source.code()', runtime)

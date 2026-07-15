@@ -272,6 +272,7 @@ fn run_boot_coordinator(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             run_boot_coordinator(app.clone());
@@ -299,6 +300,7 @@ pub fn run() {
             commands::runtime::status,
             commands::runtime::boot_error,
             commands::runtime::open_url,
+            commands::skill_install::install_local_skill_package,
             commands::diagnostics::run_doctor,
             commands::diagnostics::app_version,
             commands::diagnostics::open_release_page,

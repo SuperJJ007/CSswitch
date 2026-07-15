@@ -190,11 +190,22 @@ class ExternalSkillInstallBridge(unittest.TestCase):
             tools = responses[1]["result"]["tools"]
             self.assertEqual(
                 [tool["name"] for tool in tools],
-                ["install_external_skill", "uninstall_external_skill"],
+                [
+                    "install_external_skill",
+                    "uninstall_external_skill",
+                    "poll_external_skill_request",
+                ],
             )
             description = tools[0]["description"]
             self.assertIn("host.skills.edit", description)
             self.assertIn("host.skills.publish", description)
+            uninstall = tools[1]
+            self.assertIn(
+                "BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED", uninstall["description"]
+            )
+            self.assertIn(
+                "confirm_bundle_id", uninstall["inputSchema"]["properties"]
+            )
             payload = responses[2]["result"]["structuredContent"]
             self.assertEqual(payload["status"], "NEED_SOURCE_URL")
             self.assertFalse(payload["directory_commit"])
@@ -235,7 +246,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
             self.assertIn("host.skills.edit/publish", payload["message"])
             self.assertEqual(list(bridge_dir.iterdir()), [])
 
-    def test_scoped_uninstaller_connector_exposes_only_uninstall(self):
+    def test_scoped_uninstaller_connector_exposes_uninstall_and_poll(self):
         binary = gateway_bin()
         if not binary.is_file():
             self.skipTest("csswitch-gateway binary not built")
@@ -269,7 +280,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
             )
             self.assertEqual(
                 [tool["name"] for tool in responses[1]["result"]["tools"]],
-                ["uninstall_external_skill"],
+                ["uninstall_external_skill", "poll_external_skill_request"],
             )
 
     def test_url_request_requires_official_host_access_without_direct_write(self):
@@ -343,6 +354,10 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         self.assertNotIn('"csswitch-skill-uninstaller"', route)
         self.assertIn("Never call `host.skills.delete`", route)
         self.assertIn("manual filesystem deletion", route)
+        self.assertIn("BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED", route)
+        self.assertIn("complete `affected_skill_names` list", route)
+        self.assertIn("confirm_bundle_id=bundle_id", route)
+        self.assertIn("never confirm on the user's\nbehalf", route)
         self.assertIn("There is no\n   default or hard-coded Skill name", route)
         self.assertNotIn("internal-comms", route)
 

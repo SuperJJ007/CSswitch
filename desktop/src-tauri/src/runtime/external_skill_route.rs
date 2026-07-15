@@ -4,12 +4,27 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub(crate) const SKILL_NAME: &str = "csswitch-external-skill-tools";
 const IMPORT_ORIGIN_FILE: &str = ".import-origin";
 const MARKETPLACE: &str = "csswitch-system-bridge";
 const SKILL_BODY: &str =
     include_str!("../../resources/skills/csswitch-external-skill-tools/SKILL.md");
+const LEGACY_SPLIT_CONNECTORS_SHA256: &str =
+    "a4f6700a69ce83664cb620791362a5f380455113e0231a8ec6f39db12c16e269";
+const LEGACY_REVISION_2_SHA256: &str =
+    "867c11ff6d738326cb66a34583f3eff5eba58ead4ea40fb3f4a2b6e7242b6cee";
+const LEGACY_SINGLE_SKILL_REVISION_SHA256: &str =
+    "04d46b508ea682eda4e3f3cfd95ca1f7743213620f82dc3a10f5f09001f39999";
+const LEGACY_BUNDLE_PRE_PROGRESS_SHA256: &str =
+    "4bdff8f40a18af106a88f1489ae409b9c4df2ba24762fe806fd7f4152979da31";
+const LEGACY_BUNDLE_PROGRESS_V1_SHA256: &str =
+    "60555234c2b6aa63ce263f6ce09e9cfad09b4b16f923ec2d4331fb856eb3078c";
+const LEGACY_BUNDLE_PROGRESS_V2_SHA256: &str =
+    "bc13e93dda04d54faa6b81518ad306283b5f55b40c4da587faec1ca8d4a922ae";
+const LEGACY_BUNDLE_NO_UNINSTALL_CONFIRMATION_SHA256: &str =
+    "9c80e2c45f2471f408df8d18eee6746a29adc7f51e07212102636ba46273a29e";
 
 /// Atomically install the tiny CSSwitch routing Skill into the active org.
 ///
@@ -20,6 +35,10 @@ pub(crate) fn ensure_route_skill(data_dir: &Path) -> Result<bool, String> {
     if target.exists() || fs::symlink_metadata(&target).is_ok() {
         if route_skill_matches(&target)? {
             return Ok(false);
+        }
+        if legacy_route_skill_matches(&target)? {
+            migrate_legacy_route_body(&target)?;
+            return Ok(true);
         }
         return Err(format!(
             "Skill '{SKILL_NAME}' 已存在且不是当前 CSSwitch 路由，已拒绝覆盖"
@@ -129,7 +148,43 @@ fn route_skill_matches(target: &Path) -> Result<bool, String> {
     if fs::read(&body_path).ok().as_deref() != Some(SKILL_BODY.as_bytes()) {
         return Ok(false);
     }
-    let marker: Value = match fs::read(&marker_path)
+    route_marker_matches(&marker_path)
+}
+
+fn legacy_route_skill_matches(target: &Path) -> Result<bool, String> {
+    reject_symlink_path(target)?;
+    if !fs::metadata(target)
+        .map_err(|e| format!("检查旧路由 Skill 失败：{e}"))?
+        .is_dir()
+    {
+        return Ok(false);
+    }
+    let body_path = target.join("SKILL.md");
+    let marker_path = target.join(IMPORT_ORIGIN_FILE);
+    reject_symlink_path(&body_path)?;
+    reject_symlink_path(&marker_path)?;
+    let body = match fs::read(&body_path) {
+        Ok(body) => body,
+        Err(_) => return Ok(false),
+    };
+    let digest = format!("{:x}", Sha256::digest(&body));
+    if !matches!(
+        digest.as_str(),
+        LEGACY_SPLIT_CONNECTORS_SHA256
+            | LEGACY_REVISION_2_SHA256
+            | LEGACY_SINGLE_SKILL_REVISION_SHA256
+            | LEGACY_BUNDLE_PRE_PROGRESS_SHA256
+            | LEGACY_BUNDLE_PROGRESS_V1_SHA256
+            | LEGACY_BUNDLE_PROGRESS_V2_SHA256
+            | LEGACY_BUNDLE_NO_UNINSTALL_CONFIRMATION_SHA256
+    ) {
+        return Ok(false);
+    }
+    route_marker_matches(&marker_path)
+}
+
+fn route_marker_matches(marker_path: &Path) -> Result<bool, String> {
+    let marker: Value = match fs::read(marker_path)
         .ok()
         .and_then(|body| serde_json::from_slice(&body).ok())
     {
@@ -149,6 +204,24 @@ fn route_skill_matches(target: &Path) -> Result<bool, String> {
             .and_then(Value::as_str)
             .is_some_and(|value| !value.is_empty())
         && marker.get("license").and_then(Value::as_str) == Some("MIT"))
+}
+
+fn migrate_legacy_route_body(target: &Path) -> Result<(), String> {
+    let body_path = target.join("SKILL.md");
+    reject_symlink_path(&body_path)?;
+    let temporary = target.join(format!(".SKILL.md.csswitch-{}", unique_suffix()));
+    let result = (|| -> Result<(), String> {
+        write_new_file(&temporary, SKILL_BODY.as_bytes())?;
+        fs::rename(&temporary, &body_path)
+            .map_err(|error| format!("升级 CSSwitch 路由 Skill 失败：{error}"))?;
+        File::open(target)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("同步 CSSwitch 路由 Skill 升级失败：{error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn reject_symlink_path(path: &Path) -> Result<(), String> {
@@ -298,10 +371,10 @@ mod tests {
         (root, data)
     }
 
-    fn write_managed_route(data: &Path) -> PathBuf {
+    fn write_managed_route_with_body(data: &Path, body: &[u8]) -> PathBuf {
         let target = route_skill_path(data).unwrap();
         fs::create_dir(&target).unwrap();
-        fs::write(target.join("SKILL.md"), SKILL_BODY).unwrap();
+        fs::write(target.join("SKILL.md"), body).unwrap();
         fs::write(
             target.join(IMPORT_ORIGIN_FILE),
             serde_json::to_vec(&json!({
@@ -318,6 +391,22 @@ mod tests {
         )
         .unwrap();
         target
+    }
+
+    fn write_managed_route(data: &Path) -> PathBuf {
+        write_managed_route_with_body(data, SKILL_BODY.as_bytes())
+    }
+
+    fn route_before_bundle_uninstall_confirmation() -> String {
+        let current = std::str::from_utf8(SKILL_BODY.as_bytes()).unwrap();
+        let confirmation_protocol = "If the result is `BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED`, do not call any\nuninstall or detach tool again yet. Show the user the returned `bundle_name`\nand complete `affected_skill_names` list, explain that the operation is\nwhole-bundle only, and ask for an explicit confirm or cancel decision. If the\nuser cancels, stop without another tool call. If the user explicitly confirms,\ncall the same tool once more with the same `skill_name` and the exact returned\n`bundle_id` as `confirm_bundle_id`:\n\n```python\nhost.mcp(\n    \"csswitch-skill-installer\",\n    \"uninstall_external_skill\",\n    skill_name=skill_name,\n    confirm_bundle_id=bundle_id,\n)\n```\n\nThe confirmed call re-finds and re-verifies the installed bundle. If it returns\na new `BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED`, show the new membership and ask\nagain. Never infer or retain an older bundle ID, never confirm on the user's\nbehalf, and never offer partial physical deletion of bundle members.\n\n";
+        let current_result = "For single-Skill uninstall, follow the native detach step explicitly returned\nby the connector, then verify that `skill(skill_name)` no longer loads. A\n`BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED` result is non-mutating and requires the\nexplicit two-step flow above. A `BUNDLE_UNINSTALLED_DETACHED` result already\nmeans the entire owning bundle was batch-detached and quarantined; do not detach\nits members again. Report every response faithfully.";
+        let prior_result = "For single-Skill uninstall, follow the native detach step explicitly returned\nby the connector, then verify that `skill(skill_name)` no longer loads. A\n`BUNDLE_UNINSTALLED_DETACHED` result already means the entire owning bundle was\nbatch-detached and quarantined; do not detach its members again. Report every\nresponse faithfully.";
+        assert!(current.contains(confirmation_protocol));
+        assert!(current.contains(current_result));
+        current
+            .replace(confirmation_protocol, "")
+            .replace(current_result, prior_result)
     }
 
     #[test]
@@ -345,6 +434,126 @@ mod tests {
         fs::write(target.join("SKILL.md"), b"modified").unwrap();
         assert!(ensure_route_skill(&data).is_err());
         assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), b"modified");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_only_exact_revision_two_managed_route() {
+        let (root, data) = test_data("migrate-revision-two");
+        let legacy = include_bytes!(
+            "../../resources/skills/csswitch-external-skill-tools/legacy-revision2.md"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(legacy)),
+            LEGACY_REVISION_2_SHA256
+        );
+        let target = write_managed_route_with_body(&data, legacy);
+        assert!(ensure_route_skill(&data).unwrap());
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            SKILL_BODY.as_bytes()
+        );
+        assert!(!ensure_route_skill(&data).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_exact_split_connector_managed_route() {
+        let (root, data) = test_data("migrate-split-connectors");
+        let legacy = include_bytes!(
+            "../../resources/skills/csswitch-external-skill-tools/legacy-split-connectors.md"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(legacy)),
+            LEGACY_SPLIT_CONNECTORS_SHA256
+        );
+        let target = write_managed_route_with_body(&data, legacy);
+        assert!(ensure_route_skill(&data).unwrap());
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            SKILL_BODY.as_bytes()
+        );
+        assert!(!ensure_route_skill(&data).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_exact_bundle_route_before_progress_protocol() {
+        let (root, data) = test_data("migrate-bundle-pre-progress");
+        let legacy = include_bytes!(
+            "../../resources/skills/csswitch-external-skill-tools/legacy-bundle-pre-progress.md"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(legacy)),
+            LEGACY_BUNDLE_PRE_PROGRESS_SHA256
+        );
+        let target = write_managed_route_with_body(&data, legacy);
+        assert!(ensure_route_skill(&data).unwrap());
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            SKILL_BODY.as_bytes()
+        );
+        assert!(!ensure_route_skill(&data).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_exact_bundle_route_before_fast_polling_protocol() {
+        let (root, data) = test_data("migrate-bundle-progress-v1");
+        let legacy = include_bytes!(
+            "../../resources/skills/csswitch-external-skill-tools/legacy-bundle-progress-v1.md"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(legacy)),
+            LEGACY_BUNDLE_PROGRESS_V1_SHA256
+        );
+        let target = write_managed_route_with_body(&data, legacy);
+        assert!(ensure_route_skill(&data).unwrap());
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            SKILL_BODY.as_bytes()
+        );
+        assert!(!ensure_route_skill(&data).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_exact_bundle_route_before_gateway_long_polling() {
+        let (root, data) = test_data("migrate-bundle-progress-v2");
+        let current = route_before_bundle_uninstall_confirmation();
+        let poll_protocol = "For `HOST_ACCESS_REQUIRED`, submit the returned `request.payload` exactly once\nunder its original request ID. Then use `poll_external_skill_request` with that\nsame `request_id`; omit `last_sequence` on the first call, and pass the previous\n`PROCESSING.sequence` on later calls. The polling tool waits inside the gateway\nand returns bounded `phase`, heartbeat timestamps, elapsed time, and\n`deadline_at`, or the final response. Do not read the bridge files repeatedly,\nrun `sleep`, or start a shell/Python polling loop. Never write the request again\nand never call the install/uninstall tool again merely because a bundle is still\ndownloading. Success, failure, timeout, and interrupted-host recovery all arrive\nas a final response after `.processing` is cleared.";
+        let prior_protocol = "For `HOST_ACCESS_REQUIRED`, submit the returned `request.payload` exactly once\nunder its original request ID. Immediately try that ID's `response_filename`;\nif it is absent, read `status_filename`: `PROCESSING` includes a bounded\n`phase`, heartbeat timestamps, elapsed time, and `deadline_at`. Poll only the\nsame response filename. Do not run a dedicated `sleep` command or a long-running\nshell/Python polling loop; every poll must be one quick file read. Never write\nthe request again and never call the MCP tool again merely because a bundle is\nstill downloading. Success, failure, timeout, and interrupted-host recovery all\narrive as a final response after `.processing` is cleared.";
+        assert!(current.contains(poll_protocol));
+        let legacy = current.replace(poll_protocol, prior_protocol);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(legacy.as_bytes())),
+            LEGACY_BUNDLE_PROGRESS_V2_SHA256
+        );
+        let target = write_managed_route_with_body(&data, legacy.as_bytes());
+        assert!(ensure_route_skill(&data).unwrap());
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            SKILL_BODY.as_bytes()
+        );
+        assert!(!ensure_route_skill(&data).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_exact_bundle_route_before_uninstall_confirmation() {
+        let (root, data) = test_data("migrate-bundle-uninstall-confirmation");
+        let legacy = route_before_bundle_uninstall_confirmation();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(legacy.as_bytes())),
+            LEGACY_BUNDLE_NO_UNINSTALL_CONFIRMATION_SHA256
+        );
+        let target = write_managed_route_with_body(&data, legacy.as_bytes());
+        assert!(ensure_route_skill(&data).unwrap());
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            SKILL_BODY.as_bytes()
+        );
+        assert!(!ensure_route_skill(&data).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

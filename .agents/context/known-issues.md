@@ -1,16 +1,16 @@
 # 当前已知问题与证据缺口
 
-最后整理：2026-07-14。已解决历史放入 CHANGELOG 或 dated evidence，不在这里堆叠。
+最后整理：2026-07-16。已解决历史放入 CHANGELOG 或 dated evidence，不在这里堆叠。
 
 ## 分发
 
-- v0.5.0 最终 DMG 只有 ad-hoc 签名，没有 Developer ID 团队身份、notarization 或 stapled ticket；Gatekeeper 主签名评估拒绝。首次打开可能需要用户右键选择“打开”。
+- v0.6.0 沿用 ad-hoc 分发链路，没有 Developer ID 团队身份、notarization 或 stapled ticket；最终 DMG 发布后仍需逐项记录 Gatekeeper 结果。首次打开可能需要用户右键选择“打开”。
 
 ## Science / Skill
 
-- 外部 Skill bridge 的最后一层已安装 CSSwitch App 人工 UI 确认尚未建立；2026-07-13 E2E 使用隔离环境、local mock provider 与公开 GitHub 内容。
+- 发布者报告 v0.6.0 大部分真机验收成功，但未留下逐项结构化日志，不能外推为完整矩阵全部通过。
 - 安装、attach、load 与重启持久化不证明任一 Skill 的脚本、资产、网络、依赖或领域功能可用。
-- 仅给名称时的来源搜索由 provider / Agent 能力决定；私有仓库、更新 / 覆盖、永久删除和恢复 UI 不受支持。
+- 仅给名称时的来源搜索由 provider / Agent 能力决定；私有仓库、更新 / 覆盖、永久删除、恢复 UI 和 bundle 成员级物理删除不受支持。
 - route attachment 与 `host.agents.attach_skill` 等是观察到的 Science 合同；Science App 更新后必须重跑聚焦兼容性验证。
 - Agent 控制面配置是多个顺序请求，不是原子事务；失败只降级为 warning，但已经完成的 route / connector / `customize` / prompt 步骤不会自动回滚。
 
@@ -20,4 +20,4 @@
 
 ## 测试
 
-- 真机验收矩阵不是 v0.5.0 已全部执行的声明。每次验收应按 artifact 和环境另存证据，不把“需真机”记为通过。
+- 真机验收矩阵不是 v0.6.0 已全部执行的声明。每次验收应按 artifact 和环境另存证据，不把“需真机”或“大部分成功”记为逐项全部通过。

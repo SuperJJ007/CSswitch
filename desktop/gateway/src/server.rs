@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,15 @@ use crate::{
 };
 
 const BRIDGE_REPLAY_WINDOW_SECONDS: u64 = 185;
+const BRIDGE_HEARTBEAT_SECONDS: u64 = 2;
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct BridgeProgress {
+    phase: String,
+    message: String,
+    sequence: u64,
+}
 
 struct RequestHead {
     method: String,
@@ -803,9 +812,212 @@ fn handle_post(
 }
 
 #[cfg(unix)]
+fn valid_bridge_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(unix)]
+fn acquire_bridge_host_lock(bridge: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let lock_path = bridge.join(".csswitch-host.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err("refusing unsafe Skill bridge host lock".into());
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err("Skill bridge already has an active host".into());
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn bridge_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(unix)]
+fn bridge_operation_timeout(operation: &str) -> u64 {
+    if operation == "install" {
+        crate::skill_install::BRIDGE_INSTALL_RESPONSE_TIMEOUT_SECONDS
+    } else {
+        60
+    }
+}
+
+#[cfg(unix)]
+fn write_bridge_status(
+    bridge: &std::path::Path,
+    id: &str,
+    operation: &str,
+    started_at: u64,
+    timeout_seconds: u64,
+    progress: &BridgeProgress,
+) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let now = bridge_now();
+    let payload = json!({
+        "schema_version": csswitch_skill_install_core::SCHEMA_VERSION,
+        "status": "PROCESSING",
+        "request_id": id,
+        "operation": operation,
+        "phase": progress.phase,
+        "message": progress.message,
+        "sequence": progress.sequence,
+        "started_at": started_at,
+        "updated_at": now,
+        "elapsed_seconds": now.saturating_sub(started_at),
+        "timeout_seconds": timeout_seconds,
+        "deadline_at": started_at.saturating_add(timeout_seconds),
+        "terminal_grace_seconds": 5,
+        "poll_after_seconds": 3,
+        "response_filename": format!("{id}.response.json")
+    });
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = bridge.join(format!(
+        ".{id}.status.{}.{}.{}.tmp",
+        std::process::id(),
+        progress.sequence,
+        nonce
+    ));
+    let target = bridge.join(format!("{id}.status.json"));
+    let _ = std::fs::remove_file(&temp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut file, &payload).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    std::fs::rename(&temp, &target).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        error.to_string()
+    })
+}
+
+#[cfg(unix)]
+fn bridge_final_response_exists(path: &std::path::Path) -> Result<bool, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o077 == 0 =>
+        {
+            Ok(true)
+        }
+        Ok(_) => Err("invalid existing Skill bridge response".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn write_bridge_response_once(
+    bridge: &std::path::Path,
+    id: &str,
+    response: &Value,
+) -> Result<bool, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let target = bridge.join(format!("{id}.response.json"));
+    if bridge_final_response_exists(&target)? {
+        return Ok(false);
+    }
+    let temp = bridge.join(format!(".{id}.response.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut file, response).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    let linked = match std::fs::hard_link(&temp, &target) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.to_string());
+        }
+    };
+    std::fs::remove_file(&temp).map_err(|error| error.to_string())?;
+    Ok(linked)
+}
+
+#[cfg(unix)]
+fn cleanup_bridge_processing(bridge: &std::path::Path, id: &str) {
+    let _ = std::fs::remove_file(bridge.join(format!("{id}.processing")));
+    let _ = std::fs::remove_file(bridge.join(format!("{id}.status.json")));
+}
+
+#[cfg(unix)]
+fn finalize_bridge_processing(
+    bridge: &std::path::Path,
+    id: &str,
+    response: &Value,
+) -> Result<(), String> {
+    write_bridge_response_once(bridge, id, response)?;
+    cleanup_bridge_processing(bridge, id);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn recover_orphaned_bridge_processing(bridge: &std::path::Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(bridge).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_suffix(".processing") else {
+            continue;
+        };
+        if !valid_bridge_id(id) {
+            continue;
+        }
+        let response = json!({
+            "schema_version": csswitch_skill_install_core::SCHEMA_VERSION,
+            "status": "REQUEST_INTERRUPTED",
+            "request_id": id,
+            "retryable": true,
+            "request_terminal": true,
+            "automatic_retry_allowed": false,
+            "directory_commit": null,
+            "attach_state": "UNKNOWN",
+            "restart_required": false,
+            "message": "CSSwitch 在处理该请求期间中断。宿主已清理遗留 .processing；请重新调用相同工具，让 CSSwitch 验证真实落盘和绑定状态后安全恢复。"
+        });
+        finalize_bridge_processing(bridge, id, &response)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn start_skill_install_bridge(cfg: &GatewayConfig) -> Result<(), String> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
     let (Some(bridge), Some(data_dir), Some(bridge_token)) = (
         &cfg.skill_bridge_dir,
@@ -840,10 +1052,14 @@ fn start_skill_install_bridge(cfg: &GatewayConfig) -> Result<(), String> {
     if metadata.uid() != unsafe { libc::geteuid() } {
         return Err("refusing Skill install bridge owned by another user".into());
     }
+    let host_lock = acquire_bridge_host_lock(bridge)?;
+    recover_orphaned_bridge_processing(bridge)?;
     let bridge = bridge.clone();
     let data_dir = data_dir.clone();
     let bridge_token = bridge_token.clone();
+    let science_host_context = cfg.science_host_context.clone();
     thread::spawn(move || {
+        let _host_lock = host_lock;
         let mut used_request_ids = HashMap::new();
         loop {
             let entries = match std::fs::read_dir(&bridge) {
@@ -855,21 +1071,105 @@ fn start_skill_install_bridge(cfg: &GatewayConfig) -> Result<(), String> {
                 let Some(id) = name.strip_suffix(".request.json") else {
                     continue;
                 };
-                if id.len() != 32
-                    || !id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-                {
+                if !valid_bridge_id(id) {
                     continue;
                 }
                 let processing = bridge.join(format!("{id}.processing"));
                 if std::fs::rename(entry.path(), &processing).is_err() {
                     continue;
                 }
-                let response = read_regular_bridge_request(&processing)
+                let target = bridge.join(format!("{id}.response.json"));
+                match bridge_final_response_exists(&target) {
+                    Ok(true) => {
+                        cleanup_bridge_processing(&bridge, id);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("Skill bridge refused existing response for {id}: {error}");
+                        let progress = BridgeProgress {
+                            phase: "finalization_failed".into(),
+                            message:
+                                "检测到非法的既有最终响应；请求未执行，.processing 已保留供安全恢复"
+                                    .into(),
+                            sequence: 0,
+                        };
+                        let _ = write_bridge_status(
+                            &bridge,
+                            id,
+                            "unknown",
+                            bridge_now(),
+                            bridge_operation_timeout("unknown"),
+                            &progress,
+                        );
+                        continue;
+                    }
+                }
+                let request = read_regular_bridge_request(&processing)
                     .ok()
-                    .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
-                    .map_or_else(bridge_request_failed, |request| {
+                    .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
+                let operation = request
+                    .as_ref()
+                    .and_then(|request| request.get("operation"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let started_at = bridge_now();
+                let timeout_seconds = bridge_operation_timeout(&operation);
+                let progress = Arc::new(Mutex::new(BridgeProgress {
+                    phase: "accepted".into(),
+                    message: "宿主已接收唯一请求，正在开始处理".into(),
+                    sequence: 0,
+                }));
+                if let Ok(snapshot) = progress.lock() {
+                    let _ = write_bridge_status(
+                        &bridge,
+                        id,
+                        &operation,
+                        started_at,
+                        timeout_seconds,
+                        &snapshot,
+                    );
+                }
+                let (stop_tx, stop_rx) = mpsc::channel();
+                let heartbeat_bridge = bridge.clone();
+                let heartbeat_id = id.to_string();
+                let heartbeat_operation = operation.clone();
+                let heartbeat_progress = Arc::clone(&progress);
+                let heartbeat = thread::spawn(move || loop {
+                    match stop_rx.recv_timeout(Duration::from_secs(BRIDGE_HEARTBEAT_SECONDS)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Ok(snapshot) = heartbeat_progress.lock() {
+                                let _ = write_bridge_status(
+                                    &heartbeat_bridge,
+                                    &heartbeat_id,
+                                    &heartbeat_operation,
+                                    started_at,
+                                    timeout_seconds,
+                                    &snapshot,
+                                );
+                            }
+                        }
+                    }
+                });
+                let mut report_progress = |phase: &str, message: &str| {
+                    if let Ok(mut state) = progress.lock() {
+                        state.phase = phase.to_string();
+                        state.message = message.to_string();
+                        state.sequence = state.sequence.saturating_add(1);
+                        let _ = write_bridge_status(
+                            &bridge,
+                            id,
+                            &operation,
+                            started_at,
+                            timeout_seconds,
+                            &state,
+                        );
+                    }
+                };
+                let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    request.map_or_else(bridge_request_failed, |request| {
                         if crate::skill_install::validate_bridge_request(
                             &bridge_token,
                             id,
@@ -883,34 +1183,43 @@ fn start_skill_install_bridge(cfg: &GatewayConfig) -> Result<(), String> {
                                     .get("issued_at")
                                     .and_then(Value::as_u64)
                                     .unwrap_or_default(),
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
+                                bridge_now(),
                             )
                         {
                             bridge_request_failed()
                         } else {
-                            crate::skill_install::handle_bridge_request(&data_dir, &request)
+                            crate::skill_install::handle_bridge_request_with_progress(
+                                &data_dir,
+                                science_host_context.as_ref(),
+                                &request,
+                                &mut report_progress,
+                            )
                         }
-                    });
-                let temp = bridge.join(format!(".{id}.response.tmp"));
-                let target = bridge.join(format!("{id}.response.json"));
-                let written = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&temp)
-                    .and_then(|mut file| {
-                        serde_json::to_writer(&mut file, &response)
-                            .map_err(std::io::Error::other)?;
-                        file.sync_all()
                     })
-                    .and_then(|_| std::fs::rename(&temp, &target));
-                if written.is_err() {
-                    let _ = std::fs::remove_file(&temp);
+                }))
+                .unwrap_or_else(|_| bridge_request_internal_failed());
+                let _ = stop_tx.send(());
+                let _ = heartbeat.join();
+                match finalize_bridge_processing(&bridge, id, &response) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        eprintln!("Skill bridge final response write failed for {id}: {error}");
+                        let snapshot = BridgeProgress {
+                            phase: "finalization_failed".into(),
+                            message: "最终响应写入失败；.processing 已保留，gateway 重启后会恢复"
+                                .into(),
+                            sequence: u64::MAX,
+                        };
+                        let _ = write_bridge_status(
+                            &bridge,
+                            id,
+                            &operation,
+                            started_at,
+                            timeout_seconds,
+                            &snapshot,
+                        );
+                    }
                 }
-                let _ = std::fs::remove_file(&processing);
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -979,9 +1288,22 @@ fn read_regular_bridge_request(path: &std::path::Path) -> Result<Vec<u8>, String
 #[cfg(unix)]
 fn bridge_request_failed() -> Value {
     json!({
+        "schema_version": csswitch_skill_install_core::SCHEMA_VERSION,
         "status":"REQUEST_FAILED",
         "message":"本地 Skill 请求非法或已处理",
         "directory_commit":false,
+        "restart_required":false
+    })
+}
+
+#[cfg(unix)]
+fn bridge_request_internal_failed() -> Value {
+    json!({
+        "schema_version": csswitch_skill_install_core::SCHEMA_VERSION,
+        "status":"REQUEST_FAILED",
+        "message":"本地 Skill 请求处理异常；宿主已停止该请求，可安全重试相同工具",
+        "retryable":true,
+        "directory_commit":null,
         "restart_required":false
     })
 }
@@ -1023,9 +1345,6 @@ fn handle_one(
 }
 
 pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
-    if let Err(error) = start_skill_install_bridge(&cfg) {
-        eprintln!("Skill install host unavailable (gateway continues): {error}");
-    }
     let request_nonces = if cfg.provider == "deepseek" && cfg.shim_mode == "rewrite" {
         Some(Arc::new(RequestNonceGenerator::new()?))
     } else {
@@ -1033,6 +1352,9 @@ pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
     };
     let relay_models = Arc::new(models::RelayModelCache::default());
     let listener = TcpListener::bind(("127.0.0.1", cfg.port)).map_err(|e| e.to_string())?;
+    if let Err(error) = start_skill_install_bridge(&cfg) {
+        eprintln!("Skill install host unavailable (gateway continues): {error}");
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -1057,7 +1379,11 @@ mod tests {
     use serde_json::{json, Map, Value};
 
     #[cfg(unix)]
-    use super::{bridge_request_is_replay, read_regular_bridge_request};
+    use super::{
+        acquire_bridge_host_lock, bridge_request_is_replay, finalize_bridge_processing,
+        read_regular_bridge_request, recover_orphaned_bridge_processing,
+        write_bridge_response_once, write_bridge_status, BridgeProgress,
+    };
     use super::{
         forward_stream_body, stream_error_event, KimiServerToolFilter, RequestNonceGenerator,
         StreamFilter, StreamTermination,
@@ -1084,6 +1410,118 @@ mod tests {
         assert!(bridge_request_is_replay(&mut used, "first", 100, 101));
         assert!(!bridge_request_is_replay(&mut used, "second", 286, 286));
         assert_eq!(used.len(), 1, "expired replay ids must not grow forever");
+    }
+
+    #[cfg(unix)]
+    fn bridge_temp_dir(label: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "csswitch-bridge-{label}-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_status_has_bounded_heartbeat_contract() {
+        let bridge = bridge_temp_dir("status");
+        let id = "1".repeat(32);
+        let progress = BridgeProgress {
+            phase: "download".into(),
+            message: "downloading".into(),
+            sequence: 4,
+        };
+        write_bridge_status(&bridge, &id, "install", 100, 1_800, &progress).unwrap();
+        let status: Value = serde_json::from_slice(
+            &std::fs::read(bridge.join(format!("{id}.status.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["status"], "PROCESSING");
+        assert_eq!(status["phase"], "download");
+        assert_eq!(status["sequence"], 4);
+        assert_eq!(status["deadline_at"], 1_900);
+        assert_eq!(status["poll_after_seconds"], 3);
+        std::fs::remove_dir_all(bridge).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_finalization_cleans_processing_for_success_failure_and_timeout() {
+        let bridge = bridge_temp_dir("finalize");
+        for (digit, status) in [
+            ('2', "BUNDLE_INSTALLED_ATTACHED"),
+            ('3', "INSTALL_FAILED"),
+            ('4', "GITHUB_TIMEOUT"),
+        ] {
+            let id = digit.to_string().repeat(32);
+            std::fs::write(bridge.join(format!("{id}.processing")), b"{}").unwrap();
+            std::fs::write(bridge.join(format!("{id}.status.json")), b"{}").unwrap();
+            finalize_bridge_processing(&bridge, &id, &json!({"status": status})).unwrap();
+            assert!(!bridge.join(format!("{id}.processing")).exists());
+            assert!(!bridge.join(format!("{id}.status.json")).exists());
+            let response: Value = serde_json::from_slice(
+                &std::fs::read(bridge.join(format!("{id}.response.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(response["status"], status);
+        }
+        std::fs::remove_dir_all(bridge).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_bridge_id_never_overwrites_first_final_response() {
+        let bridge = bridge_temp_dir("duplicate");
+        let id = "5".repeat(32);
+        assert!(write_bridge_response_once(&bridge, &id, &json!({"status":"FIRST"})).unwrap());
+        assert!(!write_bridge_response_once(&bridge, &id, &json!({"status":"SECOND"})).unwrap());
+        let response: Value = serde_json::from_slice(
+            &std::fs::read(bridge.join(format!("{id}.response.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["status"], "FIRST");
+        std::fs::remove_dir_all(bridge).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_restart_recovers_orphaned_processing_to_final_response() {
+        let bridge = bridge_temp_dir("recover");
+        let id = "6".repeat(32);
+        std::fs::write(bridge.join(format!("{id}.processing")), b"{}").unwrap();
+        std::fs::write(bridge.join(format!("{id}.status.json")), b"{}").unwrap();
+        recover_orphaned_bridge_processing(&bridge).unwrap();
+        assert!(!bridge.join(format!("{id}.processing")).exists());
+        assert!(!bridge.join(format!("{id}.status.json")).exists());
+        let response: Value = serde_json::from_slice(
+            &std::fs::read(bridge.join(format!("{id}.response.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["status"], "REQUEST_INTERRUPTED");
+        assert_eq!(response["retryable"], true);
+        assert_eq!(response["request_terminal"], true);
+        assert_eq!(response["automatic_retry_allowed"], false);
+        assert_eq!(response["attach_state"], "UNKNOWN");
+        std::fs::remove_dir_all(bridge).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_host_lock_allows_only_one_recovery_owner() {
+        let bridge = bridge_temp_dir("host-lock");
+        let first = acquire_bridge_host_lock(&bridge).unwrap();
+        assert!(acquire_bridge_host_lock(&bridge).is_err());
+        drop(first);
+        let second = acquire_bridge_host_lock(&bridge).unwrap();
+        drop(second);
+        std::fs::remove_dir_all(bridge).unwrap();
     }
 
     #[cfg(unix)]

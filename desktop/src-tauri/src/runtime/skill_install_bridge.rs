@@ -15,7 +15,7 @@ const UNINSTALL_SERVER_NAME: &str = "csswitch-skill-uninstaller";
 const MANAGED_MARKER: &str = "[managed-by:csswitch]";
 const ROUTE_STATE_FILE: &str = ".csswitch-route-state.json";
 const ROUTE_STATE_SCHEMA: u64 = 1;
-const ROUTE_POLICY_REVISION: u64 = 2;
+const ROUTE_POLICY_REVISION: u64 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RegistrationStatus {
@@ -213,7 +213,7 @@ fn registration_inputs<R: Runtime>(
         "command": command,
         "args": ["skill-install-mcp", "--bridge-dir", bridge],
         "env": {"CSSWITCH_SKILL_BRIDGE_KEY_FILE": bridge_key_file},
-        "description": format!("安装或卸载外部 Skill；install/import/add an external public GitHub Skill with install_external_skill, or remove a CSSwitch-imported Skill with uninstall_external_skill. Do not use host.skills.*. {MANAGED_MARKER}")
+        "description": format!("安装或卸载外部 Skill；pass the exact public GitHub Skill directory URL to install_external_skill. CSSwitch downloads, validates, commits, and attaches OPERON; the Agent must then call skill(skill_name). Do not download, use shell, host.skills.*, catalog, Skill Manager, or host.agents.attach_skill. Use uninstall_external_skill for removal. {MANAGED_MARKER}")
     })];
     Ok((config, expected))
 }

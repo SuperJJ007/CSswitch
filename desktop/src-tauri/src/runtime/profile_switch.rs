@@ -149,8 +149,8 @@ pub(crate) fn set_active_profile_txn(
     };
 
     lifecycle.bump_generation();
-    let real_healthy =
-        scratch_ok && start_proxy_for(app, state, lifecycle, &candidate, Some(&trace)).is_ok();
+    let real_healthy = scratch_ok
+        && start_proxy_for(app, state, lifecycle, &candidate, None, Some(&trace)).is_ok();
 
     match decide_switch(scratch_ok, real_healthy) {
         SwitchOutcome::Commit => {
@@ -230,7 +230,7 @@ fn restore_proxy_for_active(
     match cfg.profile_by_id(old_active) {
         Some(old) => {
             lifecycle.bump_generation();
-            start_proxy_for(app, state, lifecycle, old, trace).is_ok()
+            start_proxy_for(app, state, lifecycle, old, None, trace).is_ok()
         }
         None => false,
     }

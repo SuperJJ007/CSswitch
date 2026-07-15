@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use super::{merge_registrations, INSTALL_SERVER_NAME, MANAGED_MARKER};
 use crate::runtime::external_skill_route::ensure_route_skill;
 
-const INSTALL_URL: &str = "https://github.com/anthropics/skills/tree/main/skills/internal-comms";
+const INSTALL_COMMIT: &str = "84abf02d42612ab0b94a54de1a1a454ae25dd131";
+const INSTALL_URL: &str = "https://github.com/michaelboeding/skills/tree/84abf02d42612ab0b94a54de1a1a454ae25dd131/skills/style-guide";
 
 fn temp_dir(label: &str) -> PathBuf {
     let suffix = SystemTime::now()
@@ -158,6 +159,8 @@ impl MockProvider {
         let port = listener.local_addr().unwrap().port();
         let observation = Arc::new(Mutex::new(Observation::default()));
         let thread_observation = observation.clone();
+        let request_cache = Arc::new(Mutex::new(None));
+        let thread_request_cache = request_cache.clone();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_shutdown = shutdown.clone();
         let worker = thread::spawn(move || {
@@ -205,6 +208,7 @@ impl MockProvider {
                             &value,
                             stream_requested,
                             &thread_observation,
+                            &thread_request_cache,
                             &bridge_dir,
                         );
                         write_http_response(&mut stream, response.0, &response.1);
@@ -309,6 +313,7 @@ fn route_model_request(
     value: &Value,
     stream_requested: bool,
     observation: &Arc<Mutex<Observation>>,
+    request_cache: &Arc<Mutex<Option<Value>>>,
     bridge_dir: &str,
 ) -> (&'static str, Vec<u8>) {
     if !stream_requested {
@@ -324,29 +329,32 @@ fn route_model_request(
         .and_then(|message| message.get("content"));
     let last_is_tool_result =
         last_content.is_some_and(|content| json_has_type(content, "tool_result"));
-    let recent_tool_result = latest_tool_result(value);
     let restart_validation = observation
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .restart_validation;
-    let restart_prompt = json_contains(
-        value,
-        "请加载并使用 internal-comms Skill 做一次无副作用检查",
-    );
+    let restart_prompt = json_contains(value, "请加载并使用 style-guide Skill 做一次无副作用检查");
     // The conversation retains earlier prompts. A newer uninstall request must
     // take precedence over the persisted restart-validation message.
-    if json_contains(value, "请卸载 internal-comms") {
-        return route_uninstall_request(value, observation, bridge_dir);
+    if json_contains(value, "请卸载 style-guide") {
+        return route_uninstall_request(value, observation, request_cache, bridge_dir);
     }
     if restart_validation && restart_prompt {
-        if let Some(result) = recent_tool_result {
-            let loaded = json_contains(result, "<skill-metadata name=\"internal-comms\"")
-                && !json_contains(result, "Unknown skill")
-                && !json_contains(result, "partially unavailable");
+        if json_contains(
+            value,
+            "<skill-metadata name=\"style-guide\" source=\"imported\"",
+        ) {
             let mut locked = observation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            locked.skill_loaded_after_restart = loaded;
+            locked.skill_loaded_after_restart = true;
+            return ("text/event-stream", terminal_sse());
+        }
+        if json_contains(value, "Unknown skill") || json_contains(value, "partially unavailable") {
+            let mut locked = observation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            locked.skill_loaded_after_restart = false;
             return ("text/event-stream", terminal_sse());
         }
         let mut locked = observation
@@ -358,11 +366,29 @@ fn route_model_request(
             tool_use_sse(
                 "skill",
                 &json!({
-                    "skill": "internal-comms",
+                    "skill": "style-guide",
                     "human_description": "Verifying persisted Skill"
                 }),
             ),
         );
+    }
+    let verification_pending = observation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .attach_called;
+    if verification_pending
+        && json_contains(
+            value,
+            "<skill-metadata name=\"style-guide\" source=\"imported\"",
+        )
+    {
+        let mut locked = observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        locked.skill_loaded_after_attach = true;
+        locked.tool_result_count += 1;
+        collect_tool_use_names(value, &mut locked.invoked_tools);
+        return ("text/event-stream", terminal_sse());
     }
     let has_installer_docs = json_contains(value, "host.mcp(\"csswitch-skill-installer\"")
         && json_contains(value, "install_external_skill");
@@ -371,6 +397,8 @@ fn route_model_request(
     if last_is_tool_result {
         let last = last_content.expect("checked above");
         if json_contains(last, "HOST_ACCESS_REQUIRED") {
+            remember_host_access_request(value, request_cache)
+                .expect("signed install host-access payload");
             let host_path = bridge_dir.to_string();
             let mut locked = observation
                 .lock()
@@ -384,8 +412,22 @@ fn route_model_request(
                 ),
             );
         }
+        if json_contains(last, "\"granted\":false") {
+            let mut locked = observation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            locked.url_failure_seen = true;
+            collect_tool_use_names(value, &mut locked.invoked_tools);
+            return ("text/event-stream", terminal_sse());
+        }
         if json_contains(last, "guestPath") && json_contains(last, "granted") {
-            let id = format!("{}-999", std::process::id());
+            let request = remember_host_access_grant(value, request_cache)
+                .expect("signed install host-access payload");
+            let filename = request["request"]["filename"]
+                .as_str()
+                .expect("install request filename");
+            let payload = &request["request"]["payload"];
+            let guest_path = request["guest_path"].as_str().expect("install guest path");
             let mut locked = observation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -395,12 +437,9 @@ fn route_model_request(
                 tool_use_sse(
                     "edit_file",
                     &json!({
-                        "file_path": Path::new(bridge_dir).join(format!("{id}.request.json")),
+                        "file_path": Path::new(guest_path).join(filename),
                         "old_string": "",
-                        "new_string": serde_json::to_string(&json!({
-                            "operation": "install",
-                            "arguments": {"source_url": INSTALL_URL}
-                        })).unwrap()
+                        "new_string": serde_json::to_string(payload).unwrap()
                     }),
                 ),
             );
@@ -409,71 +448,76 @@ fn route_model_request(
             || json_contains(last, "File not found")
             || json_contains(last, "not accessible")
         {
-            let id = format!("{}-999", std::process::id());
+            let request = remembered_host_access_request(value, request_cache)
+                .expect("install host-access payload");
+            let response_filename = request["request"]["response_filename"]
+                .as_str()
+                .expect("install response filename");
+            let guest_path = request["guest_path"].as_str().expect("install guest path");
             let mut locked = observation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             locked.invoked_tools.push("read_file".into());
+            drop(locked);
+            thread::sleep(Duration::from_secs(1));
             return (
                 "text/event-stream",
                 tool_use_sse(
                     "read_file",
-                    &json!({"file_path": Path::new(bridge_dir).join(format!("{id}.response.json"))}),
+                    &json!({"file_path": Path::new(guest_path).join(response_filename)}),
                 ),
             );
         }
-        if json_contains(last, "FILES_COMMITTED_ATTACH_REQUIRED") {
+        if json_contains(last, "INSTALLED_ATTACHED_VERIFY_REQUIRED") {
             let mut locked = observation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             locked.url_status_seen = true;
             locked.attach_called = true;
-            locked.invoked_tools.push("repl".into());
-            return (
-                "text/event-stream",
-                tool_use_sse(
-                    "repl",
-                    &json!({
-                        "code": "result = host.agents.attach_skill(\"OPERON\", \"internal-comms\")\nprint(result)",
-                        "human_description": "Attaching imported Skill"
-                    }),
-                ),
-            );
-        }
-        if json_contains(value, "Verifying attached Skill") {
-            let loaded = !json_contains(last, "Unknown skill")
-                && !json_contains(last, "partially unavailable");
-            let mut locked = observation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            locked.skill_loaded_after_attach = loaded;
-            locked.tool_result_count += 1;
-            collect_tool_use_names(value, &mut locked.invoked_tools);
-            return ("text/event-stream", terminal_sse());
-        }
-        if json_contains(value, "Attaching imported Skill") {
-            let mut locked = observation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
             locked.invoked_tools.push("skill".into());
             return (
                 "text/event-stream",
                 tool_use_sse(
                     "skill",
                     &json!({
-                        "skill": "internal-comms",
+                        "skill": "style-guide",
                         "human_description": "Verifying attached Skill"
                     }),
                 ),
             );
         }
-        if json_contains(last, "NEED_SOURCE_URL") || json_contains(last, "INSTALL_FAILED") {
+        let verification_result =
+            json_contains(last, "Unknown skill") || json_contains(last, "partially unavailable");
+        if verification_pending && verification_result {
+            let mut locked = observation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            locked.skill_loaded_after_attach = false;
+            locked.tool_result_count += 1;
+            collect_tool_use_names(value, &mut locked.invoked_tools);
+            return ("text/event-stream", terminal_sse());
+        }
+        let structured_failure = [
+            "INSTALL_FAILED",
+            "GITHUB_",
+            "UNSUPPORTED_SHARED_DEPENDENCY",
+            "SKILL_NAME_CONFLICT",
+            "INSTALLED_CONTENT_CHANGED",
+            "LEGACY_INTEGRITY_UNVERIFIED",
+            "SOURCE_REF_REQUIRES_COMMIT_SHA",
+            "SCIENCE_NOT_READY",
+            "FILES_COMMITTED_ATTACH_REQUIRED",
+            "ATTACH_STATE_UNCERTAIN",
+        ]
+        .iter()
+        .any(|status| json_contains(last, status));
+        if json_contains(last, "NEED_SOURCE_URL") || structured_failure {
             let mut locked = observation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             locked.tool_result_count += 1;
             locked.name_only_status_seen |= json_contains(last, "NEED_SOURCE_URL");
-            locked.url_failure_seen |= json_contains(last, "INSTALL_FAILED");
+            locked.url_failure_seen |= structured_failure;
             collect_tool_use_names(value, &mut locked.invoked_tools);
             return ("text/event-stream", terminal_sse());
         }
@@ -518,6 +562,7 @@ fn route_model_request(
 fn route_uninstall_request(
     value: &Value,
     observation: &Arc<Mutex<Observation>>,
+    request_cache: &Arc<Mutex<Option<Value>>>,
     bridge_dir: &str,
 ) -> (&'static str, Vec<u8>) {
     let last_content = value
@@ -556,7 +601,7 @@ fn route_uninstall_request(
                 tool_use_sse(
                     "skill",
                     &json!({
-                        "skill": "internal-comms",
+                        "skill": "style-guide",
                         "human_description": "Verifying uninstalled Skill"
                     }),
                 ),
@@ -574,13 +619,15 @@ fn route_uninstall_request(
                 tool_use_sse(
                     "repl",
                     &json!({
-                        "code": "result = host.agents.detach_skill(\"OPERON\", \"internal-comms\")\nprint(result)",
+                        "code": "result = host.agents.detach_skill(\"OPERON\", \"style-guide\")\nprint(result)",
                         "human_description": "Detaching quarantined Skill"
                     }),
                 ),
             );
         }
         if json_contains(last, "HOST_ACCESS_REQUIRED") {
+            remember_host_access_request(value, request_cache)
+                .expect("signed uninstall host-access payload");
             let mut locked = observation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -594,7 +641,15 @@ fn route_uninstall_request(
             );
         }
         if json_contains(last, "guestPath") && json_contains(last, "granted") {
-            let id = format!("{}-998", std::process::id());
+            let request = remember_host_access_grant(value, request_cache)
+                .expect("signed uninstall host-access payload");
+            let filename = request["request"]["filename"]
+                .as_str()
+                .expect("uninstall request filename");
+            let payload = &request["request"]["payload"];
+            let guest_path = request["guest_path"]
+                .as_str()
+                .expect("uninstall guest path");
             let mut locked = observation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -604,12 +659,9 @@ fn route_uninstall_request(
                 tool_use_sse(
                     "edit_file",
                     &json!({
-                        "file_path": Path::new(bridge_dir).join(format!("{id}.request.json")),
+                        "file_path": Path::new(guest_path).join(filename),
                         "old_string": "",
-                        "new_string": serde_json::to_string(&json!({
-                            "operation": "uninstall",
-                            "arguments": {"skill_name": "internal-comms"}
-                        })).unwrap()
+                        "new_string": serde_json::to_string(payload).unwrap()
                     }),
                 ),
             );
@@ -618,16 +670,25 @@ fn route_uninstall_request(
             || json_contains(last, "File not found")
             || json_contains(last, "not accessible")
         {
-            let id = format!("{}-998", std::process::id());
+            let request = remembered_host_access_request(value, request_cache)
+                .expect("uninstall host-access payload");
+            let response_filename = request["request"]["response_filename"]
+                .as_str()
+                .expect("uninstall response filename");
+            let guest_path = request["guest_path"]
+                .as_str()
+                .expect("uninstall guest path");
             let mut locked = observation
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             locked.invoked_tools.push("read_file".into());
+            drop(locked);
+            thread::sleep(Duration::from_secs(1));
             return (
                 "text/event-stream",
                 tool_use_sse(
                     "read_file",
-                    &json!({"file_path": Path::new(bridge_dir).join(format!("{id}.response.json"))}),
+                    &json!({"file_path": Path::new(guest_path).join(response_filename)}),
                 ),
             );
         }
@@ -643,7 +704,7 @@ fn route_uninstall_request(
                 tool_use_sse(
                     "repl",
                     &json!({
-                        "code": "result = host.mcp(\"csswitch-skill-installer\", \"uninstall_external_skill\", skill_name=\"internal-comms\")\nprint(result)",
+                        "code": "import json\nresult = host.mcp(\"csswitch-skill-installer\", \"uninstall_external_skill\", skill_name=\"style-guide\")\nprint(json.dumps(result, ensure_ascii=False))",
                         "human_description": "Uninstalling external Skill"
                     }),
                 ),
@@ -680,7 +741,7 @@ fn route_uninstall_request(
             tool_use_sse(
                 "repl",
                 &json!({
-                    "code": "result = host.mcp(\"csswitch-skill-installer\", \"uninstall_external_skill\", skill_name=\"internal-comms\")\nprint(result)",
+                    "code": "import json\nresult = host.mcp(\"csswitch-skill-installer\", \"uninstall_external_skill\", skill_name=\"style-guide\")\nprint(json.dumps(result, ensure_ascii=False))",
                     "human_description": "Uninstalling external Skill"
                 }),
             ),
@@ -723,10 +784,10 @@ fn route_uninstall_request(
 fn repl_tool_sse(source_url: bool) -> Vec<u8> {
     let code = if source_url {
         format!(
-            "result = host.mcp(\"csswitch-skill-installer\", \"install_external_skill\", source_url={INSTALL_URL:?})\nprint(result)"
+            "import json\nresult = host.mcp(\"csswitch-skill-installer\", \"install_external_skill\", source_url={INSTALL_URL:?})\nprint(json.dumps(result, ensure_ascii=False))"
         )
     } else {
-        "result = host.mcp(\"csswitch-skill-installer\", \"install_external_skill\", skill_name=\"internal-comms\")\nprint(result)".to_string()
+        "import json\nresult = host.mcp(\"csswitch-skill-installer\", \"install_external_skill\", skill_name=\"style-guide\")\nprint(json.dumps(result, ensure_ascii=False))".to_string()
     };
     tool_use_sse(
         "repl",
@@ -758,20 +819,168 @@ fn latest_tool_result(value: &Value) -> Option<&Value> {
         .find(|content| json_has_type(content, "tool_result"))
 }
 
+fn find_json_payload_with_status(value: &Value, status: &str) -> Option<Value> {
+    match value {
+        Value::String(text) => {
+            let parsed: Value = serde_json::from_str(text).ok()?;
+            (parsed.get("status").and_then(Value::as_str) == Some(status))
+                .then_some(parsed.clone())
+                .or_else(|| find_json_payload_with_status(&parsed, status))
+        }
+        Value::Array(values) => values
+            .iter()
+            .rev()
+            .find_map(|value| find_json_payload_with_status(value, status)),
+        Value::Object(values) => (values.get("status").and_then(Value::as_str) == Some(status))
+            .then(|| value.clone())
+            .or_else(|| {
+                values
+                    .values()
+                    .find_map(|value| find_json_payload_with_status(value, status))
+            }),
+        _ => None,
+    }
+}
+
+fn remember_host_access_request(
+    value: &Value,
+    request_cache: &Arc<Mutex<Option<Value>>>,
+) -> Option<Value> {
+    let request = find_json_payload_with_status(value, "HOST_ACCESS_REQUIRED")?;
+    *request_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(request.clone());
+    Some(request)
+}
+
+fn remembered_host_access_request(
+    value: &Value,
+    request_cache: &Arc<Mutex<Option<Value>>>,
+) -> Option<Value> {
+    remember_host_access_request(value, request_cache).or_else(|| {
+        request_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    })
+}
+
+fn remember_host_access_grant(
+    value: &Value,
+    request_cache: &Arc<Mutex<Option<Value>>>,
+) -> Option<Value> {
+    let guest_path = find_string_field(value, "guestPath")?;
+    let mut request = remembered_host_access_request(value, request_cache)?;
+    request["guest_path"] = Value::String(guest_path);
+    *request_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(request.clone());
+    Some(request)
+}
+
+fn find_string_field(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .rev()
+            .find_map(|value| find_string_field(value, key)),
+        Value::Object(values) => values
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                values
+                    .values()
+                    .find_map(|value| find_string_field(value, key))
+            }),
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|value| find_string_field(&value, key)),
+        _ => None,
+    }
+}
+
 #[test]
 fn finds_tool_result_before_science_third_party_safety_notice() {
     let transcript = json!({
         "messages": [
             {"role":"assistant","content":[{"type":"tool_use","name":"skill"}]},
-            {"role":"user","content":[{"type":"tool_result","content":"<skill-metadata name=\"internal-comms\" />"}]},
+            {"role":"user","content":[{"type":"tool_result","content":"<skill-metadata name=\"style-guide\" />"}]},
             {"role":"user","content":[{"type":"text","text":"[System] third-party authored"}]}
         ]
     });
     let result = latest_tool_result(&transcript).expect("missing recent tool result");
     assert!(json_contains(
         result,
-        "<skill-metadata name=\"internal-comms\""
+        "<skill-metadata name=\"style-guide\""
     ));
+}
+
+#[test]
+fn keeps_signed_host_access_payload_across_pruned_model_rounds() {
+    let cache = Arc::new(Mutex::new(None));
+    let payload = json!({
+        "status": "HOST_ACCESS_REQUIRED",
+        "request": {"filename": "request.json", "payload": {"signature": "test"}}
+    });
+    let signed = json!({"content": serde_json::to_string(&json!({
+        "stdout": format!("{}\n", serde_json::to_string(&payload).unwrap())
+    }))
+    .unwrap()});
+    let remembered = remember_host_access_request(&signed, &cache).unwrap();
+    assert_eq!(remembered["request"]["filename"], "request.json");
+
+    let pruned = json!({"content": "{\"granted\":true,\"guestPath\":\"/tmp/bridge\"}"});
+    let recovered = remembered_host_access_request(&pruned, &cache).unwrap();
+    assert_eq!(recovered["request"]["filename"], "request.json");
+
+    let grant = json!({"content": "{\"granted\":true,\"guestPath\":\"/host/bridge\"}"});
+    let with_grant = remember_host_access_grant(&grant, &cache).unwrap();
+    assert_eq!(with_grant["guest_path"], "/host/bridge");
+    let recovered =
+        remembered_host_access_request(&json!({"content": "not found"}), &cache).unwrap();
+    assert_eq!(recovered["guest_path"], "/host/bridge");
+}
+
+#[test]
+fn recognizes_attached_skill_metadata_without_human_description() {
+    let observation = Arc::new(Mutex::new(Observation {
+        attach_called: true,
+        ..Observation::default()
+    }));
+    let request_cache = Arc::new(Mutex::new(None));
+    let transcript = json!({
+        "stream": true,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "content": "<skill-metadata name=\"style-guide\" source=\"imported\" />"
+                }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "content": "unrelated asynchronous result"
+                }]
+            }
+        ]
+    });
+    let _ = route_model_request(
+        &transcript,
+        true,
+        &observation,
+        &request_cache,
+        "/tmp/bridge",
+    );
+    assert!(
+        observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .skill_loaded_after_attach
+    );
 }
 
 fn json_contains(value: &Value, expected: &str) -> bool {
@@ -1021,25 +1230,36 @@ fn science_url(guard: &ScienceGuard) -> Result<String, String> {
 }
 
 fn configure_third_party_via_control(guard: &ScienceGuard, gateway: &Path) -> Result<(), String> {
-    let control_url = science_url(guard)?;
-    let mut command = safe_command(gateway, &guard.sandbox_home, &guard.safe_bin);
-    command
-        .arg("science-control")
-        .arg("configure-third-party")
-        .env("CSSWITCH_SCIENCE_CONTROL_URL", control_url);
-    let output = output_with_timeout(&mut command, Duration::from_secs(10))?;
-    if !output.status.success() {
-        return Err(format!(
-            "路由 Skill 控制面绑定失败：{}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+    let mut last_error = "Science 第三方能力配置未执行".to_string();
+    for _ in 0..3 {
+        let attempt = (|| -> Result<(), String> {
+            let control_url = science_url(guard)?;
+            let mut command = safe_command(gateway, &guard.sandbox_home, &guard.safe_bin);
+            command
+                .arg("science-control")
+                .arg("configure-third-party")
+                .env("CSSWITCH_SCIENCE_CONTROL_URL", control_url);
+            let output = output_with_timeout(&mut command, Duration::from_secs(10))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "路由 Skill 控制面绑定失败：{}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            let value: Value = serde_json::from_slice(&output.stdout)
+                .map_err(|error| format!("路由 Skill 控制面响应非法：{error}"))?;
+            if value.get("status").and_then(Value::as_str) != Some("CONFIGURED") {
+                return Err("Science 第三方能力配置未返回 CONFIGURED".into());
+            }
+            Ok(())
+        })();
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
+        }
+        thread::sleep(Duration::from_millis(500));
     }
-    let value: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("路由 Skill 控制面响应非法：{error}"))?;
-    if value.get("status").and_then(Value::as_str) != Some("CONFIGURED") {
-        return Err("Science 第三方能力配置未返回 CONFIGURED".into());
-    }
-    Ok(())
+    Err(last_error)
 }
 
 fn open_chat(guard: &mut ScienceGuard) -> Result<String, String> {
@@ -1123,13 +1343,19 @@ fn wait_round(
     provider: &MockProvider,
     predicate: impl Fn(&Observation) -> bool,
 ) -> Observation {
-    for attempt in 0..900 {
+    // A production GitHub install can spend up to 45 seconds on each of the
+    // validated redirect and archive requests before returning a timeout.
+    for attempt in 0..1200 {
         let observation = provider.snapshot();
         if predicate(&observation) {
             return observation;
         }
         if attempt % 20 == 0 {
             if let Ok(current) = snapshot(guard) {
+                assert!(
+                    !current.contains("database temporarily unavailable"),
+                    "isolated Science database entered its fail-closed wedge state"
+                );
                 if current.contains("button \"Allow for project\"") {
                     click(guard, &current, "button \"Allow for project\"").unwrap();
                 } else if current.contains("button \"Allow\"") {
@@ -1262,7 +1488,7 @@ fn wait_log_contains(path: &Path, needle: &str) {
 #[test]
 #[ignore = "explicit installed Science local-MCP dialogue E2E; temp HOME/data-dir, public GitHub, local mock/browser only"]
 fn isolated_science_installs_attaches_and_persists_external_skill() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     assert_eq!(
         std::env::var("CSSWITCH_REAL_SCIENCE_SKILL_INSTALL_MCP_E2E").as_deref(),
@@ -1285,6 +1511,52 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     assert!(ensure_route_skill(&data_dir).unwrap());
     assert!(!ensure_route_skill(&data_dir).unwrap());
 
+    let science_bin = std::env::var_os("CSSWITCH_REAL_SCIENCE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/Applications/Claude Science.app/Contents/Resources/bin/claude-science")
+        })
+        .canonicalize()
+        .expect("canonical installed Science binary");
+    let playwright = std::env::var_os("CSSWITCH_PLAYWRIGHT_CLI")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/Users/superjj/.codex/skills/playwright/scripts/playwright_cli.sh")
+        });
+    assert!(science_bin.is_file());
+    assert!(playwright.is_file());
+    let mut version_command = safe_command(&science_bin, &sandbox_home, &safe_bin);
+    version_command.arg("--version");
+    let version_output = output_with_timeout(&mut version_command, Duration::from_secs(10))
+        .expect("read installed Science version");
+    assert!(version_output.status.success());
+    let science_version = String::from_utf8(version_output.stdout).unwrap();
+    assert!(science_version.starts_with("claude-science "));
+    let science_version_token = science_version
+        .split_whitespace()
+        .nth(1)
+        .expect("Science --version token")
+        .to_string();
+    let port = free_port();
+    let sandbox_port = free_port();
+    assert_ne!(port, sandbox_port);
+    let metadata = fs::metadata(&science_bin).unwrap();
+    let science_context = csswitch_skill_install_core::ScienceHostContext {
+        binary: science_bin.clone(),
+        version: science_version_token,
+        fingerprint: csswitch_skill_install_core::ScienceExecutableFingerprint {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            mode: metadata.mode(),
+        },
+        home: sandbox_home.clone(),
+        data_dir: data_dir.clone(),
+        sandbox_port: port,
+    };
+
     let gateway = std::env::var_os("CSSWITCH_E2E_GATEWAY_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -1304,8 +1576,17 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     .unwrap();
     fs::write(&bridge_key, format!("{bridge_token}\n")).unwrap();
     fs::set_permissions(&bridge_key, fs::Permissions::from_mode(0o600)).unwrap();
+    let bridge_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        & 0xffff_ffff_ffff;
     let install_bridge =
-        outer_home.join(format!("CSSwitch-Skill-Bridge-e2e-{}", std::process::id()));
+        PathBuf::from(std::env::var_os("HOME").expect("real user HOME")).join(format!(
+            "CSSwitch-Skill-Bridge-e2e-{}-{bridge_suffix:012x}",
+            std::process::id()
+        ));
+    assert!(!install_bridge.exists());
     let provider = MockProvider::start(install_bridge.to_string_lossy().into_owned());
     let gateway_child = Command::new(&gateway)
         .arg("--provider")
@@ -1318,6 +1599,10 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
         .env("CSSWITCH_SKILL_DATA_DIR", &data_dir)
         .env("CSSWITCH_SKILL_BRIDGE_DIR", &install_bridge)
         .env("CSSWITCH_SKILL_BRIDGE_TOKEN", bridge_token)
+        .env(
+            "CSSWITCH_SCIENCE_HOST_CONTEXT",
+            serde_json::to_string(&science_context).unwrap(),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             File::create(root.join("gateway.stderr.log")).unwrap(),
@@ -1342,31 +1627,6 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     });
     assert!(merge_registrations(&config, vec![installer]).unwrap());
 
-    let science_bin = std::env::var_os("CSSWITCH_REAL_SCIENCE_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("/Applications/Claude Science.app/Contents/Resources/bin/claude-science")
-        })
-        .canonicalize()
-        .expect("canonical installed Science binary");
-    let playwright = std::env::var_os("CSSWITCH_PLAYWRIGHT_CLI")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("/Users/superjj/.codex/skills/playwright/scripts/playwright_cli.sh")
-        });
-    assert!(science_bin.is_file());
-    assert!(playwright.is_file());
-    let mut version_command = safe_command(&science_bin, &sandbox_home, &safe_bin);
-    version_command.arg("--version");
-    let version_output = output_with_timeout(&mut version_command, Duration::from_secs(10))
-        .expect("read installed Science version");
-    assert!(version_output.status.success());
-    let science_version = String::from_utf8(version_output.stdout).unwrap();
-    assert!(science_version.starts_with("claude-science "));
-
-    let port = free_port();
-    let sandbox_port = free_port();
-    assert_ne!(port, sandbox_port);
     let science_stderr = root.join("science.stderr.log");
     let child = spawn_science(
         &science_bin,
@@ -1440,18 +1700,28 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     let installed = data_dir
         .join("orgs")
         .join(&login.org_uuid)
-        .join("skills/internal-comms");
+        .join("skills/style-guide");
     assert!(installed.join("SKILL.md").is_file());
     let import_origin: Value = serde_json::from_slice(
         &fs::read(installed.join(".import-origin")).expect("missing import origin marker"),
     )
     .expect("invalid import origin marker");
     assert_eq!(import_origin["version"], 1);
-    assert_eq!(import_origin["repo"], "anthropics/skills");
-    assert_eq!(import_origin["plugin"], "internal-comms");
+    assert_eq!(import_origin["repo"], "michaelboeding/skills");
+    assert_eq!(import_origin["sha"], INSTALL_COMMIT);
+    assert_eq!(import_origin["plugin"], "style-guide");
     assert_eq!(import_origin["marketplace"], "csswitch-local-bridge");
-    assert_eq!(import_origin["path"], "skills/internal-comms");
+    assert_eq!(import_origin["path"], "skills/style-guide");
     assert_eq!(import_origin["license"], "NOASSERTION");
+    assert_eq!(import_origin["csswitch_revision"], 2);
+    assert_eq!(import_origin["source_kind"], "github");
+    assert_eq!(
+        import_origin["content_sha256"]
+            .as_str()
+            .expect("content hash")
+            .len(),
+        64
+    );
     assert!(!installed.join(".catalog_stamp").exists());
 
     guard.stop_science();
@@ -1471,7 +1741,7 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     send_prompt(
         &guard,
         &restarted_chat,
-        "请加载并使用 internal-comms Skill 做一次无副作用检查",
+        "请加载并使用 style-guide Skill 做一次无副作用检查",
     )
     .unwrap();
     let restarted = wait_round(&guard, &provider, |value| value.skill_loaded_after_restart);
@@ -1481,7 +1751,7 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
     );
 
     let idle = wait_chat_idle(&guard, 120).unwrap();
-    send_prompt(&guard, &idle, "请卸载 internal-comms").unwrap();
+    send_prompt(&guard, &idle, "请卸载 style-guide").unwrap();
     let uninstalled = wait_round(&guard, &provider, |value| {
         value.skill_absent_after_detach || value.uninstall_status_seen
     });
@@ -1513,7 +1783,7 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
             entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with("internal-comms-")
+                .starts_with("style-guide-")
         })
     }));
     assert!(!final_uninstall

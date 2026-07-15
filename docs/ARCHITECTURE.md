@@ -2,4 +2,4 @@
 
 当前架构合同已迁移到 [docs/architecture/overview.md](architecture/overview.md)。
 
-此兼容指针计划保留到 v0.5.0 之后的下一个正式发布，再单独决定是否删除。
+v0.6.0 继续保留此兼容入口；正文只在新路径维护。

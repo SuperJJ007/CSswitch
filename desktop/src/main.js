@@ -112,6 +112,8 @@ function mockInvoke(cmd, args) {
       return Promise.resolve({ msg: "（预览模式：假装已就绪）", action: "started" });
     case "science_runtime_preflight":
       return Promise.resolve({ status: "installed_ready", selected_source: "installed_app", selected_version: "0.0.0-preview", cached_version: null, download_url: "https://claude.com/download" });
+    case "install_local_skill_package":
+      return Promise.resolve({ schema_version: 2, status: "BUNDLE_INSTALLED_ATTACHED", package_kind: "bundle", bundle_name: "demo-bundle", skill_names: ["demo-skill", "demo-reader"], attach_verified: true, message: "bundle 文件已安装并绑定 OPERON。" });
     case "open_science_download_page":
       return Promise.resolve(null);
     case "status":
@@ -392,7 +394,7 @@ function setBusy(on, op) {
   const activationBusy = on && busyOp && busyOp.kind === "activate";
   if (!on) clearBusyMsgTimers();
   [
-    els.oneClickBtn, els.stopBtn, els.newBtn,
+    els.oneClickBtn, els.stopBtn, els.importSkillBtn, els.newBtn,
     els.runtimeUseCacheBtn, els.runtimeDownloadBtn, els.runtimeChoiceCancelBtn,
     els.wizSaveBtn, els.wizFetchBtn, els.wizCancelBtn,
     els.connSaveBtn, els.connFetchBtn, els.connClearBtn, els.connCancelBtn,
@@ -1062,6 +1064,30 @@ async function runOneClick(runtimeChoice) {
   }
 }
 
+async function importLocalSkill() {
+  if (busy) return;
+  setBusy(true, { kind: "importSkill" });
+  setMsg("正在选择并校验 Skill 包…");
+  try {
+    const result = await call("install_local_skill_package");
+    if (result.status === "CANCELLED") {
+      setMsg("已取消导入 Skill 包。");
+    } else if (result.status === "INSTALLED_ATTACHED_VERIFY_REQUIRED") {
+      setMsg("文件已安装并绑定 OPERON。请在 Science 中让 Agent 调用 skill(" + result.skill_name + ") 验证当前会话加载。", "ok");
+    } else if (result.status === "BUNDLE_INSTALLED_ATTACHED") {
+      const names = Array.isArray(result.skill_names) ? result.skill_names : [];
+      const summary = names.slice(0, 4).join("、") + (names.length > 4 ? " 等" : "");
+      setMsg("已安装并绑定 " + names.length + " 个 Skill" + (summary ? "：" + summary : "") + "。", "ok");
+    } else {
+      setMsg((result.message || "Skill 包导入未完成") + " [" + result.status + "]", "err");
+    }
+  } catch (e) {
+    setMsg("导入 Skill 包失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
 // ── 一键开始：先确认本次实际 Science runtime，再进入原启动链路。──
 async function oneClick() {
   if (!configState.active_id) {
@@ -1198,7 +1224,7 @@ async function refreshStatus() {
 
 function wire() {
   [
-    "oneClickBtn", "stopBtn", "ltProxy", "ltSandbox", "ltUpstream",
+    "oneClickBtn", "stopBtn", "importSkillBtn", "ltProxy", "ltSandbox", "ltUpstream",
     "runtimeChoiceSec", "runtimeChoiceText", "runtimeUseCacheBtn", "runtimeDownloadBtn", "runtimeChoiceCancelBtn",
     "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
     "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "reuseSystemSsh", "advSec",
@@ -1264,6 +1290,7 @@ function wire() {
   els.runtimeDownloadBtn.addEventListener("click", openScienceDownload);
   els.runtimeChoiceCancelBtn.addEventListener("click", cancelRuntimeChoice);
   els.stopBtn.addEventListener("click", stopAll);
+  els.importSkillBtn.addEventListener("click", importLocalSkill);
   els.openBrowserBtn.addEventListener("click", openBrowser);
   els.doctorBtn.addEventListener("click", runDoctor);
   els.updateBtn.addEventListener("click", checkUpdate);

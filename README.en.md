@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.5.0"><img src="https://img.shields.io/badge/release-v0.5.0-2ea44f.svg" alt="CSSwitch v0.5.0"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.6.0"><img src="https://img.shields.io/badge/release-v0.6.0-2ea44f.svg" alt="CSSwitch v0.6.0"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -24,13 +24,14 @@ It is built for more than developers. You need Claude Science, a third-party API
 
 [Download latest release](../../releases/latest) · [Documentation](./docs/README.md) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.5.0:** In third-party mode, one combined local connector installs or uninstalls external Skills. Installation requires an exact public GitHub directory URL and, after Science approval, performs the bounded copy, native Agent attachment, and verification. Uninstall quarantines only CSSwitch-owned imports before native detachment. This release also avoids redundant Science version and Skill-route work on repeated starts and adds an explicit opt-in for isolated Science to use the system `~/.ssh/config`. See the [External Skill bridge](./docs/features/external-skill-bridge.md), [system SSH contract](./docs/features/system-ssh.md), and [architecture contract](./docs/architecture/overview.md).
+> **0.6.0:** External Skills can now be installed from an exact public GitHub URL or a local `.zip` / `.skill` file selected in the desktop panel. Slow GitHub downloads expose single-request progress, terminal cleanup, and restart interruption recovery. Uninstalling any bundle member first returns the complete affected Skill list and requires confirmation for whole-bundle removal; partial physical deletion is not supported. Legacy v0.5.0 connector routes migrate automatically while user MCP entries and unknown fields are preserved. See the [external Skill bridge](./docs/features/external-skill-bridge.md), [system SSH contract](./docs/features/system-ssh.md), and [architecture contract](./docs/architecture/overview.md).
 
 ## Contents
 
 - [Why CSSwitch exists](#why-csswitch-exists)
 - [What it can do](#what-it-can-do)
 - [Quick start](#quick-start)
+- [Installing and removing external Skills](#installing-and-removing-external-skills)
 - [Upgrading from an older version](#upgrading-from-an-older-version)
 - [Supported model sources](#supported-model-sources)
 - [Status diagnostics and capability catalog](#status-diagnostics-and-capability-catalog)
@@ -70,7 +71,7 @@ Claude Science sandbox
 - Click "一键开始" (Start) to launch the proxy, prepare the sandbox, and open Science.
 - Show the actual selected model name in Science instead of a vague `claude` or `opus` label.
 - Switch back to "Official Claude" without interfering with your real Claude login.
-- Reuse Science's persistent data-dir; Skill state is not a CSSwitch startup gate. Version 0.5.0 can install a Skill from an exact public GitHub URL and safely quarantine CSSwitch-owned imports through the same connector.
+- Reuse Science's persistent data-dir; Skill state is not a CSSwitch startup gate. Version 0.6.0 installs a Skill or bundle from an exact public GitHub URL or local `.zip` / `.skill` file; bundle removal requires whole-bundle confirmation and quarantines only CSSwitch-owned imports.
 - CSSwitch inherits the Science version currently installed in `/Applications/Claude Science.app`; it does not compare, pin, upgrade, or downgrade that version. After the App updates, the next launch uses the updated App executable with the same persistent data-dir.
 - If the Science App is missing, CSSwitch never starts a data-dir cache silently. Only an executable cache with a readable version can be authorized for this launch once; the choice is not saved. Otherwise the UI offers the [official Claude download page](https://claude.com/download) or cancel.
 
@@ -104,9 +105,43 @@ CSSwitch does not choose a Science version for you. Normal startup uses the curr
 
 To use Science with its official service configuration, switch to "官方 Claude" (Official Claude). CSSwitch will tear down the third-party proxy path and open the real Science app.
 
+## Installing and removing external Skills
+
+CSSwitch 0.6.0 provides GitHub and local-file installation paths. Both use the same path, size, symlink, and reserved-file validation, then attach the installed Skills to Science's default Agent through the native control path. The installer does not sign in to GitHub for you or read or take over Science credentials.
+
+**Install from a public GitHub URL**
+
+1. Complete "一键开始" (Start) in CSSwitch, then open a new Science conversation.
+2. Send the Agent an exact public GitHub tree URL and explicitly ask it to use the CSSwitch external Skill installer. For example:
+
+   ```text
+   Use the CSSwitch external Skill installer for this fixed commit. Create only one request and do not retry automatically:
+   https://github.com/<owner>/<repo>/tree/<commit>/<path>
+   ```
+
+3. When Science asks for access to the CSSwitch bridge directory, verify the path and approve read/write access for this request.
+4. Let the same request continue while the download progresses; do not submit the install instruction again. On success, a single Skill asks for a current-conversation load check, while a bundle reports its complete member count and attachment result.
+
+A fixed commit URL is recommended for reproducible verification and fast reuse. A public repository-root bundle can use `.../tree/<commit>`. Private repositories, name search, overwrite updates, and Skill publishing are outside the current scope.
+
+**Install from a local file**
+
+1. Keep isolated Science running and healthy.
+2. Click "导入 Skill 包" (Import Skill package) in the CSSwitch panel.
+3. Select a `.zip` or `.skill` file. Supported layouts include a root-level `SKILL.md`, one outer Skill directory, or a bundle with multiple direct Skill children and an optional `_shared` support directory.
+4. After CSSwitch validates, atomically commits, and attaches the package, load the Skill in a new Science conversation to confirm it can actually run.
+
+Installing the exact same fixed GitHub commit or local archive again verifies and reuses the existing content without another download or duplicate Skill. A package with the same Skill name but different content or provenance is rejected instead of overwriting the installed copy.
+
+**Removal and bundle confirmation**
+
+Ask the CSSwitch uninstaller to remove a Skill from Science. A single-Skill removal only handles a directory carrying a valid CSSwitch import marker, quarantines it, and completes Agent detachment. If the target belongs to a bundle, the first call only returns the bundle name, complete affected-Skill list, and confirmation ID; no files are removed until the user explicitly confirms whole-bundle removal. Cancellation must not invoke the uninstall tool again, and this version does not physically delete only one bundle member.
+
+See the [external Skill bridge](./docs/features/external-skill-bridge.md) for detailed statuses, limits, recovery behavior, and troubleshooting.
+
 ## Upgrading from an older version
 
-Version 0.5.0 keeps the existing v2 configuration format and reuses `~/.csswitch/sandbox/home/.claude-science`, so existing Science organizations, projects, and Skills are not migrated or overwritten. Legacy CSSwitch Skill store/inventory files remain untouched but no longer participate in startup; external `~/.claude/skills` trees are not synchronized into Science.
+Version 0.6.0 keeps the existing v2 configuration format and reuses `~/.csswitch/sandbox/home/.claude-science`, so existing Science organizations, projects, and Skills are not migrated or overwritten. Legacy v0.5.0 external-Skill connectors are merged automatically while user-created MCP entries and unknown fields are preserved. Legacy CSSwitch Skill store/inventory files remain untouched but no longer participate in startup; external `~/.claude/skills` trees are not synchronized into Science.
 
 For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/operations/upgrade-and-rollback.md).
 
@@ -154,7 +189,7 @@ CSSwitch is not an official Claude service, and third-party model mode does not 
 
 - Anthropic-hosted remote MCP services are unavailable, including `pubmed`, `clinical-trials`, `chembl`, `biorxiv`, and other `*.mcp.claude.com` services.
 - Directory connectors, remote plugins, and cloud features that require real Claude account authorization may show session expired, unavailable, or skipped.
-- Science's native GitHub import, Skill publishing, and draft deletion may still query the Anthropic account catalog. CSSwitch does not emulate OAuth or that catalog; version 0.5.0 supports only exact public GitHub URLs and quarantine removal, not deterministic name search, updates/overwrite, permanent-delete/restore UI, private repositories, or publishing.
+- Science's native GitHub import, Skill publishing, and draft deletion may still query the Anthropic account catalog. CSSwitch does not emulate OAuth or that catalog; version 0.6.0 supports only exact public GitHub URLs or a user-selected local `.zip` / `.skill` file and quarantines CSSwitch-owned bundles, not deterministic name search, overwrite, member-level physical deletion, permanent-delete/restore UI, private repositories, or publishing.
 - Third-party models differ in tool use, long context, thinking, image, and streaming compatibility. Native Anthropic endpoints are usually more reliable than OpenAI translation paths.
 - The macOS package is not notarized yet, so the first launch requires manual approval.
 - The inference gateway is a bundled Rust sidecar; no runtime Python fallback is shipped.

@@ -273,8 +273,13 @@ pub(crate) fn one_click_login<R: Runtime>(
             let running_runtime =
                 running_runtime.ok_or("Science 状态为运行中，但无法确认其 binary 身份")?;
             if oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home) {
-                let (_pport, secret, proxy_action) =
-                    ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
+                let (_pport, secret, proxy_action) = ensure_proxy(
+                    &app,
+                    &state,
+                    lifecycle,
+                    Some(&running_runtime),
+                    Some(&trace),
+                )?;
                 let installer_bridge = skill_install_bridge_dir(&secret)?;
                 // Science 已在运行时只读检查，不并发改写它的 MCP 配置。
                 let installer = match current_skill_install_bridge_key() {
@@ -377,7 +382,8 @@ pub(crate) fn one_click_login<R: Runtime>(
         return Err("找不到 scripts/launch-virtual-sandbox.sh。".into());
     }
 
-    let (pport, secret, proxy_action) = ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
+    let (pport, secret, proxy_action) =
+        ensure_proxy(&app, &state, lifecycle, Some(&launch_runtime), Some(&trace))?;
     let installer_bridge = skill_install_bridge_dir(&secret)?;
     // 本地 MCP 注册是 best-effort：失败只降级该工具，绝不阻断 Science 启动。
     let installer = match current_skill_install_bridge_key() {

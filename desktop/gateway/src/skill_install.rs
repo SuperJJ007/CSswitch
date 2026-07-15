@@ -1,52 +1,32 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
-use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
 use hmac::{Hmac, Mac};
 use regex::Regex;
-use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, USER_AGENT};
 use serde_json::{json, Value};
 use sha2::Sha256;
 
+use csswitch_skill_install_core::{
+    attach_skill, find_bundle_for_skill, install_github_package_with_progress, quarantine_bundle,
+    update_agent_skills, verify_attach_control_ready, AttachResult, BundleCommit, InstallCommit,
+    InstallError, InstalledPackage, ScienceHostContext, GITHUB_BUNDLE_OPERATION_TIMEOUT_SECONDS,
+    SCHEMA_VERSION,
+};
+
 const INSTALL_TOOL_NAME: &str = "install_external_skill";
 const UNINSTALL_TOOL_NAME: &str = "uninstall_external_skill";
+const POLL_TOOL_NAME: &str = "poll_external_skill_request";
 const IMPORT_ORIGIN_FILE: &str = ".import-origin";
 const CSSWITCH_MARKETPLACE: &str = "csswitch-local-bridge";
 const MAX_IMPORT_ORIGIN_BYTES: usize = 16 * 1024;
-const MAX_FILES: usize = 512;
-const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const BRIDGE_KEY_FILE_ENV: &str = "CSSWITCH_SKILL_BRIDGE_KEY_FILE";
 const BRIDGE_REQUEST_VERSION: u64 = 1;
 const BRIDGE_REQUEST_TTL_SECONDS: u64 = 180;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GithubSource {
-    owner: String,
-    repo: String,
-    tail: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedSource {
-    owner: String,
-    repo: String,
-    commit: String,
-    path: String,
-    files: Vec<TreeFile>,
-}
-
-#[derive(Debug, Clone)]
-struct TreeFile {
-    relative_path: PathBuf,
-    blob_sha: String,
-    executable: bool,
-    size: usize,
-}
+pub(crate) const BRIDGE_INSTALL_RESPONSE_TIMEOUT_SECONDS: u64 =
+    GITHUB_BUNDLE_OPERATION_TIMEOUT_SECONDS + 60;
 
 #[derive(Debug)]
 struct InstallLock {
@@ -71,17 +51,24 @@ impl ToolMode {
 
     fn allows(self, tool_name: &str) -> bool {
         match self {
-            Self::Install => tool_name == INSTALL_TOOL_NAME,
-            Self::Uninstall => tool_name == UNINSTALL_TOOL_NAME,
-            Self::All => matches!(tool_name, INSTALL_TOOL_NAME | UNINSTALL_TOOL_NAME),
+            Self::Install => matches!(tool_name, INSTALL_TOOL_NAME | POLL_TOOL_NAME),
+            Self::Uninstall => matches!(tool_name, UNINSTALL_TOOL_NAME | POLL_TOOL_NAME),
+            Self::All => matches!(
+                tool_name,
+                INSTALL_TOOL_NAME | UNINSTALL_TOOL_NAME | POLL_TOOL_NAME
+            ),
         }
     }
 
     fn definitions(self) -> Vec<Value> {
         match self {
-            Self::Install => vec![install_tool_definition()],
-            Self::Uninstall => vec![uninstall_tool_definition()],
-            Self::All => vec![install_tool_definition(), uninstall_tool_definition()],
+            Self::Install => vec![install_tool_definition(), poll_tool_definition()],
+            Self::Uninstall => vec![uninstall_tool_definition(), poll_tool_definition()],
+            Self::All => vec![
+                install_tool_definition(),
+                uninstall_tool_definition(),
+                poll_tool_definition(),
+            ],
         }
     }
 }
@@ -180,10 +167,11 @@ fn handle_mcp_request(
                         host_access_request(bridge_dir, bridge_token, "install", &arguments)
                     }
                 }
-                UNINSTALL_TOOL_NAME => match requested_skill_name(&arguments) {
+                UNINSTALL_TOOL_NAME => match validate_uninstall_arguments(&arguments) {
                     Ok(_) => host_access_request(bridge_dir, bridge_token, "uninstall", &arguments),
                     Err(message) => uninstall_failure(message),
                 },
+                POLL_TOOL_NAME => poll_bridge_request(bridge_dir, &arguments),
                 _ => return Some(rpc_error(id, -32602, "未知工具")),
             };
             tool_result(payload)
@@ -212,17 +200,152 @@ fn host_access_request(
     request["signature"] = Value::String(signature);
     json!({
         "status": "HOST_ACCESS_REQUIRED",
-        "message": "调用 request_host_access，为 bridge_dir 请求 rw 权限；授权后调用 edit_file（old_string 为空）把 request.payload 写入 request.filename，再用 read_file 读取 response_filename；未生成时短暂等待后重试。把响应原样告知用户。安装不要改用 host.skills.edit/publish；卸载不要改用 host.skills.delete 或 skills.deleteDraft。",
+        "request_id": id,
+        "message": "调用 request_host_access，为 host_access.host_path 请求 rw 权限。授权成功后必须使用返回的 guestPath：只调用一次 edit_file（old_string 为空）把 request.payload 写入 guestPath/request.filename。随后只调用 poll_external_skill_request 查询同一 request_id；首次不传 last_sequence，后续传回上次 sequence，让 gateway 长轮询阶段变化或最终响应。不要直接反复读取文件，不要运行 sleep、shell/Python 轮询，也绝不能再次写 request_filename、再次调用安装/卸载工具或创建新请求。宿主会把成功、失败、超时或中断恢复写成最终响应并清理 .processing；poll 工具超过 deadline_at + terminal_grace_seconds 仍无最终响应时会返回 HOST_RESPONSE_TIMEOUT。任何最终响应（包括 retryable 错误）都必须原样告知用户并结束本次请求；没有用户新的明确指令，绝不能自动重试或生成新 request_id。安装不要改用 host.skills.edit/publish；卸载不要改用 host.skills.delete 或 skills.deleteDraft。",
         "bridge_dir": bridge_dir,
-        "host_access": {"host_path": host_path, "mode": "rw"},
+        "host_access": {
+            "host_path": host_path,
+            "mode": "rw",
+            "use_returned_guest_path": true
+        },
         "request": {
             "filename": format!("{id}.request.json"),
+            "status_filename": format!("{id}.status.json"),
             "response_filename": format!("{id}.response.json"),
+            "poll_tool": POLL_TOOL_NAME,
+            "poll_after_seconds": 0,
+            "timeout_seconds": BRIDGE_INSTALL_RESPONSE_TIMEOUT_SECONDS,
+            "terminal_grace_seconds": 5,
             "payload": request
         },
         "directory_commit": false,
         "restart_required": false
     })
+}
+
+fn poll_bridge_request(bridge_dir: &Path, arguments: &Value) -> Value {
+    let request_id = arguments
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if request_id.len() != 32
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return json!({
+            "status": "REQUEST_STATUS_INVALID",
+            "request_id": request_id,
+            "poll_again": false,
+            "message": "request_id 必须是 install/uninstall 工具原样返回的 32 位小写十六进制 ID。"
+        });
+    }
+    let last_sequence = arguments.get("last_sequence").and_then(Value::as_u64);
+    let response_path = bridge_dir.join(format!("{request_id}.response.json"));
+    let status_path = bridge_dir.join(format!("{request_id}.status.json"));
+    let wait_deadline = Instant::now() + Duration::from_secs(10);
+    let mut latest_status = None;
+    loop {
+        match read_bridge_poll_json(&response_path) {
+            Ok(Some(mut response)) => {
+                if let Some(object) = response.as_object_mut() {
+                    object
+                        .entry("request_id")
+                        .or_insert_with(|| json!(request_id));
+                    object.insert("poll_complete".into(), Value::Bool(true));
+                    object.insert("poll_again".into(), Value::Bool(false));
+                }
+                return response;
+            }
+            Ok(None) => {}
+            Err(message) => return poll_read_failure(request_id, &message),
+        }
+        match read_bridge_poll_json(&status_path) {
+            Ok(Some(mut status)) => {
+                let sequence = status.get("sequence").and_then(Value::as_u64);
+                let deadline_at = status.get("deadline_at").and_then(Value::as_u64);
+                let terminal_grace = status
+                    .get("terminal_grace_seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(5);
+                if deadline_at.is_some_and(|deadline| {
+                    unix_seconds() > deadline.saturating_add(terminal_grace)
+                }) {
+                    return json!({
+                        "status": "HOST_RESPONSE_TIMEOUT",
+                        "request_id": request_id,
+                        "poll_again": false,
+                        "deadline_at": deadline_at,
+                        "message": "宿主最终响应超过固定 deadline 与 grace；停止轮询，禁止重复提交同一请求。"
+                    });
+                }
+                if let Some(object) = status.as_object_mut() {
+                    object.insert("poll_complete".into(), Value::Bool(false));
+                    object.insert("poll_again".into(), Value::Bool(true));
+                    object.insert("poll_tool".into(), Value::String(POLL_TOOL_NAME.into()));
+                }
+                latest_status = Some(status);
+                if last_sequence.is_none() || sequence != last_sequence {
+                    return latest_status.expect("status was just stored");
+                }
+            }
+            Ok(None) => {}
+            Err(message) => return poll_read_failure(request_id, &message),
+        }
+        if Instant::now() >= wait_deadline {
+            return latest_status.unwrap_or_else(|| {
+                json!({
+                    "status": "REQUEST_NOT_READY",
+                    "request_id": request_id,
+                    "poll_complete": false,
+                    "poll_again": true,
+                    "poll_tool": POLL_TOOL_NAME,
+                    "message": "宿主尚未接收该请求；保持同一 request_id 继续查询，禁止重新提交。"
+                })
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn poll_read_failure(request_id: &str, message: &str) -> Value {
+    json!({
+        "status": "REQUEST_STATUS_UNAVAILABLE",
+        "request_id": request_id,
+        "poll_again": false,
+        "message": format!("无法安全读取宿主请求状态：{message}")
+    })
+}
+
+fn read_bridge_poll_json(path: &Path) -> Result<Option<Value>, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err("状态文件类型或大小非法".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err("状态文件属主或权限非法".into());
+        }
+    }
+    serde_json::from_reader(file)
+        .map(Some)
+        .map_err(|_| "状态文件 JSON 非法".into())
 }
 
 fn read_bridge_token_file() -> Result<String, String> {
@@ -388,10 +511,7 @@ pub(crate) fn validate_bridge_request(
             }
         }
         "uninstall" => {
-            if arguments.len() != 1 {
-                return Err("本地 Skill 卸载参数非法".into());
-            }
-            requested_skill_name(request.get("arguments").unwrap())?;
+            validate_uninstall_arguments(request.get("arguments").unwrap())?;
         }
         _ => return Err("未知的本地 Skill 操作".into()),
     }
@@ -421,11 +541,11 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 fn install_tool_definition() -> Value {
     json!({
         "name": INSTALL_TOOL_NAME,
-        "description": "安装、导入或添加外部 Skill；install, import, or add an existing external public GitHub Skill. Use this instead of host.skills.edit, host.skills.publish, Add Skill ZIP, or marketplace.importSkills. With only a Skill name, search for candidates but never install an ambiguous guessed repository; confirm the exact URL when needed. After FILES_COMMITTED_ATTACH_REQUIRED, call host.agents.attach_skill('OPERON', skill_name), then skill(skill_name) before reporting it usable.",
+        "description": "安装、导入或添加公开 GitHub 中的单个 Skill 或 Nature-like Skill bundle。Agent 只提交准确 URL，不下载文件、不使用 shell、catalog、Skill Manager、host.skills.edit 或 host.skills.publish。CSSwitch 宿主完成 archive 下载、验证、原子提交并绑定 OPERON；不要手工调用 host.agents.attach_skill。单 Skill返回 INSTALLED_ATTACHED_VERIFY_REQUIRED 后必须调用 skill(skill_name)；bundle 返回 BUNDLE_INSTALLED_ATTACHED 后可直接报告已安装并绑定全部成员。任何最终错误都结束本次请求；即使 retryable=true，也必须先报告用户，禁止自动再次调用本工具。重试 FILES_COMMITTED_ATTACH_REQUIRED 时才可在同一用户请求内再次调用本工具。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "source_url": {"type": "string", "description": "Public GitHub Skill directory URL in https://github.com/owner/repo/tree/ref/path form."},
+                "source_url": {"type": "string", "description": "Public GitHub repository, plugin/collection, or exact Skill directory URL."},
                 "skill_name": {"type": "string", "description": "The name supplied by the user when no source URL is available."}
             },
             "additionalProperties": false
@@ -436,11 +556,12 @@ fn install_tool_definition() -> Value {
 fn uninstall_tool_definition() -> Value {
     json!({
         "name": UNINSTALL_TOOL_NAME,
-        "description": "卸载、删除或移除 CSSwitch 导入的外部 Skill；uninstall, delete, or remove a CSSwitch-imported external Skill. Use this instead of host.skills.delete or skills.deleteDraft. It validates the CSSwitch import-origin marker and moves the directory to quarantine. After QUARANTINED_DETACH_REQUIRED, call host.agents.detach_skill('OPERON', skill_name), then verify skill(skill_name) no longer loads before reporting completion.",
+        "description": "卸载 CSSwitch 导入的外部 Skill。单 Skill 保持原隔离和手工 detach 流程。bundle 成员首次调用只返回 BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED、整包信息和受影响 Skill 列表，不改文件或绑定；必须向用户展示完整列表并等待明确确认。用户确认后才可再次调用，并把响应中的 bundle_id 原样作为 confirm_bundle_id；取消时不得再次调用。确认调用会重新校验 bundle、批量解除 OPERON 绑定并整包隔离，不要逐成员调用 host.agents.detach_skill，也不支持部分物理删除。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "skill_name": {"type": "string", "description": "Exact installed Skill directory name to uninstall."}
+                "skill_name": {"type": "string", "description": "Exact installed Skill directory name to uninstall."},
+                "confirm_bundle_id": {"type": "string", "description": "Only after explicit user confirmation of BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED, pass that response's exact bundle_id. Omit on the first call and for single-Skill uninstall."}
             },
             "required": ["skill_name"],
             "additionalProperties": false
@@ -448,11 +569,46 @@ fn uninstall_tool_definition() -> Value {
     })
 }
 
+fn poll_tool_definition() -> Value {
+    json!({
+        "name": POLL_TOOL_NAME,
+        "description": "只读查询一次已提交的 CSSwitch 外部 Skill 请求。首次只传 request_id；若返回 PROCESSING，下一次把其 sequence 原样作为 last_sequence，gateway 会在内部等待最多 10 秒直到阶段变化。不得用本工具创建新请求，也不得再次调用安装/卸载工具。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string", "description": "HOST_ACCESS_REQUIRED 原样返回的 request payload id。"},
+                "last_sequence": {"type": "integer", "minimum": 0, "description": "上一次 PROCESSING 返回的 sequence；首次查询省略。"}
+            },
+            "required": ["request_id"],
+            "additionalProperties": false
+        }
+    })
+}
+
 fn tool_result(payload: Value) -> Value {
-    let is_error = matches!(
-        payload.get("status").and_then(Value::as_str),
-        Some("INSTALL_FAILED" | "UNINSTALL_FAILED")
-    );
+    let payload = with_schema(payload);
+    let status = payload.get("status").and_then(Value::as_str);
+    let is_error = status.is_some_and(|status| {
+        status.starts_with("GITHUB_")
+            || matches!(
+                status,
+                "HOST_RESPONSE_TIMEOUT"
+                    | "REQUEST_STATUS_INVALID"
+                    | "REQUEST_STATUS_UNAVAILABLE"
+                    | "SOURCE_REF_REQUIRES_COMMIT_SHA"
+                    | "LEGACY_INTEGRITY_UNVERIFIED"
+                    | "INSTALL_FAILED"
+                    | "UNINSTALL_FAILED"
+                    | "SKILL_NAME_CONFLICT"
+                    | "INSTALLED_CONTENT_CHANGED"
+                    | "UNSUPPORTED_SHARED_DEPENDENCY"
+                    | "MULTIPLE_BUNDLE_CANDIDATES"
+                    | "BUNDLE_STRUCTURE_UNSUPPORTED"
+                    | "BUNDLE_LIMIT_EXCEEDED"
+                    | "BUNDLE_PATH_CONFLICT"
+                    | "UNSUPPORTED_PLUGIN_RUNTIME_DEPENDENCY"
+            )
+    });
     let text = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     json!({
         "content": [{"type": "text", "text": text}],
@@ -461,25 +617,65 @@ fn tool_result(payload: Value) -> Value {
     })
 }
 
-pub(crate) fn handle_bridge_request(data_dir: &Path, request: &Value) -> Value {
+fn with_schema(mut payload: Value) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("schema_version".into(), Value::from(SCHEMA_VERSION));
+    }
+    payload
+}
+
+pub(crate) fn handle_bridge_request_with_progress(
+    data_dir: &Path,
+    science_context: Option<&ScienceHostContext>,
+    request: &Value,
+    progress: &mut dyn FnMut(&str, &str),
+) -> Value {
     let operation = request
         .get("operation")
         .and_then(Value::as_str)
         .unwrap_or("");
     let arguments = request.get("arguments").unwrap_or(&Value::Null);
-    match operation {
-        "install" => install_from_arguments(data_dir, arguments),
-        "uninstall" => uninstall_from_arguments(data_dir, arguments),
+    with_schema(match operation {
+        "install" => install_from_arguments_with_context_and_progress(
+            data_dir,
+            science_context,
+            arguments,
+            progress,
+        ),
+        "uninstall" => uninstall_from_arguments_with_context(data_dir, science_context, arguments),
         _ => json!({
             "status": "REQUEST_FAILED",
             "message": "未知的本地 Skill 操作",
             "directory_commit": false,
             "restart_required": false
         }),
-    }
+    })
 }
 
 pub(crate) fn install_from_arguments(data_dir: &Path, arguments: &Value) -> Value {
+    install_from_arguments_with_context(data_dir, None, arguments)
+}
+
+fn install_from_arguments_with_context(
+    data_dir: &Path,
+    science_context: Option<&ScienceHostContext>,
+    arguments: &Value,
+) -> Value {
+    let mut progress = |_: &str, _: &str| {};
+    install_from_arguments_with_context_and_progress(
+        data_dir,
+        science_context,
+        arguments,
+        &mut progress,
+    )
+}
+
+fn install_from_arguments_with_context_and_progress(
+    data_dir: &Path,
+    science_context: Option<&ScienceHostContext>,
+    arguments: &Value,
+    progress: &mut dyn FnMut(&str, &str),
+) -> Value {
     let source_url = arguments
         .get("source_url")
         .and_then(Value::as_str)
@@ -494,137 +690,254 @@ pub(crate) fn install_from_arguments(data_dir: &Path, arguments: &Value) -> Valu
         return json!({
             "status": "NEED_SOURCE_URL",
             "skill_name": skill_name,
-            "message": "请提供该 Skill 的公开 GitHub 目录链接（https://github.com/owner/repo/tree/ref/path）。CSSwitch 不会根据名称猜测来源。",
+            "source_kind": "github",
             "directory_commit": false,
+            "attach_attempted": false,
+            "attach_required": false,
+            "attach_verified": false,
+            "load_verification_required": false,
+            "content_sha256": null,
+            "resolved_commit_sha": null,
+            "message": "请提供公开 GitHub 仓库、Skill 集合或准确 Skill 目录链接。CSSwitch 不会根据名称猜测来源。",
             "restart_required": false
         });
     };
-    match install_external_skill(data_dir, source_url) {
+    let Some(science_context) = science_context else {
+        return install_not_ready(skill_name, "CSSwitch 尚未确认可用的 Science runtime");
+    };
+    progress("preflight", "正在确认 Science runtime 与 OPERON 控制面");
+    if let Err(error) = verify_attach_control_ready(science_context) {
+        return install_not_ready(skill_name, &error.message);
+    }
+    match install_external_skill(data_dir, source_url, science_context, progress) {
         Ok(value) => value,
-        Err(message) => json!({
-            "status": "INSTALL_FAILED",
-            "message": message,
-            "directory_commit": false,
-            "restart_required": false
-        }),
+        Err(error) => install_error_payload(skill_name, error),
     }
 }
 
-fn install_external_skill(data_dir: &Path, source_url: &str) -> Result<Value, String> {
-    let parsed = parse_github_source(source_url)?;
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(45))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("初始化 GitHub 客户端失败：{e}"))?;
-    let resolved = resolve_source(&client, parsed)?;
-    let skill_name = skill_name_from_source_path(&resolved.path)?;
-    let active_org = read_active_org(data_dir)?;
-    let skills_root = data_dir.join("orgs").join(&active_org).join("skills");
-    ensure_safe_root(data_dir, &skills_root)?;
-    fs::create_dir_all(&skills_root).map_err(|e| format!("创建 Skills 目录失败：{e}"))?;
-    reject_symlink_path(&skills_root)?;
-
-    let target = skills_root.join(&skill_name);
-    let lock_path = skills_root.join(format!(".csswitch-install-{skill_name}.lock"));
-    let lock = acquire_lock(&lock_path)?;
-    if target.exists() || fs::symlink_metadata(&target).is_ok() {
-        return Err(format!("Skill '{skill_name}' 已存在；CSSwitch 拒绝覆盖"));
-    }
-    let temp = skills_root.join(format!(
-        ".csswitch-install-{skill_name}-{}-{}",
-        std::process::id(),
-        unique_suffix()
-    ));
-    fs::create_dir(&temp).map_err(|e| format!("创建安装临时目录失败：{e}"))?;
-    let install_result: Result<(), String> = (|| {
-        download_tree(&client, &resolved, &temp)?;
-        if !temp.join("SKILL.md").is_file() {
-            return Err("来源目录顶层缺少 SKILL.md".into());
+fn install_external_skill(
+    data_dir: &Path,
+    source_url: &str,
+    science_context: &ScienceHostContext,
+    progress: &mut dyn FnMut(&str, &str),
+) -> Result<Value, InstallError> {
+    match install_github_package_with_progress(data_dir, source_url, progress)? {
+        InstalledPackage::Skill(commit) => {
+            progress("attach", "文件已提交，正在绑定 OPERON 并回读确认");
+            Ok(attach_install_commit(science_context, commit))
         }
-        write_import_origin(&temp, &resolved, &skill_name)?;
-        sync_tree(&temp)?;
-        rename_no_replace(&temp, &target)?;
-        sync_directory(&skills_root)?;
-        Ok(())
-    })();
-    if install_result.is_err() {
-        let _ = fs::remove_dir_all(&temp);
+        InstalledPackage::Bundle(commit) => {
+            progress("attach", "bundle 已提交，正在批量绑定 OPERON 并回读确认");
+            Ok(attach_bundle_commit(science_context, commit))
+        }
     }
-    drop(lock);
-    install_result?;
-    Ok(json!({
-        "status": "FILES_COMMITTED_ATTACH_REQUIRED",
-        "skill_name": skill_name,
+}
+
+fn attach_bundle_commit(context: &ScienceHostContext, commit: BundleCommit) -> Value {
+    let attach = update_agent_skills(context, &commit.skill_names, &[], &commit.active_org);
+    let (status, message, attach_required, attach_verified) = match attach.as_ref() {
+        Ok(_) => (
+            "BUNDLE_INSTALLED_ATTACHED",
+            format!(
+                "bundle 文件已安装，OPERON 已回读确认绑定 {} 个 Skill。",
+                commit.skill_names.len()
+            ),
+            false,
+            true,
+        ),
+        Err(error) if error.uncertain => (
+            "ATTACH_STATE_UNCERTAIN",
+            format!("bundle 文件已保留，但批量绑定结果不确定：{}", error.message),
+            true,
+            false,
+        ),
+        Err(error) => (
+            "FILES_COMMITTED_ATTACH_REQUIRED",
+            format!("bundle 文件已保留，但自动批量绑定未完成：{}", error.message),
+            true,
+            false,
+        ),
+    };
+    let attach_error = attach.as_ref().err().cloned();
+    let attached_names = attach
+        .as_ref()
+        .map(|result| result.attached.clone())
+        .unwrap_or_default();
+    let missing_names = if attach_verified {
+        Vec::new()
+    } else {
+        commit.skill_names.clone()
+    };
+    let skills = commit
+        .members
+        .iter()
+        .map(|member| {
+            json!({
+                "skill_name": member.skill_name,
+                "content_sha256": member.content_sha256,
+                "install_action": member.install_action,
+                "attach_verified": attach_verified,
+            })
+        })
+        .collect::<Vec<_>>();
+    let content_fetch = !matches!(
+        commit.action,
+        csswitch_skill_install_core::InstallAction::ReusedVerified
+    );
+    json!({
+        "status": status,
+        "package_kind": "bundle",
+        "bundle_id": commit.bundle_id,
+        "bundle_name": commit.bundle_name,
+        "skill_name": commit.skill_names.first(),
+        "skill_names": commit.skill_names,
+        "support_paths": commit.support_paths,
+        "skills": skills,
+        "source_kind": commit.source_kind.as_str(),
+        "directory_commit": commit.directory_commit,
+        "install_action": commit.action.as_str(),
+        "attach_attempted": true,
+        "attach_required": attach_required,
+        "attach_verified": attach_verified,
+        "attached_skill_names": attached_names,
+        "missing_skill_names": missing_names,
+        "load_verification_required": false,
+        "content_sha256": commit.bundle_content_sha256,
+        "resolved_commit_sha": commit.resolved_commit_sha,
+        "source_digest_sha256": commit.source_digest_sha256,
+        "dependency_scan": "BEST_EFFORT",
         "agent_name": "OPERON",
-        "attach_required": true,
-        "attach_method": "host.agents.attach_skill",
-        "resolved_commit_sha": resolved.commit,
+        "attach_method": "csswitch_batch_auto_attach",
         "source_resolution": true,
-        "content_fetch": true,
-        "directory_commit": true,
-        "science_discovery": "FILES_VISIBLE_NOT_ATTACHED",
+        "content_fetch": content_fetch,
+        "science_discovery": if attach_verified { "BATCH_ATTACHED" } else { "FILES_VISIBLE_NOT_ATTACHED" },
+        "skill_trigger": "NOT_REQUIRED_FOR_BUNDLE_ACCEPTANCE",
+        "function_run": "NOT_VERIFIED",
+        "restart_required": false,
+        "new_conversation_required": false,
+        "import_origin_written": true,
+        "attach_error": attach_error,
+        "message": message
+    })
+}
+
+fn attach_install_commit(context: &ScienceHostContext, commit: InstallCommit) -> Value {
+    let attach = attach_skill(context, &commit.skill_name, &commit.active_org);
+    let (status, message, attach_required, attach_verified) = match attach.as_ref() {
+        Ok(AttachResult::Attached | AttachResult::AlreadyAttached) => (
+            "INSTALLED_ATTACHED_VERIFY_REQUIRED",
+            "Skill 文件已验证并绑定 OPERON。Agent 现在必须调用 skill(skill_name) 验证当前会话加载；验证前不得报告可用。".to_string(),
+            false,
+            true,
+        ),
+        Err(error) if error.uncertain => (
+            "ATTACH_STATE_UNCERTAIN",
+            format!("Skill 文件已保留，但 OPERON 绑定结果不确定：{}", error.message),
+            true,
+            false,
+        ),
+        Err(error) => (
+            "FILES_COMMITTED_ATTACH_REQUIRED",
+            format!("Skill 文件已保留，但自动绑定未完成：{}。请重新调用同一安装工具重试。", error.message),
+            true,
+            false,
+        ),
+    };
+    let attach_error = attach.err();
+    let content_fetch = !matches!(
+        commit.action,
+        csswitch_skill_install_core::InstallAction::ReusedVerified
+    );
+    json!({
+        "status": status,
+        "skill_name": commit.skill_name,
+        "source_kind": commit.source_kind.as_str(),
+        "directory_commit": commit.directory_commit,
+        "install_action": commit.action.as_str(),
+        "attach_attempted": true,
+        "attach_required": attach_required,
+        "attach_verified": attach_verified,
+        "load_verification_required": attach_verified,
+        "content_sha256": commit.content_sha256,
+        "resolved_commit_sha": commit.resolved_commit_sha,
+        "source_digest_sha256": commit.source_digest_sha256,
+        "dependency_scan": commit.dependency_scan,
+        "agent_name": "OPERON",
+        "attach_method": "csswitch_auto_attach",
+        "source_resolution": true,
+        "content_fetch": content_fetch,
+        "science_discovery": if attach_verified { "ATTACHED" } else { "FILES_VISIBLE_NOT_ATTACHED" },
         "skill_trigger": "NOT_VERIFIED",
         "function_run": "NOT_VERIFIED",
         "restart_required": false,
         "new_conversation_required": false,
         "import_origin_written": true,
-        "message": "Skill 目录和本地导入来源标记已完整写入，但尚未成为可用 Skill。现在必须调用 host.agents.attach_skill('OPERON', skill_name)，随后调用 skill(skill_name) 验证加载；验证成功前不要向用户报告安装完成。"
-    }))
+        "attach_error": attach_error,
+        "message": message
+    })
 }
 
-fn write_import_origin(
-    skill_dir: &Path,
-    source: &ResolvedSource,
-    skill_name: &str,
-) -> Result<(), String> {
-    let marker = json!({
-        "version": 1,
-        "repo": format!("{}/{}", source.owner, source.repo),
-        "sha": source.commit,
-        "plugin": skill_name,
-        "marketplace": CSSWITCH_MARKETPLACE,
-        "path": source.path,
-        "importedAt": rfc3339_now(),
-        "license": "NOASSERTION"
-    });
-    let mut body =
-        serde_json::to_vec(&marker).map_err(|e| format!("编码 Skill 导入来源失败：{e}"))?;
-    body.push(b'\n');
-    if body.len() > MAX_IMPORT_ORIGIN_BYTES {
-        return Err("Skill 导入来源标记过大".into());
-    }
-    write_new_file(&skill_dir.join(IMPORT_ORIGIN_FILE), &body, false)
+fn install_not_ready(skill_name: Option<&str>, message: &str) -> Value {
+    json!({
+        "status": "SCIENCE_NOT_READY",
+        "skill_name": skill_name,
+        "source_kind": "github",
+        "directory_commit": false,
+        "attach_attempted": false,
+        "attach_required": false,
+        "attach_verified": false,
+        "load_verification_required": false,
+        "content_sha256": null,
+        "resolved_commit_sha": null,
+        "restart_required": false,
+        "message": message
+    })
 }
 
-fn rfc3339_now() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    rfc3339_from_unix(seconds)
-}
-
-fn rfc3339_from_unix(seconds: u64) -> String {
-    let days = (seconds / 86_400) as i64;
-    let second_of_day = seconds % 86_400;
-    // Howard Hinnant's civil-from-days conversion, with day zero at 1970-01-01.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    let hour = second_of_day / 3_600;
-    let minute = (second_of_day % 3_600) / 60;
-    let second = second_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+fn install_error_payload(skill_name: Option<&str>, error: InstallError) -> Value {
+    let status = match error.code.as_str() {
+        "SKILL_NAME_CONFLICT"
+        | "INSTALLED_CONTENT_CHANGED"
+        | "UNSUPPORTED_SHARED_DEPENDENCY"
+        | "MULTIPLE_BUNDLE_CANDIDATES"
+        | "BUNDLE_STRUCTURE_UNSUPPORTED"
+        | "BUNDLE_LIMIT_EXCEEDED"
+        | "BUNDLE_PATH_CONFLICT"
+        | "UNSUPPORTED_PLUGIN_RUNTIME_DEPENDENCY"
+        | "SOURCE_REF_REQUIRES_COMMIT_SHA"
+        | "LEGACY_INTEGRITY_UNVERIFIED" => error.code.as_str(),
+        code if code.starts_with("GITHUB_") => error.code.as_str(),
+        "SCIENCE_NOT_READY" => "SCIENCE_NOT_READY",
+        _ => "INSTALL_FAILED",
+    };
+    let user_retry_available = error.retryable;
+    let message = format!(
+        "{}。本次请求已结束且 bridge 状态已清理；不得自动重试。{}",
+        error.message,
+        if user_retry_available {
+            "如需重试，必须先向用户报告并等待新的明确指令。"
+        } else {
+            "请向用户报告该最终错误。"
+        }
+    );
+    json!({
+        "status": status,
+        "skill_name": skill_name,
+        "source_kind": "github",
+        "directory_commit": error.directory_commit,
+        "attach_attempted": false,
+        "attach_required": false,
+        "attach_verified": false,
+        "load_verification_required": false,
+        "content_sha256": null,
+        "resolved_commit_sha": null,
+        "restart_required": false,
+        "request_terminal": true,
+        "automatic_retry_allowed": false,
+        "user_retry_available": user_retry_available,
+        "error": error,
+        "message": message
+    })
 }
 
 fn requested_skill_name(arguments: &Value) -> Result<String, String> {
@@ -636,6 +949,38 @@ fn requested_skill_name(arguments: &Value) -> Result<String, String> {
         .ok_or("请提供要卸载的准确 Skill 名称")?;
     validate_skill_name(name)?;
     Ok(name.to_string())
+}
+
+fn requested_bundle_confirmation(arguments: &Value) -> Result<Option<String>, String> {
+    let Some(value) = arguments.get("confirm_bundle_id") else {
+        return Ok(None);
+    };
+    let id = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("bundle 确认 ID 非法")?;
+    if id.len() != 64
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("bundle 确认 ID 非法".into());
+    }
+    Ok(Some(id.to_string()))
+}
+
+fn validate_uninstall_arguments(arguments: &Value) -> Result<(String, Option<String>), String> {
+    let object = arguments.as_object().ok_or("本地 Skill 卸载参数非法")?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "skill_name" | "confirm_bundle_id"))
+    {
+        return Err("本地 Skill 卸载参数非法".into());
+    }
+    let skill_name = requested_skill_name(arguments)?;
+    let confirm_bundle_id = requested_bundle_confirmation(arguments)?;
+    Ok((skill_name, confirm_bundle_id))
 }
 
 fn validate_skill_name(name: &str) -> Result<(), String> {
@@ -656,19 +1001,126 @@ fn uninstall_failure(message: String) -> Value {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn uninstall_from_arguments(data_dir: &Path, arguments: &Value) -> Value {
-    let skill_name = match requested_skill_name(arguments) {
-        Ok(name) => name,
+    uninstall_from_arguments_with_context(data_dir, None, arguments)
+}
+
+fn uninstall_from_arguments_with_context(
+    data_dir: &Path,
+    science_context: Option<&ScienceHostContext>,
+    arguments: &Value,
+) -> Value {
+    let (skill_name, confirm_bundle_id) = match validate_uninstall_arguments(arguments) {
+        Ok(values) => values,
         Err(message) => return uninstall_failure(message),
     };
-    match uninstall_external_skill(data_dir, &skill_name) {
+    match uninstall_external_skill(
+        data_dir,
+        science_context,
+        &skill_name,
+        confirm_bundle_id.as_deref(),
+    ) {
         Ok(value) => value,
         Err(message) => uninstall_failure(message),
     }
 }
 
-fn uninstall_external_skill(data_dir: &Path, skill_name: &str) -> Result<Value, String> {
+fn bundle_uninstall_confirmation(
+    bundle: &csswitch_skill_install_core::BundleUninstall,
+    skill_name: &str,
+    confirmation_changed: bool,
+) -> Value {
+    let message = if confirmation_changed {
+        "bundle 归属或确认 ID 已变化；文件和绑定尚未改动。请向用户重新展示当前整包成员，并等待新的明确确认。"
+    } else {
+        "该 Skill 属于 bundle；文件和绑定尚未改动。请向用户展示完整受影响 Skill 列表，并确认是否整包卸载。取消时不要再次调用卸载工具。"
+    };
+    json!({
+        "status": "BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED",
+        "package_kind": "bundle",
+        "bundle_id": bundle.bundle_id,
+        "confirm_bundle_id": bundle.bundle_id,
+        "bundle_name": bundle.bundle_name,
+        "skill_name": skill_name,
+        "skill_names": bundle.skill_names,
+        "affected_skill_names": bundle.skill_names,
+        "confirmation_required": true,
+        "confirmation_scope": "whole_bundle",
+        "partial_uninstall_supported": false,
+        "detach_required": false,
+        "detach_attempted": false,
+        "detach_verified": false,
+        "directory_removed": false,
+        "quarantine_commit": false,
+        "restart_required": false,
+        "request_terminal": true,
+        "automatic_retry_allowed": false,
+        "message": message
+    })
+}
+
+fn uninstall_external_skill(
+    data_dir: &Path,
+    science_context: Option<&ScienceHostContext>,
+    skill_name: &str,
+    confirm_bundle_id: Option<&str>,
+) -> Result<Value, String> {
     validate_skill_name(skill_name)?;
+    if let Some(bundle) = find_bundle_for_skill(data_dir, skill_name).map_err(|e| e.to_string())? {
+        if confirm_bundle_id != Some(bundle.bundle_id.as_str()) {
+            return Ok(bundle_uninstall_confirmation(
+                &bundle,
+                skill_name,
+                confirm_bundle_id.is_some(),
+            ));
+        }
+        let context = science_context
+            .ok_or("bundle 卸载需要 CSSwitch 已确认的 Science runtime；文件尚未改动")?;
+        update_agent_skills(context, &[], &bundle.skill_names, &bundle.active_org).map_err(
+            |error| format!("bundle 批量 detach 未确认，文件尚未改动：{}", error.message),
+        )?;
+        let commit = match quarantine_bundle(data_dir, &bundle) {
+            Ok(commit) => commit,
+            Err(error) => {
+                return match update_agent_skills(
+                    context,
+                    &bundle.skill_names,
+                    &[],
+                    &bundle.active_org,
+                ) {
+                    Ok(_) => Err(format!(
+                        "bundle 整包隔离失败，已恢复 OPERON 绑定：{}",
+                        error.message
+                    )),
+                    Err(restore_error) => Err(format!(
+                        "bundle 整包隔离失败，且 OPERON 绑定恢复未确认：{}；{}",
+                        error.message, restore_error.message
+                    )),
+                };
+            }
+        };
+        return Ok(json!({
+            "status": "BUNDLE_UNINSTALLED_DETACHED",
+            "package_kind": "bundle",
+            "bundle_id": commit.bundle_id,
+            "bundle_name": commit.bundle_name,
+            "skill_name": skill_name,
+            "skill_names": commit.skill_names,
+            "agent_name": "OPERON",
+            "detach_required": false,
+            "detach_verified": true,
+            "detach_method": "csswitch_batch_auto_detach",
+            "directory_removed": true,
+            "quarantine_commit": true,
+            "quarantine_path": commit.quarantined_path,
+            "restart_required": false,
+            "message": "bundle 已整包解除 OPERON 绑定并移入 CSSwitch 隔离回收区。"
+        }));
+    }
+    if confirm_bundle_id.is_some() {
+        return Err("确认的 bundle 已不存在，或该 Skill 的 bundle 归属已改变；文件尚未改动".into());
+    }
     let active_org = read_active_org(data_dir)?;
     let skills_root = data_dir.join("orgs").join(&active_org).join("skills");
     ensure_safe_root(data_dir, &skills_root)?;
@@ -835,57 +1287,6 @@ fn prepare_trash_root(data_dir: &Path, trash_root: &Path) -> Result<(), String> 
     Ok(())
 }
 
-fn parse_github_source(raw: &str) -> Result<GithubSource, String> {
-    if raw.contains('?') || raw.contains('#') {
-        return Err("GitHub URL 不得包含查询参数或片段".into());
-    }
-    let prefix = "https://github.com/";
-    let rest = raw
-        .strip_prefix(prefix)
-        .ok_or("只支持 https://github.com 的公开目录 URL")?;
-    let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
-    if parts.len() < 5 || parts[2] != "tree" {
-        return Err("URL 必须是 https://github.com/owner/repo/tree/ref/path".into());
-    }
-    let token = Regex::new(r"^[A-Za-z0-9_.-]+$").expect("static regex");
-    if !token.is_match(parts[0]) || !token.is_match(parts[1]) {
-        return Err("GitHub owner 或 repo 非法".into());
-    }
-    let tail = parts[3..]
-        .iter()
-        .map(|part| percent_decode_segment(part))
-        .collect::<Result<Vec<_>, _>>()?;
-    if tail.len() < 2 || tail.len() > 32 || tail.iter().any(|part| !safe_component(part)) {
-        return Err("GitHub ref/path 非法或过长".into());
-    }
-    Ok(GithubSource {
-        owner: parts[0].into(),
-        repo: parts[1].trim_end_matches(".git").into(),
-        tail,
-    })
-}
-
-fn percent_decode_segment(value: &str) -> Result<String, String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                return Err("URL 百分号编码非法".into());
-            }
-            let hex =
-                std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| "URL 编码非法")?;
-            out.push(u8::from_str_radix(hex, 16).map_err(|_| "URL 编码非法")?);
-            index += 3;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_| "URL 必须是 UTF-8".into())
-}
-
 fn safe_component(value: &str) -> bool {
     !value.is_empty()
         && value != "."
@@ -893,253 +1294,6 @@ fn safe_component(value: &str) -> bool {
         && !value.contains('/')
         && !value.contains('\\')
         && !value.contains('\0')
-}
-
-fn encode_path(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
-}
-
-fn github_json(client: &Client, url: &str) -> Result<Option<Value>, String> {
-    let response = client
-        .get(url)
-        .header(USER_AGENT, "CSSwitch-Skill-Installer/0.1")
-        .header(ACCEPT, "application/vnd.github+json")
-        .send()
-        .map_err(|e| format!("GitHub 请求失败：{e}"))?;
-    if response.status().as_u16() == 404 || response.status().as_u16() == 422 {
-        return Ok(None);
-    }
-    if !response.status().is_success() {
-        return Err(format!("GitHub 返回 HTTP {}", response.status().as_u16()));
-    }
-    let mut body = Vec::new();
-    response
-        .take((MAX_TOTAL_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .map_err(|e| format!("读取 GitHub 响应失败：{e}"))?;
-    if body.len() > MAX_TOTAL_BYTES {
-        return Err("GitHub 元数据响应过大".into());
-    }
-    serde_json::from_slice(&body)
-        .map(Some)
-        .map_err(|e| format!("GitHub JSON 非法：{e}"))
-}
-
-fn resolve_source(client: &Client, source: GithubSource) -> Result<ResolvedSource, String> {
-    let mut matches = Vec::new();
-    for split in 1..source.tail.len() {
-        let reference = source.tail[..split].join("/");
-        let path = source.tail[split..].join("/");
-        let commit_url = format!(
-            "https://api.github.com/repos/{}/{}/commits/{}",
-            source.owner,
-            source.repo,
-            encode_path(&reference)
-        );
-        let Some(commit_json) = github_json(client, &commit_url)? else {
-            continue;
-        };
-        let Some(commit) = commit_json.get("sha").and_then(Value::as_str) else {
-            continue;
-        };
-        let tree_url = format!(
-            "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
-            source.owner, source.repo, commit
-        );
-        let Some(tree_json) = github_json(client, &tree_url)? else {
-            continue;
-        };
-        if tree_json.get("truncated").and_then(Value::as_bool) == Some(true) {
-            return Err("GitHub 仓库树过大且响应被截断，拒绝安装".into());
-        }
-        let files = collect_tree_files(&tree_json, &path)?;
-        if files
-            .iter()
-            .any(|file| file.relative_path == Path::new("SKILL.md"))
-        {
-            matches.push(ResolvedSource {
-                owner: source.owner.clone(),
-                repo: source.repo.clone(),
-                commit: commit.to_string(),
-                path,
-                files,
-            });
-        }
-    }
-    match matches.len() {
-        0 => Err("无法解析 GitHub ref/path，或目录顶层没有 SKILL.md".into()),
-        1 => Ok(matches.remove(0)),
-        _ => Err("GitHub URL 的 ref/path 存在歧义；请改用 commit SHA 形式的 URL".into()),
-    }
-}
-
-fn collect_tree_files(tree_json: &Value, source_path: &str) -> Result<Vec<TreeFile>, String> {
-    let prefix = format!("{}/", source_path.trim_end_matches('/'));
-    let entries = tree_json
-        .get("tree")
-        .and_then(Value::as_array)
-        .ok_or("GitHub tree 响应缺少 tree")?;
-    let mut files = Vec::new();
-    let mut total = 0usize;
-    for entry in entries {
-        let Some(repo_path) = entry.get("path").and_then(Value::as_str) else {
-            continue;
-        };
-        if !repo_path.starts_with(&prefix) {
-            continue;
-        }
-        let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
-        if kind == "tree" {
-            continue;
-        }
-        let mode = entry.get("mode").and_then(Value::as_str).unwrap_or("");
-        if kind != "blob" || !matches!(mode, "100644" | "100755") {
-            return Err(format!(
-                "Skill 包含不支持的链接、子模块或特殊文件：{repo_path}"
-            ));
-        }
-        let relative = &repo_path[prefix.len()..];
-        let relative_path = validate_relative_path(relative)?;
-        let size = entry.get("size").and_then(Value::as_u64).unwrap_or(0) as usize;
-        if size > MAX_FILE_BYTES {
-            return Err(format!(
-                "Skill 文件超过 {} MiB 限制",
-                MAX_FILE_BYTES / 1024 / 1024
-            ));
-        }
-        total = total.checked_add(size).ok_or("Skill 总大小溢出")?;
-        if total > MAX_TOTAL_BYTES {
-            return Err(format!(
-                "Skill 总大小超过 {} MiB 限制",
-                MAX_TOTAL_BYTES / 1024 / 1024
-            ));
-        }
-        files.push(TreeFile {
-            relative_path,
-            blob_sha: entry
-                .get("sha")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            executable: mode == "100755",
-            size,
-        });
-        if files.len() > MAX_FILES {
-            return Err(format!("Skill 文件数超过 {MAX_FILES} 限制"));
-        }
-    }
-    Ok(files)
-}
-
-fn validate_relative_path(value: &str) -> Result<PathBuf, String> {
-    let path = Path::new(value);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return Err("Skill 包含不安全路径".into());
-    }
-    if value.as_bytes().contains(&0) || value.split('/').any(|part| part.is_empty()) {
-        return Err("Skill 包含不安全路径".into());
-    }
-    Ok(path.to_path_buf())
-}
-
-fn skill_name_from_source_path(path: &str) -> Result<String, String> {
-    let name = path.rsplit('/').next().unwrap_or("");
-    let valid = Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$").expect("static regex");
-    if !valid.is_match(name) || matches!(name, "." | "..") {
-        return Err("Skill 目录名非法".into());
-    }
-    Ok(name.to_string())
-}
-
-fn download_tree(client: &Client, source: &ResolvedSource, temp: &Path) -> Result<(), String> {
-    let mut seen_casefold = BTreeMap::<String, PathBuf>::new();
-    let mut actual_total = 0usize;
-    for file in &source.files {
-        let folded = file.relative_path.to_string_lossy().to_lowercase();
-        if let Some(prior) = seen_casefold.insert(folded, file.relative_path.clone()) {
-            return Err(format!(
-                "Skill 包含大小写冲突路径：{} / {}",
-                prior.display(),
-                file.relative_path.display()
-            ));
-        }
-        if file.blob_sha.len() != 40 || !file.blob_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err("GitHub tree 包含非法 blob SHA".into());
-        }
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/git/blobs/{}",
-            source.owner, source.repo, file.blob_sha
-        );
-        let Some(blob) = github_json(client, &url)? else {
-            return Err("GitHub blob 不存在".into());
-        };
-        if blob.get("encoding").and_then(Value::as_str) != Some("base64") {
-            return Err("GitHub blob 编码不受支持".into());
-        }
-        let encoded = blob
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or("GitHub blob 缺少内容")?;
-        let content = base64::engine::general_purpose::STANDARD
-            .decode(
-                encoded
-                    .bytes()
-                    .filter(|byte| !byte.is_ascii_whitespace())
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|_| "GitHub blob base64 非法")?;
-        if content.len() > MAX_FILE_BYTES || (file.size != 0 && content.len() != file.size) {
-            return Err("GitHub blob 大小与 tree 元数据不一致或超限".into());
-        }
-        actual_total = actual_total
-            .checked_add(content.len())
-            .ok_or("Skill 总大小溢出")?;
-        if actual_total > MAX_TOTAL_BYTES {
-            return Err("Skill 下载总大小超限".into());
-        }
-        let destination = temp.join(&file.relative_path);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("创建 Skill 子目录失败：{e}"))?;
-        }
-        write_new_file(&destination, &content, file.executable)?;
-    }
-    Ok(())
-}
-
-fn write_new_file(path: &Path, content: &[u8], executable: bool) -> Result<(), String> {
-    #[cfg(unix)]
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(if executable { 0o700 } else { 0o600 });
-    let mut file = options
-        .open(path)
-        .map_err(|e| format!("创建 Skill 文件失败：{e}"))?;
-    file.write_all(content)
-        .map_err(|e| format!("写 Skill 文件失败：{e}"))?;
-    file.sync_all()
-        .map_err(|e| format!("同步 Skill 文件失败：{e}"))?;
-    #[cfg(unix)]
-    fs::set_permissions(
-        path,
-        fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
-    )
-    .map_err(|e| format!("设置 Skill 文件权限失败：{e}"))?;
-    Ok(())
 }
 
 fn read_active_org(data_dir: &Path) -> Result<String, String> {
@@ -1219,22 +1373,6 @@ fn unique_suffix() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
-}
-
-fn sync_tree(root: &Path) -> Result<(), String> {
-    let mut dirs = vec![root.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        for entry in fs::read_dir(&dir).map_err(|e| format!("读取临时目录失败：{e}"))? {
-            let path = entry
-                .map_err(|e| format!("读取临时目录项失败：{e}"))?
-                .path();
-            if path.is_dir() {
-                dirs.push(path);
-            }
-        }
-        sync_directory(&dir)?;
-    }
-    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
@@ -1339,18 +1477,36 @@ mod tests {
         (root, data)
     }
 
+    fn write_poll_json(path: &Path, value: &Value) {
+        let temp = path.with_extension("tmp");
+        fs::write(&temp, serde_json::to_vec(value).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::rename(temp, path).unwrap();
+    }
+
     fn imported_skill(data: &Path, name: &str) -> PathBuf {
         let skill = data.join("orgs/org-test/skills").join(name);
         fs::create_dir(&skill).unwrap();
         fs::write(skill.join("SKILL.md"), b"---\nname: test\n---\n").unwrap();
-        let source = ResolvedSource {
-            owner: "owner".into(),
-            repo: "repo".into(),
-            commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            path: format!("skills/{name}"),
-            files: vec![],
-        };
-        write_import_origin(&skill, &source, name).unwrap();
+        let marker = json!({
+            "version": 1,
+            "repo": "owner/repo",
+            "sha": "0123456789abcdef0123456789abcdef01234567",
+            "plugin": name,
+            "marketplace": CSSWITCH_MARKETPLACE,
+            "path": format!("skills/{name}"),
+            "importedAt": "2026-07-15T00:00:00Z",
+            "license": "NOASSERTION"
+        });
+        fs::write(
+            skill.join(IMPORT_ORIGIN_FILE),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
         skill
     }
 
@@ -1365,43 +1521,119 @@ mod tests {
     }
 
     #[test]
-    fn tool_description_routes_external_install_away_from_authoring() {
+    fn tool_description_routes_download_and_attach_to_csswitch() {
         let tool = install_tool_definition();
         let description = tool["description"].as_str().unwrap();
         assert!(description.contains("host.skills.edit"));
         assert!(description.contains("host.skills.publish"));
-        assert!(description.contains("ambiguous guessed repository"));
-        assert!(description.contains("host.agents.attach_skill"));
+        assert!(description.contains("Agent 只提交准确 URL"));
+        assert!(description.contains("不下载文件"));
+        assert!(description.contains("不要手工调用 host.agents.attach_skill"));
+        assert!(description.contains("skill(skill_name)"));
+
+        let uninstall = uninstall_tool_definition();
+        let uninstall_description = uninstall["description"].as_str().unwrap();
+        assert!(uninstall_description.contains("BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED"));
+        assert!(uninstall_description.contains("confirm_bundle_id"));
+        assert!(uninstall_description.contains("不支持部分物理删除"));
+        assert!(uninstall["inputSchema"]["properties"]["confirm_bundle_id"].is_object());
     }
 
     #[test]
-    fn import_origin_matches_science_sidecar_shape() {
-        let root = temp_dir("origin");
-        let source = ResolvedSource {
-            owner: "anthropics".into(),
-            repo: "skills".into(),
-            commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            path: "skills/internal-comms".into(),
-            files: vec![],
+    fn bundle_uninstall_confirmation_is_structured_and_non_mutating() {
+        let bundle = csswitch_skill_install_core::BundleUninstall {
+            bundle_id: "a".repeat(64),
+            bundle_name: "nature-skills".into(),
+            active_org: "org-test".into(),
+            skill_names: vec!["nature-reader".into(), "nature-writing".into()],
+            top_level_paths: vec![
+                "_shared".into(),
+                "nature-reader".into(),
+                "nature-writing".into(),
+            ],
+            manifest_path: PathBuf::from("/private/tmp/bundle.json"),
         };
-        write_import_origin(&root, &source, "internal-comms").unwrap();
-        let marker: Value =
-            serde_json::from_slice(&fs::read(root.join(IMPORT_ORIGIN_FILE)).unwrap()).unwrap();
-        assert_eq!(marker["version"], 1);
-        assert_eq!(marker["repo"], "anthropics/skills");
-        assert_eq!(marker["sha"], source.commit);
-        assert_eq!(marker["plugin"], "internal-comms");
-        assert_eq!(marker["marketplace"], CSSWITCH_MARKETPLACE);
-        assert_eq!(marker["path"], "skills/internal-comms");
-        assert_eq!(marker["license"], "NOASSERTION");
-        assert!(marker["importedAt"].as_str().unwrap().ends_with('Z'));
-        fs::remove_dir_all(root).unwrap();
+        let result = bundle_uninstall_confirmation(&bundle, "nature-reader", false);
+        assert_eq!(result["status"], "BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED");
+        assert_eq!(result["bundle_id"], "a".repeat(64));
+        assert_eq!(result["confirm_bundle_id"], "a".repeat(64));
+        assert_eq!(result["bundle_name"], "nature-skills");
+        assert_eq!(result["skill_name"], "nature-reader");
+        assert_eq!(result["skill_names"], result["affected_skill_names"]);
+        assert_eq!(result["skill_names"].as_array().unwrap().len(), 2);
+        assert_eq!(result["confirmation_required"], true);
+        assert_eq!(result["confirmation_scope"], "whole_bundle");
+        assert_eq!(result["partial_uninstall_supported"], false);
+        assert_eq!(result["detach_attempted"], false);
+        assert_eq!(result["directory_removed"], false);
+        assert_eq!(result["quarantine_commit"], false);
+
+        let changed = bundle_uninstall_confirmation(&bundle, "nature-reader", true);
+        assert!(changed["message"].as_str().unwrap().contains("重新展示"));
     }
 
     #[test]
-    fn rfc3339_formatter_handles_epoch_and_known_date() {
-        assert_eq!(rfc3339_from_unix(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339_from_unix(1_704_067_199), "2023-12-31T23:59:59Z");
+    fn bundle_confirmation_argument_is_strictly_bound() {
+        let id = "b".repeat(64);
+        let parsed = validate_uninstall_arguments(
+            &json!({"skill_name":"nature-reader","confirm_bundle_id":id}),
+        )
+        .unwrap();
+        assert_eq!(parsed.0, "nature-reader");
+        assert_eq!(
+            parsed.1.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert!(validate_uninstall_arguments(
+            &json!({"skill_name":"nature-reader","confirm_bundle_id":"B".repeat(64)})
+        )
+        .is_err());
+        assert!(validate_uninstall_arguments(
+            &json!({"skill_name":"nature-reader","confirm_bundle_id":"b".repeat(64),"confirm":true})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn source_url_without_science_context_never_writes() {
+        let data = temp_dir("science-not-ready");
+        let result = install_from_arguments(
+            &data,
+            &json!({"source_url": "https://github.com/a/b/tree/main/skill"}),
+        );
+        assert_eq!(result["status"], "SCIENCE_NOT_READY");
+        assert_eq!(result["directory_commit"], false);
+        assert!(!data.join("orgs").exists());
+        fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn github_failures_keep_structured_status_and_mcp_error_semantics() {
+        for code in [
+            "GITHUB_RATE_LIMITED",
+            "GITHUB_PERMISSION_DENIED",
+            "GITHUB_NOT_FOUND",
+            "GITHUB_TIMEOUT",
+            "GITHUB_REDIRECT_INVALID",
+            "SOURCE_REF_REQUIRES_COMMIT_SHA",
+            "LEGACY_INTEGRITY_UNVERIFIED",
+        ] {
+            let payload = install_error_payload(
+                Some("demo"),
+                InstallError::new(code, "expected failure", "test").retryable(true),
+            );
+            assert_eq!(payload["status"], code);
+            assert_eq!(payload["request_terminal"], true);
+            assert_eq!(payload["automatic_retry_allowed"], false);
+            assert_eq!(payload["user_retry_available"], true);
+            assert!(payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("不得自动重试"));
+            let result = tool_result(payload);
+            assert_eq!(result["isError"], true);
+            assert_eq!(result["structuredContent"]["status"], code);
+        }
     }
 
     #[test]
@@ -1466,27 +1698,50 @@ mod tests {
         let invalid = uninstall_from_arguments(&data, &json!({"skill_name":"../escape"}));
         assert_eq!(invalid["status"], "UNINSTALL_FAILED");
         assert!(invalid["message"].as_str().unwrap().contains("非法"));
+
+        let single = imported_skill(&data, "single-skill");
+        let stale_confirmation = uninstall_from_arguments(
+            &data,
+            &json!({"skill_name":"single-skill","confirm_bundle_id":"c".repeat(64)}),
+        );
+        assert_eq!(stale_confirmation["status"], "UNINSTALL_FAILED");
+        assert!(stale_confirmation["message"]
+            .as_str()
+            .unwrap()
+            .contains("bundle"));
+        assert!(single.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn github_url_parser_keeps_ambiguous_ref_tail_for_resolution() {
-        let source =
-            parse_github_source("https://github.com/owner/repo/tree/feature/slash/skills/pdf")
-                .unwrap();
-        assert_eq!(source.owner, "owner");
-        assert_eq!(source.repo, "repo");
-        assert_eq!(source.tail, ["feature", "slash", "skills", "pdf"]);
-        assert!(parse_github_source("http://github.com/owner/repo/tree/main/pdf").is_err());
-        assert!(parse_github_source("https://github.com/owner/repo/tree/main/../pdf").is_err());
-        assert!(parse_github_source("https://github.com/owner/repo/tree/main/pdf?x=1").is_err());
-    }
-
-    #[test]
-    fn tree_collection_rejects_symlinks_and_traversal() {
-        let symlink = json!({"tree": [{"path":"skills/pdf/SKILL.md","type":"blob","mode":"120000","sha":"0123456789012345678901234567890123456789","size":4}]});
-        assert!(collect_tree_files(&symlink, "skills/pdf").is_err());
-        assert!(validate_relative_path("../escape").is_err());
+    fn uninstall_accepts_v1_compatible_local_zip_marker() {
+        let (root, data) = standard_data_dir("uninstall-local-zip");
+        let skill = data.join("orgs/org-test/skills/local-demo");
+        fs::create_dir(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), b"demo").unwrap();
+        fs::write(
+            skill.join(IMPORT_ORIGIN_FILE),
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "repo": "csswitch/local-archive",
+                "sha": "a".repeat(40),
+                "plugin": "local-demo",
+                "marketplace": CSSWITCH_MARKETPLACE,
+                "path": "local-demo",
+                "importedAt": "2026-07-15T00:00:00Z",
+                "license": "NOASSERTION",
+                "csswitch_revision": 2,
+                "source_kind": "local_zip",
+                "content_sha256": "b".repeat(64),
+                "archive_sha256": "a".repeat(64)
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let result = uninstall_from_arguments(&data, &json!({"skill_name":"local-demo"}));
+        assert_eq!(result["status"], "QUARANTINED_DETACH_REQUIRED");
+        assert!(!skill.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -1536,7 +1791,10 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(names, [INSTALL_TOOL_NAME, UNINSTALL_TOOL_NAME]);
+        assert_eq!(
+            names,
+            [INSTALL_TOOL_NAME, UNINSTALL_TOOL_NAME, POLL_TOOL_NAME]
+        );
         let called = mcp_request(bridge, ToolMode::All, &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":INSTALL_TOOL_NAME,"arguments":{"skill_name":"pdf"}}})).unwrap();
         assert_eq!(
             called["result"]["structuredContent"]["status"],
@@ -1550,6 +1808,12 @@ mod tests {
         assert_eq!(
             uninstall["result"]["structuredContent"]["request"]["payload"]["operation"],
             "uninstall"
+        );
+        let confirmed = mcp_request(bridge, ToolMode::All, &json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":UNINSTALL_TOOL_NAME,"arguments":{"skill_name":"pdf","confirm_bundle_id":"d".repeat(64)}}})).unwrap();
+        assert_eq!(
+            confirmed["result"]["structuredContent"]["request"]["payload"]["arguments"]
+                ["confirm_bundle_id"],
+            "d".repeat(64)
         );
     }
 
@@ -1572,8 +1836,9 @@ mod tests {
             &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         )
         .unwrap();
-        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 2);
         assert_eq!(listed["result"]["tools"][0]["name"], UNINSTALL_TOOL_NAME);
+        assert_eq!(listed["result"]["tools"][1]["name"], POLL_TOOL_NAME);
         let rejected = mcp_request(
             bridge,
             ToolMode::Uninstall,
@@ -1590,10 +1855,30 @@ mod tests {
             bridge,
             TEST_BRIDGE_TOKEN,
             "uninstall",
-            &json!({"skill_name":"pdf"}),
+            &json!({"skill_name":"pdf","confirm_bundle_id":"e".repeat(64)}),
         );
         let filename = result["request"]["filename"].as_str().unwrap();
         let id = filename.strip_suffix(".request.json").unwrap();
+        assert_eq!(result["request_id"], id);
+        assert_eq!(
+            result["request"]["status_filename"],
+            format!("{id}.status.json")
+        );
+        assert_eq!(result["request"]["poll_tool"], POLL_TOOL_NAME);
+        assert_eq!(result["request"]["poll_after_seconds"], 0);
+        assert_eq!(
+            result["request"]["timeout_seconds"],
+            BRIDGE_INSTALL_RESPONSE_TIMEOUT_SECONDS
+        );
+        assert_eq!(result["request"]["terminal_grace_seconds"], 5);
+        assert!(result["message"]
+            .as_str()
+            .unwrap()
+            .contains("绝不能再次写 request_filename"));
+        assert!(result["message"]
+            .as_str()
+            .unwrap()
+            .contains("不要运行 sleep"));
         let request = result["request"]["payload"].clone();
         validate_bridge_request(TEST_BRIDGE_TOKEN, id, &request).unwrap();
 
@@ -1608,6 +1893,72 @@ mod tests {
         let expired_signature = sign_bridge_request(TEST_BRIDGE_TOKEN, &expired).unwrap();
         expired["signature"] = json!(expired_signature);
         assert!(validate_bridge_request(TEST_BRIDGE_TOKEN, id, &expired).is_err());
+    }
+
+    #[test]
+    fn poll_tool_reports_progress_long_polls_and_returns_final_response() {
+        let bridge = temp_dir("poll-bridge");
+        let id = "a".repeat(32);
+        let status_path = bridge.join(format!("{id}.status.json"));
+        let response_path = bridge.join(format!("{id}.response.json"));
+        write_poll_json(
+            &status_path,
+            &json!({
+                "status": "PROCESSING",
+                "request_id": id,
+                "phase": "download",
+                "sequence": 7,
+                "elapsed_seconds": 12,
+                "deadline_at": unix_seconds() + 60,
+                "terminal_grace_seconds": 5
+            }),
+        );
+        let first = poll_bridge_request(&bridge, &json!({"request_id": id}));
+        assert_eq!(first["status"], "PROCESSING");
+        assert_eq!(first["phase"], "download");
+        assert_eq!(first["sequence"], 7);
+        assert_eq!(first["poll_again"], true);
+
+        let response_for_thread = response_path.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            write_poll_json(
+                &response_for_thread,
+                &json!({"status":"BUNDLE_INSTALLED_ATTACHED","directory_commit":true}),
+            );
+        });
+        let final_response =
+            poll_bridge_request(&bridge, &json!({"request_id": id, "last_sequence": 7}));
+        worker.join().unwrap();
+        assert_eq!(final_response["status"], "BUNDLE_INSTALLED_ATTACHED");
+        assert_eq!(final_response["request_id"], id);
+        assert_eq!(final_response["poll_complete"], true);
+        assert_eq!(final_response["poll_again"], false);
+
+        let invalid = poll_bridge_request(&bridge, &json!({"request_id":"../escape"}));
+        assert_eq!(invalid["status"], "REQUEST_STATUS_INVALID");
+        fs::remove_dir_all(bridge).unwrap();
+    }
+
+    #[test]
+    fn poll_tool_stops_after_host_deadline_without_resubmitting() {
+        let bridge = temp_dir("poll-timeout");
+        let id = "b".repeat(32);
+        write_poll_json(
+            &bridge.join(format!("{id}.status.json")),
+            &json!({
+                "status": "PROCESSING",
+                "request_id": id,
+                "phase": "download",
+                "sequence": 4,
+                "deadline_at": unix_seconds().saturating_sub(10),
+                "terminal_grace_seconds": 5
+            }),
+        );
+        let result = poll_bridge_request(&bridge, &json!({"request_id": id}));
+        assert_eq!(result["status"], "HOST_RESPONSE_TIMEOUT");
+        assert_eq!(result["poll_again"], false);
+        fs::remove_dir_all(bridge).unwrap();
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.5.0"><img src="https://img.shields.io/badge/release-v0.5.0-2ea44f.svg" alt="CSSwitch v0.5.0"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.6.0"><img src="https://img.shields.io/badge/release-v0.6.0-2ea44f.svg" alt="CSSwitch v0.6.0"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -24,13 +24,14 @@ CSSwitch 是一个给 Claude Science 使用的本地配置转换器。它把 Sci
 
 [下载最新版](../../releases/latest) · [项目文档](./docs/README.md) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.5.0：** CSSwitch 可在第三方模型模式下通过一个合并后的本地 connector 安装或卸载外部 Skill。安装要求准确的公开 GitHub 目录 URL，并在 Science 审批后复制、原生绑定和验证；卸载只隔离 CSSwitch 自己导入的目录，再使用 Science 原生解绑。版本还优化了重复「一键开始」的 Science 版本探测与 Skill 路由同步，并可由用户显式授权隔离 Science 使用系统 `~/.ssh/config`。详见[外部 Skill bridge](./docs/features/external-skill-bridge.md)、[系统 SSH](./docs/features/system-ssh.md)和[架构说明](./docs/architecture/overview.md)。
+> **0.6.0：** 外部 Skill 安装现在支持准确的公开 GitHub URL 和主面板本地 `.zip` / `.skill` 两条路线；GitHub 慢下载提供单请求进度、终态清理和重启中断恢复。bundle 从任意成员卸载时，必须先返回完整受影响 Skill 列表并由用户确认整包卸载，不做部分物理删除。v0.5.0 的旧 connector 路由会自动迁移，用户 MCP 配置和未知字段保持原样。详见[外部 Skill bridge](./docs/features/external-skill-bridge.md)、[系统 SSH](./docs/features/system-ssh.md)和[架构说明](./docs/architecture/overview.md)。
 
 ## 目录
 
 - [为什么需要 CSSwitch](#为什么需要-csswitch)
 - [可以做什么](#可以做什么)
 - [快速开始](#快速开始)
+- [安装和卸载外部 Skill](#安装和卸载外部-skill)
 - [从旧版升级](#从旧版升级)
 - [支持的模型来源](#支持的模型来源)
 - [状态诊断与能力 catalog](#状态诊断与能力-catalog)
@@ -70,7 +71,7 @@ Claude Science sandbox
 - 点击「一键开始」会自动启动代理、准备隔离环境、打开 Science。
 - Science 顶部模型选择器会显示你选择的真实模型名，而不是笼统的 `claude` 或 `opus`。
 - 可以一键切回「官方 Claude」模式，不干扰你的真实 Claude 登录。
-- 复用 Science 的持久化 data-dir；Skill 状态不阻塞 CSSwitch 启动。0.5.0 可通过对话从准确的公开 GitHub URL 安装 Skill，并通过同一 connector 安全隔离卸载 CSSwitch 自己的导入。
+- 复用 Science 的持久化 data-dir；Skill 状态不阻塞 CSSwitch 启动。0.6.0 可从准确的公开 GitHub URL 或本地 `.zip` / `.skill` 安装单 Skill/bundle；bundle 卸载必须整包确认并只隔离 CSSwitch 自己的导入。
 - CSSwitch 默认继承 `/Applications/Claude Science.app` 中用户当前安装的 Science，不比较、固定、升级或降级版本；更新 App 后，下次启动继续复用原 data-dir 并使用更新后的 App executable。
 - 如果 Science App 缺失，CSSwitch 不会静默启动 data-dir 中的旧缓存。只有缓存可执行且版本可确认时，UI 才允许“仅本次使用缓存版本”；该选择不保存。否则只能打开 [Claude 官方下载页](https://claude.com/download) 安装 / 更新或取消。
 
@@ -104,9 +105,43 @@ CSSwitch 不替你选择 Science 版本。正常启动使用当前安装的 Clau
 
 如果你想使用 Science 的官方服务配置，切到「官方 Claude」模式即可。CSSwitch 会停止第三方代理链路，再打开真实 Science。
 
+## 安装和卸载外部 Skill
+
+CSSwitch 0.6.0 提供 GitHub 和本地文件两条安装路线。两条路线使用相同的路径、大小、符号链接和保留文件校验，并在安装后把 Skill 原生绑定到 Science 的默认 Agent。安装器不会替你登录 GitHub，也不会读取或接管 Science 凭证。
+
+**从公开 GitHub URL 安装**
+
+1. 在 CSSwitch 中完成「一键开始」，然后打开一个新的 Science 对话。
+2. 把准确的公开 GitHub tree URL 发给 Agent，并明确要求使用 CSSwitch 外部 Skill 安装器。例如：
+
+   ```text
+   请使用 CSSwitch 外部 Skill 安装器安装这个固定提交，只发起一次请求，不要自动重试：
+   https://github.com/<owner>/<repo>/tree/<commit>/<path>
+   ```
+
+3. Science 请求访问 CSSwitch bridge 目录时，核对路径后批准本次读写授权。
+4. 下载期间等待同一个请求继续推进，不要重复发送安装指令。成功后，单 Skill 会要求在当前会话做一次加载验证；bundle 会报告完整成员数量和绑定结果。
+
+推荐使用固定 commit URL，便于复用和核对。公开仓库的根目录 bundle 也可以使用 `.../tree/<commit>`。私有仓库、名称搜索、覆盖更新和 Skill 发布不在当前范围内。
+
+**从本地文件安装**
+
+1. 保持隔离 Science 正在运行且状态正常。
+2. 在 CSSwitch 主面板点击「导入 Skill 包」。
+3. 选择 `.zip` 或 `.skill` 文件。支持 archive 根目录直接包含 `SKILL.md`、唯一外层 Skill 目录，以及包含多个直接 Skill 子目录和可选 `_shared` 的 bundle。
+4. CSSwitch 校验、原子写入并绑定后，在新的 Science 对话中加载对应 Skill，确认它能真实执行。
+
+完全相同的 GitHub 固定提交或本地 archive 再次安装时会校验并快速复用，不会重新下载或生成重复 Skill。同名但来源或内容不同的包会返回冲突，不会覆盖现有安装。
+
+**卸载与 bundle 确认**
+
+在 Science 中要求 CSSwitch 卸载器卸载某个 Skill。单 Skill 只会处理带有 CSSwitch 导入标记的目录，并在隔离后完成 Agent 解绑。若目标属于 bundle，首次调用只返回 bundle 名称、完整受影响 Skill 列表和确认 ID，不会删除文件；只有用户明确确认后才整包解绑和隔离。取消时不应再次调用卸载工具，当前版本也不支持只物理删除一个 bundle 成员。
+
+更完整的状态、限制、恢复行为和故障排查见[外部 Skill bridge](./docs/features/external-skill-bridge.md)。
+
 ## 从旧版升级
 
-0.5.0 保留现有 v2 配置格式并继续复用 `~/.csswitch/sandbox/home/.claude-science`，因此已有 Science 组织、项目和 Skill 不会被迁移或覆盖。旧 `~/.csswitch/` Skill store/inventory 会原样保留但不再参与启动；外部 `~/.claude/skills` 也不会自动同步到 Science。
+0.6.0 保留现有 v2 配置格式并继续复用 `~/.csswitch/sandbox/home/.claude-science`，因此已有 Science 组织、项目和 Skill 不会被迁移或覆盖。v0.5.0 的旧外部 Skill connector 会合并迁移；用户自建 MCP 项和未知配置字段保持不变。旧 `~/.csswitch/` Skill store/inventory 会原样保留但不再参与启动；外部 `~/.claude/skills` 也不会自动同步到 Science。
 
 完整步骤、备份位置和回滚边界见[升级与回滚说明](./docs/operations/upgrade-and-rollback.md)。
 
@@ -154,7 +189,7 @@ CSSwitch 不是 Claude 官方服务，第三方模型模式也不会获得 Anthr
 
 - Anthropic 托管的远程 MCP 服务不可用，例如 `pubmed`、`clinical-trials`、`chembl`、`biorxiv` 等 `*.mcp.claude.com` 服务。
 - 依赖真实 Claude 账号授权的目录连接器、远程插件、云端能力可能会显示 session expired、unavailable 或 skipped。
-- Science 原生 GitHub 导入、新 Skill 发布和草稿删除仍可能查询 Anthropic 账号 catalog。CSSwitch 不伪造 OAuth 或 catalog；0.5.0 仅增加准确公开 GitHub URL 的本地安装与隔离回收，不提供确定性的名称搜索、更新、覆盖、永久删除/恢复界面、私有仓库或发布。
+- Science 原生 GitHub 导入、新 Skill 发布和草稿删除仍可能查询 Anthropic 账号 catalog。CSSwitch 不伪造 OAuth 或 catalog；0.6.0 只支持准确公开 GitHub URL 或用户选择的本地 `.zip` / `.skill`，并对 CSSwitch 导入做整包隔离回收，不提供确定性的名称搜索、覆盖、成员级物理删除、永久删除/恢复界面、私有仓库或发布。
 - 第三方模型对工具调用、长上下文、thinking、图片和流式输出的兼容程度不同；原生 Anthropic 端点通常比 OpenAI 翻译路径更稳。
 - 当前 macOS 包尚未 Apple 公证，首次启动需要手动放行。
 - inference gateway 已是随应用打包的 Rust sidecar；不再提供运行时 Python fallback。

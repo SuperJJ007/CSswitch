@@ -20,6 +20,10 @@ pub struct GatewayConfig {
     /// It is supplied only through the child environment and is never returned
     /// from Gateway health or inference responses.
     pub skill_bridge_token: Option<String>,
+    /// Verified Science runtime identity used by the local Skill attach control
+    /// plane. A gateway without this context still serves inference traffic but
+    /// does not install Skills.
+    pub science_host_context: Option<csswitch_skill_install_core::ScienceHostContext>,
 }
 
 pub const UPSTREAM_UA: &str = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSSwitch)";
@@ -243,6 +247,21 @@ impl GatewayConfig {
                     value.len() == 64
                         && value.chars().all(|character| character.is_ascii_hexdigit())
                 });
+        let science_host_context = std::env::var("CSSWITCH_SCIENCE_HOST_CONTEXT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                serde_json::from_str::<csswitch_skill_install_core::ScienceHostContext>(&value)
+                    .map_err(|_| "CSSWITCH_SCIENCE_HOST_CONTEXT 不是合法的 Science host context")
+            })
+            .transpose()?;
+        if science_host_context
+            .as_ref()
+            .zip(skill_data_dir.as_ref())
+            .is_some_and(|(context, data_dir)| &context.data_dir != data_dir)
+        {
+            return Err("Science host context 与 Skill data-dir 不一致".into());
+        }
         Ok(Self {
             provider,
             port: port.ok_or("--port 必填")?,
@@ -257,6 +276,7 @@ impl GatewayConfig {
             skill_data_dir,
             skill_bridge_dir,
             skill_bridge_token,
+            science_host_context,
         })
     }
 }

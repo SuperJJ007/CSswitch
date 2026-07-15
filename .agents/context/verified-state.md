@@ -1,8 +1,17 @@
 # 已验证状态快照
 
-最后复核：2026-07-14。
+最后复核：2026-07-16。
 
-## 本轮直接复核
+## v0.6.0 发布候选
+
+- 外部 Skill 安装支持准确公开 GitHub URL 与主面板本地 `.zip` / `.skill`；共享 package core 对单 Skill 和 bundle 执行一致的安全校验与原子提交。
+- GitHub 安装使用单请求协议，提供下载进度、终态响应、无自动重试、`.processing` 清理与 gateway 重启中断恢复。
+- bundle 从任意成员卸载会先返回完整受影响列表和整包确认；取消不改动，确认后整包批量解绑与隔离，不提供部分物理删除。
+- v0.5.0 旧 route / split connector 会迁移到合并 connector，并保留用户 MCP 项和未知字段；停止、重启恢复与重复安装均有自动化或定向验证。
+- `435d8b9` 合并主线文档维护体系后，`bash test/run_all.sh --require-release-ready` 退出 0；五层全部 pass，Tauri 232 passed / 3 explicit ignored，Gateway 102 passed。
+- 发布者报告大部分 v0.6.0 真机验收成功并授权合并发布；没有逐项结构化日志，因此只记作部分人工验收。
+
+## v0.5.0 历史直接复核
 
 - 文档基线为 `v0.5.0 / main@557a01f`；本轮开始时维护 worktree 干净。
 - `main`、`origin/main` 与本地 `v0.5.0^{}` 指向同一 commit。
