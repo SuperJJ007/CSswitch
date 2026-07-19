@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.9.0-beta.1] — Unreleased
+
+### Added
+
+- Added an internal Ubuntu 24.04 x86_64/glibc beta target with a shared macOS/Linux runtime platform adapter, trusted system-tool paths, Linux Science discovery at `$HOME/.local/bin/claude-science`, and fixed `/usr/bin/xdg-open` browser integration.
+- Added fail-closed Linux preflight for x86_64, Bubblewrap 0.8.0 or newer, working unprivileged user namespaces, `socat`, and `lsof`. The preflight returns bounded `environment_blocked` codes and never offers a no-sandbox fallback.
+- Enabled the existing CSSwitch-owned Codex browser OAuth, dynamic model catalog, and inference path on Linux while retaining private `0700/0600` files, atomic generation checks, loopback callbacks, symlink rejection, and a bounded environment allowlist.
+- Added an Ubuntu 24.04 GitHub Actions workflow that runs the release-ready gate, builds one internal amd64 `.deb`, checks package contents and metadata, installs it under Xvfb, emits SHA-256, and retains the artifact for 14 days without publishing a Release.
+
+### Changed
+
+- Linux exposes only isolated third-party mode. The UI hides Official Claude, the backend rejects direct `official` requests, and a migrated official-mode configuration is atomically normalized to proxy with a one-time notice.
+- Science launch and stop scripts now run on both macOS Bash 3.2 and Ubuntu Bash. macOS Keychain cleanup remains macOS-only; Linux relies on the isolated HOME and private-file boundary.
+- Linux Science commands now use fixed `/bin/bash`/system-tool paths and a cleared environment with isolated HOME, XDG roots, runtime directory, and temporary directory. Host API/provider variables and SSH agent state are not inherited; system SSH opt-in accepts only a verified config and Unix agent socket.
+- Linux is strictly browser-first. Exact Science nonce URLs stay in backend memory and are validated against the active loopback port; opener failures expose only a redacted origin plus a retry action.
+- Configuration remains schema v4. `get_config` adds read-only `os`, `arch`, `support_tier`, and `official_mode_supported` platform capabilities without adding persistent fields.
+
+### Scope and evidence boundary
+
+- This beta is not tagged or publicly released. WSL/WSLg, ARM64, musl, systemd, AppImage/rpm, remote listeners, `0.0.0.0`, and no-sandbox degradation remain out of scope.
+- Source tests on macOS do not prove the GitHub Actions artifact, installed Ubuntu desktop, real Claude Science runtime, or live Codex OAuth. Those layers must be recorded separately before distribution.
+
 ## [0.7.0] — 2026-07-17
 
 ### Added

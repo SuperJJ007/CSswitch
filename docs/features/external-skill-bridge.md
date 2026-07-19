@@ -1,6 +1,6 @@
 # 外部 Skill 安装桥
 
-公开 GitHub URL 路线自 v0.5.0 起提供，v0.6.0 扩展本地包、bundle 与恢复语义；当前 v0.7.0 继续使用本合同。
+公开 GitHub URL 路线自 v0.5.0 起提供，v0.6.0 扩展本地包、bundle 与恢复语义；已发布 v0.7.0 继续使用本合同，未发布 `v0.9.0-beta.1` Linux 开发线不改变其数据与恢复语义。Linux 上系统文件选择器和完整安装态仍须由 Actions artifact 与 Ubuntu 真机验收，源码接线不能替代这些证据。
 
 CSSwitch 只提供两个窄入口，不启用 Skill Manager：
 

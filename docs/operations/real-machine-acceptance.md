@@ -1,6 +1,6 @@
-# CSSwitch v0.8.0 真机验收
+# CSSwitch v0.9.0-beta.1 真机验收
 
-本矩阵描述应如何验收，不表示各项已经通过。每次执行必须记录目标 commit / artifact、环境和结果；发布附件的既有结果见对应 [release evidence](../evidence/releases/README.md)。
+本矩阵描述应如何验收，不表示各项已经通过。RM-01～RM-45 是从 v0.8.0 延续的 macOS/通用编号；Linux 首期另用 LX 编号。每次执行必须记录目标 commit / artifact、环境和结果；发布附件的既有结果见对应 [release evidence](../evidence/releases/README.md)。
 
 ## 1. 安全护栏
 
@@ -172,3 +172,22 @@ bash test/real_machine_guard.sh assert-stopped
 ```
 
 确认测试端口释放、8765 PID 不变、真实用户目录未改、已安装用户 app 未被替换。若执行过 Codex 登录 / 退出，另外用原生 Codex 自己的脱敏 status 复核其会话仍在；不得用读取原生 token 文件作为证据。每项如实标为通过、失败、环境阻塞、未执行或需人工判断。
+
+## 9. Linux x64 beta 增量矩阵
+
+Linux 必须使用 Ubuntu 24.04 x86_64 云 VM、独立非特权用户和内部 `.deb`，不能在 macOS 或普通容器中代跑。通用安全护栏继续适用；平台细节以 [Linux x64 beta](linux-x64-beta.md) 为准。
+
+| ID | 场景 | 必须满足 |
+|---|---|---|
+| LX-01 | deb 身份 | Actions source SHA、amd64 metadata、SHA-256、Desktop/Gateway/脚本/图标一致 |
+| LX-02 | 环境 preflight | x86_64、bwrap 0.8+、userns、socat、lsof 分别验证；缺一项返回对应 `environment_blocked`，无 no-sandbox |
+| LX-03 | GUI 与 opener | X11/Wayland、中文输入、单实例、隐藏/退出、`/usr/bin/xdg-open` 成功与失败 fallback 分开记录 |
+| LX-04 | official 拒绝 | UI 无入口；直接 backend 请求拒绝；迁入 official 配置原子归一为 proxy 且只提示一次 |
+| LX-05 | Science 选择 | invalid explicit fail closed；`$HOME/.local/bin` 优先；cached_once 仅明确单次授权；不从 PATH 猜测 |
+| LX-06 | 真实 HOME sentinel | 事前/事后 hash、mode、stat 摘要不变；不打开真实凭证内容；隔离 HOME/data-dir 只在 CSSwitch root 下 |
+| LX-07 | 双 loopback | Gateway、Science UI 与 preview 只监听 127.0.0.1；端口冲突和多个/身份不符 listener 均 fail closed |
+| LX-08 | mock 功能 | API-key provider、模型目录、文本、Skill/MCP、system SSH 默认关闭与显式 opt-in |
+| LX-09 | 生命周期恢复 | stop、退出、重开、Gateway/Science crash、journal target identity、无归属残留进程 |
+| LX-10 | 真实 Science | 当日 stable version/arch、start/url/browser/stop 与隔离 data-dir；URL/nonce 不入日志 |
+| LX-11 | Codex OAuth | 用户授权测试账号；取消/超时/成功/退出恢复、动态模型和最小推理；只保留脱敏状态 |
+| LX-12 | 卸载 | package removal、desktop entry 和用户数据保留/删除语义据实记录，不触碰真实 Science 目录 |

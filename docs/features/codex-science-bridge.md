@@ -2,15 +2,17 @@
 
 状态：**v0.7.0 已发布，Codex 仍是默认关闭的实验能力。** browser-only 登录、OAuth 后自动 profile、动态 GPT-5.6 目录兼容、双 App 数据根隔离与无签名前置的私有文件认证已进入发布源码。2026-07-17 的 no-signing Acceptance 候选完成了浏览器 OAuth、动态模型目录、Science 选择 `Codex / GPT-5.6-Sol` 和文本推理验收；最终公开 DMG 已建立 source、hash、打包与分发证据，但没有从该 DMG 安装后重跑 live OAuth / 推理。详见 [v0.7.0 发布证据](../evidence/releases/v0.7.0.md)与[Acceptance 候选证据](../evidence/investigations/2026-07-17-codex-browser-only-acceptance.md)。
 
+未发布的 `v0.9.0-beta.1` 开发线把同一实验合同开放到 Ubuntu 24.04 x86_64 源码路径：OAuth callback 仍只绑定 loopback，浏览器由固定 `/usr/bin/xdg-open` 打开，私有凭据仍归 CSSwitch 文件边界所有且不引入 Secret Service。Linux 编译、Actions artifact、安装态和真实 OAuth 尚未完成时，不能据此声称 Linux 已验收。
+
 本文冻结 CSSwitch 将用户自己的 Codex 登录接入隔离 Claude Science 的 v1 实施边界。它是非官方、实验性且默认关闭的本地能力，不代表 OpenAI 或 Anthropic 的官方集成。
 
 ## 目标与非目标
 
 目标：用户通过 CSSwitch 独立完成 Codex OAuth 登录，由 Rust `csswitch-gateway` 将 Science 的 Anthropic Messages 请求翻译为 OpenAI Responses 请求，并让 Science 从动态目录中选择多个当前账号可用的模型。
 
-v1 只支持：
+当前合同只支持：
 
-- macOS；
+- 已发布 v0.7 的 macOS，以及未发布 v0.9 beta 的 Ubuntu 24.04 x86_64 源码路径；
 - 一个全局 CSSwitch Codex 账号；
 - loopback HTTP 与 SSE；
 - 独立 CSSwitch OAuth 凭据；
@@ -31,7 +33,7 @@ v1 明确不做：
 
 此能力自 `v0.7.0` 起作为默认关闭的实验功能提供。旧 UI 的入口收在「高级设置」：启用 Codex 实验能力 → 使用 CSSwitch 独立浏览器登录 → 登录成功后 Codex 配置自动出现 → 用户手动设为当前 → 一键开始 → 在 Science 的 “More models” 中选择 `Codex / …` 动态模型。Codex 配置不填写 API Key、`base_url` 或固定模型，也不会在登录后自动替换当前 provider。
 
-登录由 CSSwitch 自己的 OAuth 私有文件完成，不读取、复用或修改原生 Codex 登录或 macOS Keychain。关闭实验开关只停止受管 Codex 链路并隐藏新建/启动入口，不删除 CSSwitch 凭据；退出登录必须由用户单独确认。Doctor 不执行实时认证检查，只显示实验开关、Codex profile 数，以及内存中最近一次用户主动检查留下的 `last_known_*`、allowlist reason/cause 与 age；没有记录时显示 `auth=not_checked`。它不显示账号指纹、邮箱、token、auth epoch / generation 或认证文件内容。
+登录由 CSSwitch 自己的 OAuth 私有文件完成，不读取、复用或修改原生 Codex 登录、macOS Keychain 或 Linux Secret Service。关闭实验开关只停止受管 Codex 链路并隐藏新建/启动入口，不删除 CSSwitch 凭据；退出登录必须由用户单独确认。Doctor 不执行实时认证检查，只显示实验开关、Codex profile 数，以及内存中最近一次用户主动检查留下的 `last_known_*`、allowlist reason/cause 与 age；没有记录时显示 `auth=not_checked`。它不显示账号指纹、邮箱、token、auth epoch / generation 或认证文件内容。
 
 自动 Gate 已覆盖 mock OAuth、配置迁移、协议转换、动态目录、旧 UI 与生命周期；Acceptance 候选另建立了单账号浏览器 OAuth、动态目录、一个 live 模型与最小文本推理证据。两个以上 live 模型、真实工具调用、刷新/退出重登、显式代理/TUN 变体和最终公开 DMG 的 live OAuth / 推理仍未建立，不能由源码测试或旧候选外推。
 
@@ -54,7 +56,7 @@ v1 明确不做：
 | auth epoch / generation | `~/.csswitch/codex-auth-state.v1.json`，不含账号或凭据 | CSSwitch Gateway |
 | thinking HMAC key | `~/.csswitch/codex-thinking.v1.json`，目录 `0700`、文件 `0600` | CSSwitch Gateway |
 | 登录、状态、退出和刷新 | `csswitch-gateway codex-auth ...` | CSSwitch Gateway |
-| provider profile 和功能开关 | CSSwitch config v3 | CSSwitch Desktop backend |
+| provider profile 和功能开关 | CSSwitch config v4 | CSSwitch Desktop backend |
 | 模型目录缓存 | CSSwitch-owned、无凭据缓存 | CSSwitch Gateway |
 | 原生 Codex 登录 | `~/.codex` 及原生 Codex Keychain 项 | 原生 Codex，CSSwitch 不接触 |
 | Science 对话与项目 | 隔离 Science data-dir | Science |

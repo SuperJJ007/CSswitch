@@ -1,6 +1,6 @@
 # CSSwitch 架构总览
 
-本文是 v0.7.0 当前架构合同，只保留产品边界、所有权、数据流和失败边界。版本固定的调查结果见[证据目录](../evidence/README.md)。
+本文是 `v0.9.0-beta.1` 开发线的当前架构合同，只保留产品边界、所有权、数据流和失败边界。Linux artifact、安装态与真机是否通过仍由[日期化证据](../evidence/README.md)单独记录；当前公开正式版本仍是 v0.7.0。
 
 ## 产品边界
 
@@ -34,7 +34,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 |---|---|---|
 | provider profiles 与 CSSwitch settings | `~/.csswitch/` 配置 | CSSwitch |
 | Gateway 生命周期与本地路由 | CSSwitch runtime state | CSSwitch |
-| 已安装 Science executable | `/Applications/Claude Science.app/.../claude-science` | 用户 / Science installer |
+| 已安装 Science executable | macOS App 固定路径或 Linux `$HOME/.local/bin/claude-science` | 用户 / Science installer |
 | 持久 Science 状态 | `~/.csswitch/sandbox/home/.claude-science` | Science |
 | 版本 runtime 资源 | `<data-dir>/runtime/<version>/` | Science |
 | 组织与 Skills | `<data-dir>/orgs/<active-org>/...` | Science 组织 |
@@ -44,13 +44,15 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 | Codex OAuth / thinking / generation records | CSSwitch data root 下的私有 `codex-*.v1.json` | CSSwitch Gateway |
 | v0.4.2 / v0.4.3 legacy Skill store / inventory | 原样保留但不参与当前 runtime | 非当前运行路径 |
 
-持久 data-dir 提供状态连续性，不固定 executable 版本。正常新启动优先用户当前安装的 App；历史缓存只有在 App 不可用、版本可读且用户仅本次授权时才可使用。详见 [Science runtime 合同](science-runtime.md)。
+持久 data-dir 提供状态连续性，不固定 executable 版本。正常新启动优先平台受信任安装路径；历史缓存只有在该安装不可用、版本可读且用户仅本次授权时才可使用。详见 [Science runtime 合同](science-runtime.md)。
 
 ## 组件边界
 
 ### Desktop / Tauri backend
 
 管理配置、端口、Science runtime metadata、强身份边界、UI health 状态和可选 bridge 编排。关闭设置窗口只隐藏窗口；明确退出 CSSwitch 才按受管顺序停止 Science 与 Gateway。
+
+`get_config` 只读投影 `os`、`arch`、`support_tier` 和 `official_mode_supported`，不把平台写进 schema v4。Linux beta 隐藏并拒绝 Official Claude；迁入的 official 模式会原子归一为 proxy 并显示一次说明。macOS 原行为不变。
 
 ### Rust Gateway
 

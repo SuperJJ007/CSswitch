@@ -1,14 +1,16 @@
 # 开发与维护
 
-本文说明 v0.7.0 源码树的开发入口。安全、Git / worktree 和证据措辞分别以 [`.agents/rules/`](../../.agents/rules/) 为准。
+本文说明 `v0.9.0-beta.1` 源码树的开发入口。安全、Git / worktree 和证据措辞分别以 [`.agents/rules/`](../../.agents/rules/) 为准。
 
 ## 环境
 
-- macOS Apple Silicon（当前桌面发布目标）；
+- macOS（回归开发环境），或 Ubuntu 24.04 x86_64/glibc（Linux beta 构建环境）；
 - Node.js / npm（Tauri 前端与构建）；
 - Rust / Cargo（desktop backend 与 Rust gateway）；
 - Python 3（测试驱动与 mock 使用，**不是** CSSwitch runtime proxy 依赖）；
-- Claude Science App（只在隔离 runtime / 真机验收时需要）。
+- Claude Science（只在隔离 runtime / 真机验收时需要；CI 不下载约 5 GB 的真实 runtime）。
+
+Ubuntu 构建依赖、`.deb` 路径和 Xvfb smoke 见 [Linux x64 beta](linux-x64-beta.md)。普通 macOS 开发不能替代 Linux 编译与安装证据。
 
 ## 本地启动
 

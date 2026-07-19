@@ -42,6 +42,12 @@ Codex OAuth 与 Gateway 不要求 Apple Developer 身份、Developer ID、Team I
 
 计算最终 DMG 的大小和 SHA-256，之后任何重建都视为新 artifact，需重跑后续层。
 
+### Linux 内部 beta
+
+`v0.9.0-beta.1` Linux 首期只允许 [Ubuntu 24.04 workflow](../../.github/workflows/linux-x64-internal.yml) 生成内部 amd64 `.deb` 与 SHA-256。不得在本阶段创建 tag 或公开 Release；不得把本地构建冒充 Actions artifact。workflow 需要检查 deb 架构/依赖、Desktop/Gateway、脚本/图标、安装和 Xvfb 启停，artifact 保留 14 天。完整边界见 [Linux x64 beta](linux-x64-beta.md)。
+
+`.deb` 通过仍不等于真实 Science、Wayland/X11、Codex OAuth 或公开分发通过；Ubuntu 真机结果必须另写 dated evidence。
+
 ## 4. 临时安装与 runtime
 
 只读挂载 DMG，把 app 复制到隔离位置或使用独立 bundle ID；未经授权不覆盖 `/Applications/CSSwitch.app`。
