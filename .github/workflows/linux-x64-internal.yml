@@ -84,17 +84,33 @@ jobs:
           mapfile -t debs < <(find desktop/src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print)
           test "${#debs[@]}" -eq 1
           deb="${debs[0]}"
-          test "$(dpkg-deb -f "$deb" Package)" = "csswitch"
-          test "$(dpkg-deb -f "$deb" Architecture)" = "amd64"
+          package_name="$(dpkg-deb -f "$deb" Package)"
+          architecture="$(dpkg-deb -f "$deb" Architecture)"
           package_version="$(dpkg-deb -f "$deb" Version)"
+          depends="$(dpkg-deb -f "$deb" Depends)"
+          printf 'deb metadata: package=%s version=%s architecture=%s\n' \
+            "$package_name" "$package_version" "$architecture"
+          test "$package_name" = "cs-switch" || {
+            echo "unexpected deb package: $package_name" >&2
+            exit 1
+          }
+          test "$architecture" = "amd64" || {
+            echo "unexpected deb architecture: $architecture" >&2
+            exit 1
+          }
           case "$package_version" in
             0.9.0-beta.1|0.9.0~beta.1) ;;
             *) echo "unexpected deb version: $package_version" >&2; exit 1 ;;
           esac
-          depends="$(dpkg-deb -f "$deb" Depends)"
-          grep -Eq '(^|, )bubblewrap \(>= 0\.8(\.0)?\)($|, )' <<< "$depends"
+          grep -Eq '(^|, )bubblewrap \(>= 0\.8(\.0)?\)($|, )' <<< "$depends" || {
+            echo "deb dependency contract missing bubblewrap >= 0.8" >&2
+            exit 1
+          }
           for dependency in socat lsof xdg-utils openssh-client; do
-            grep -Eq "(^|, )${dependency}([[:space:]]|,|$)" <<< "$depends"
+            grep -Eq "(^|, )${dependency}([[:space:]]|,|$)" <<< "$depends" || {
+              echo "deb dependency contract missing $dependency" >&2
+              exit 1
+            }
           done
 
           extract="$(mktemp -d)"
