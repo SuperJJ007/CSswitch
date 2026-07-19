@@ -28,6 +28,7 @@ from test.installed_provider_matrix import (
     _dispatch,
     _safe_json_write,
     _scrub_error,
+    _trusted_lsof_bin,
     build_case_scenario,
 )
 from test.model_catalog_coverage_acceptance import strict_route_checks
@@ -98,6 +99,12 @@ class InstalledProviderMatrixTests(unittest.TestCase):
             path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             path.chmod(0o700)
         return bundle
+
+    def test_trusted_lsof_path_is_platform_fixed_and_unknown_platform_fails_closed(self):
+        self.assertEqual(_trusted_lsof_bin("darwin"), Path("/usr/sbin/lsof"))
+        self.assertEqual(_trusted_lsof_bin("linux"), Path("/usr/bin/lsof"))
+        with self.assertRaisesRegex(ControllerError, "unsupported process inspection platform"):
+            _trusted_lsof_bin("plan9")
 
     def _session(self, case="deepseek-off", inspector=None):
         root = self.base / f"root-{case}-{len(list(self.base.glob('root-*')))}"

@@ -261,6 +261,7 @@ class ProviderMockScenarioTests(unittest.TestCase):
         first = conn.getresponse()
         self.assertEqual(first.status, 200)
         first.read()
+        self.assertTrue(wait_for_request_count(mock, 1))
         mock.enter_phase("formal")
         body = b"{}"
         conn.request("POST", "/formal", body=body, headers={"Content-Type": "application/json"})
@@ -744,6 +745,7 @@ class ProviderMockScenarioTests(unittest.TestCase):
                 self.assertEqual(
                     request(instance.mock, "POST", "/status/503", {})[0], 503
                 )
+                self.assertTrue(wait_for_request_count(instance.mock, 2))
                 self.assertTrue(instance.mock.result()["protocol_complete"])
                 instance._stop_requested.set()
                 return value

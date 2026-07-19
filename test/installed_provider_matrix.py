@@ -77,6 +77,17 @@ class ControllerError(RuntimeError):
     """A fail-closed installed acceptance error."""
 
 
+def _trusted_lsof_bin(platform: str = sys.platform) -> Path:
+    if platform == "darwin":
+        return Path("/usr/sbin/lsof")
+    if platform.startswith("linux"):
+        return Path("/usr/bin/lsof")
+    raise ControllerError("unsupported process inspection platform")
+
+
+LSOF_BIN = _trusted_lsof_bin()
+
+
 @dataclass(frozen=True)
 class CaseDefinition:
     case_id: str
@@ -854,7 +865,7 @@ class ProcessInspector:
         if pid <= 1:
             return None
         result = subprocess.run(
-            ["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-d", "txt", "-Fn"],
+            [str(LSOF_BIN), "-nP", "-a", "-p", str(pid), "-d", "txt", "-Fn"],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -870,7 +881,7 @@ class ProcessInspector:
             return False
         result = subprocess.run(
             [
-                "/usr/sbin/lsof", "-nP", "-a", "-p", str(pid),
+                str(LSOF_BIN), "-nP", "-a", "-p", str(pid),
                 f"-iTCP:{port}", "-sTCP:LISTEN",
             ],
             check=False,
@@ -1073,7 +1084,7 @@ class Server(socketserver.TCPServer):
 with Server(("127.0.0.1", port), Handler) as server:
     pid = os.getpid()
     result = subprocess.run(
-        ["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-d", "txt", "-Fn"],
+        ["@LSOF@", "-nP", "-a", "-p", str(pid), "-d", "txt", "-Fn"],
         check=True, capture_output=True, text=True,
     )
     executable = next((line[1:] for line in result.stdout.splitlines() if line.startswith("n")), "")
@@ -1128,7 +1139,7 @@ case "$cmd" in
     pid="$(cat "$state/pid" 2>/dev/null || true)"
     recorded_port="$(cat "$state/port" 2>/dev/null || true)"
     case "$pid:$recorded_port" in *[!0-9:]*) echo '{"running":false}'; exit 0 ;; esac
-    if /bin/kill -0 "$pid" 2>/dev/null && /usr/sbin/lsof -nP -a -p "$pid" -iTCP:"$recorded_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    if /bin/kill -0 "$pid" 2>/dev/null && @LSOF@ -nP -a -p "$pid" -iTCP:"$recorded_port" -sTCP:LISTEN >/dev/null 2>&1; then
       echo '{"running":true}'
     else
       echo '{"running":false}'
@@ -1153,16 +1164,19 @@ case "$cmd" in
     expected_port="${CSSWITCH_EXPECTED_SANDBOX_PORT:-}"
     case "$pid:$recorded_port:$expected_port" in *[!0-9:]*) echo REFUSE >&2; exit 1 ;; esac
     test "$pid" -gt 1 && test "$recorded_port" = "$expected_port" && test "$recorded_port" != 8765
-    actual_exe="$(/usr/sbin/lsof -nP -a -p "$pid" -d txt -Fn 2>/dev/null | /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1)"
+    actual_exe="$(@LSOF@ -nP -a -p "$pid" -d txt -Fn 2>/dev/null | /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1)"
     test -n "$recorded_exe" && test "$actual_exe" = "$recorded_exe" || { echo REFUSE >&2; exit 1; }
-    /usr/sbin/lsof -nP -a -p "$pid" -iTCP:"$recorded_port" -sTCP:LISTEN >/dev/null 2>&1 || { echo REFUSE >&2; exit 1; }
+    @LSOF@ -nP -a -p "$pid" -iTCP:"$recorded_port" -sTCP:LISTEN >/dev/null 2>&1 || { echo REFUSE >&2; exit 1; }
     /bin/kill -TERM "$pid"
     rm -f "$state/pid" "$state/port" "$state/executable" "$state/ready"
     echo stopped
     ;;
   *) exit 2 ;;
 esac
-""".replace("@SERVER@", shlex.quote(str(server_path)))
+""".replace("@SERVER@", shlex.quote(str(server_path))).replace(
+            "@LSOF@", shlex.quote(str(LSOF_BIN))
+        )
+        server_script = server_script.replace("@LSOF@", str(LSOF_BIN))
         for path, body in (
             (self.bin_dir / "open", open_script),
             (self.bin_dir / "security", security_script),
