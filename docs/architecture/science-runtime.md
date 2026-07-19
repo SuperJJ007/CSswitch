@@ -1,6 +1,6 @@
 # Science runtime 合同
 
-本文描述 `v0.9.0-beta.1` 开发线的 macOS / Linux 选择与身份合同。它不是 Linux artifact 或真机通过证据。2026-07-13 的具体版本、错误 binary 事故与 E2E 证据见[日期化调查](../evidence/investigations/2026-07-13-science-runtime-and-skill-bridge.md)。
+本文描述 `v0.8.0-linux-beta.1` 内测线的 macOS / Linux 选择与身份合同。它不是 Linux artifact 或真机通过证据。2026-07-13 的具体版本、错误 binary 事故与 E2E 证据见[日期化调查](../evidence/investigations/2026-07-13-science-runtime-and-skill-bridge.md)。
 
 ## 分离四个事实
 

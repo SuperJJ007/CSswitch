@@ -2,7 +2,7 @@
 
 状态：**v0.7.0 已发布，Codex 仍是默认关闭的实验能力。** browser-only 登录、OAuth 后自动 profile、动态 GPT-5.6 目录兼容、双 App 数据根隔离与无签名前置的私有文件认证已进入发布源码。2026-07-17 的 no-signing Acceptance 候选完成了浏览器 OAuth、动态模型目录、Science 选择 `Codex / GPT-5.6-Sol` 和文本推理验收；最终公开 DMG 已建立 source、hash、打包与分发证据，但没有从该 DMG 安装后重跑 live OAuth / 推理。详见 [v0.7.0 发布证据](../evidence/releases/v0.7.0.md)与[Acceptance 候选证据](../evidence/investigations/2026-07-17-codex-browser-only-acceptance.md)。
 
-未发布的 `v0.9.0-beta.1` 开发线把同一实验合同开放到 Ubuntu 24.04 x86_64 源码路径：OAuth callback 仍只绑定 loopback，浏览器由固定 `/usr/bin/xdg-open` 打开，私有凭据仍归 CSSwitch 文件边界所有且不引入 Secret Service。Linux 编译、Actions artifact、安装态和真实 OAuth 尚未完成时，不能据此声称 Linux 已验收。
+内部 `v0.8.0-linux-beta.1` 内测线把同一实验合同开放到 Ubuntu 24.04 x86_64 源码路径：OAuth callback 仍只绑定 loopback，浏览器由固定 `/usr/bin/xdg-open` 打开，私有凭据仍归 CSSwitch 文件边界所有且不引入 Secret Service。Linux Actions artifact 通过仍不能代替真实安装态和 live OAuth；未完成的层不能据此声称已验收。
 
 本文冻结 CSSwitch 将用户自己的 Codex 登录接入隔离 Claude Science 的 v1 实施边界。它是非官方、实验性且默认关闭的本地能力，不代表 OpenAI 或 Anthropic 的官方集成。
 

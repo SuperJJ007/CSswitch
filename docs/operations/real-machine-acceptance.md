@@ -1,4 +1,4 @@
-# CSSwitch v0.9.0-beta.1 真机验收
+# CSSwitch v0.8.0-linux-beta.1 真机验收
 
 本矩阵描述应如何验收，不表示各项已经通过。RM-01～RM-45 是从 v0.8.0 延续的 macOS/通用编号；Linux 首期另用 LX 编号。每次执行必须记录目标 commit / artifact、环境和结果；发布附件的既有结果见对应 [release evidence](../evidence/releases/README.md)。
 

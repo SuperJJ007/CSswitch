@@ -49,7 +49,7 @@ bash test/run_all.sh --require-release-ready
 
 ## Linux x64 CI
 
-未发布的 `v0.9.0-beta.1` 另有 [Ubuntu 24.04 内部 workflow](../../.github/workflows/linux-x64-internal.yml)。它可由 `codex/v090-linux-x64` 的窄范围 push、PR 或手动触发，在标准 hosted VM 上以 `RUST_TEST_THREADS=1` 执行同一 `--require-release-ready` 门禁，再构建/安装 amd64 `.deb`。workflow 文件存在、本机 YAML 可解析或 macOS 测试通过都不能写成该 job 已通过；必须记录 GitHub Actions run、source SHA、artifact 名称和 SHA-256。
+`080-linux-beta`（技术版本 `v0.8.0-linux-beta.1`）另有 [Ubuntu 24.04 内部 workflow](../../.github/workflows/linux-x64-internal.yml)。它可由 `codex/v090-linux-x64` 的窄范围 push、PR 或手动触发，在标准 hosted VM 上以 `RUST_TEST_THREADS=1` 执行同一 `--require-release-ready` 门禁，再构建/安装 amd64 `.deb`。workflow 文件存在、本机 YAML 可解析或 macOS 测试通过都不能写成该 job 已通过；必须记录 GitHub Actions run、source SHA、artifact 名称和 SHA-256。
 
 包检查必须从 Desktop Entry 精确定位 Desktop、唯一定位 Gateway、检查 x86-64 ELF/依赖/资源，并在临时 HOME 验证 Gateway 空认证状态不泄密。Xvfb 只证明进程启动、单实例和信号终止；Actions 不下载真实 Claude Science、不做 live Codex OAuth，也不证明 GUI 可见、显式退出、X11/Wayland 输入、Bubblewrap/AppArmor 或完整进程生命周期。这些层仍需 [Linux x64 beta](linux-x64-beta.md) 定义的 Ubuntu 真机验收。
 

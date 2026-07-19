@@ -5,7 +5,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
   <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/release-v0.7.0-2ea44f.svg" alt="CSSwitch v0.7.0"></a>
-  <img src="https://img.shields.io/badge/development-v0.9.0--beta.1-f0a000.svg" alt="Development v0.9.0-beta.1">
+  <img src="https://img.shields.io/badge/internal-080--linux--beta-f0a000.svg" alt="CSSwitch 080 Linux Beta">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Ubuntu%2024.04%20x64-1d1d1f.svg" alt="macOS and Ubuntu 24.04 x64">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -21,13 +21,13 @@ CSSwitch is a local configuration converter for Claude Science. It translates Sc
 
 It is built for more than developers. Install Claude Science, choose either a third-party API key or Codex login, make the profile active, then click "一键开始" (Start).
 
-> The current source is the internal `v0.9.0-beta.1` development line: macOS remains a regression target and Ubuntu 24.04 x86_64/glibc is added as beta. No Linux `.deb` is public yet; it must be built by GitHub Actions and pass real Ubuntu acceptance before it is distributable. The public latest release remains v0.7.0.
+> The current source is the internal `080-linux-beta` line, technical version `v0.8.0-linux-beta.1`: macOS remains a regression target and Ubuntu 24.04 x86_64/glibc is added as beta. Only the exact GitHub Actions `.deb` artifact may be shared for limited community testing. It has not passed real Ubuntu desktop, real Science, or live OAuth acceptance and is not a public Release. The public latest release remains v0.7.0.
 
 [Download latest release](https://github.com/SuperJJ007/CSSwitch/releases/latest) · [Documentation](./docs/README.md) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
 > **0.7.0:** Adds an off-by-default experimental Codex bridge. CSSwitch performs its own browser OAuth, dynamically reads the account model catalog, and converts Codex Responses/SSE for Science through the Rust Gateway. Login, model discovery, inference, and logout share one network route; native Codex login is never read or modified. The ad-hoc release does not require an Apple developer account. This release also adopts the new orange rounded-square icon and fixes Codex SSE responses without `Content-Type` being misreported as temporary Claude unavailability. See the [Codex → Claude Science contract](./docs/features/codex-science-bridge.md).
 
-> **0.9.0-beta.1 (unreleased):** The first native Linux milestone targets Ubuntu 24.04 x64 only, with an internal `.deb`, `xdg-open`, loopback-only listeners, and fail-closed Bubblewrap/userns preflight. Linux provides only the isolated CSSwitch third-party mode, not Official Claude mode. WSL/WSLg, ARM64, musl, systemd, AppImage/rpm, remote listeners, and no-sandbox fallbacks are out of scope. See [Linux x64 beta](./docs/operations/linux-x64-beta.md).
+> **080 Linux Beta (`0.8.0-linux-beta.1`, limited testing):** The first native Linux milestone targets Ubuntu 24.04 x64 only, with an internal `.deb`, `xdg-open`, loopback-only listeners, and fail-closed Bubblewrap/userns preflight. Linux provides only the isolated CSSwitch third-party mode, not Official Claude mode. WSL/WSLg, ARM64, musl, systemd, AppImage/rpm, remote listeners, and no-sandbox fallbacks are out of scope. See the [Linux tester guide](./docs/operations/linux-x64-beta-testing.md) and the full [Linux x64 beta contract](./docs/operations/linux-x64-beta.md).
 
 ## Contents
 

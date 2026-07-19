@@ -1,10 +1,10 @@
 # Linux x64 beta
 
-状态：`v0.9.0-beta.1` 未发布开发合同。本文说明目标和验收方法，不表示 `.deb`、Ubuntu 安装态、真实 Claude Science 或 live Codex 已通过。
+状态：`080-linux-beta` 有限社区内测合同，技术版本 `v0.8.0-linux-beta.1`。本文说明目标和验收方法，不表示 Ubuntu 真机、真实 Claude Science 或 live Codex 已通过。
 
 ## 支持范围
 
-首期只支持 Ubuntu 24.04 x86_64、glibc、原生桌面会话。交付物是 GitHub Actions 生成的单一内部 amd64 `.deb` 与 SHA-256；不创建 tag，不发布 GitHub Release。
+首期只支持 Ubuntu 24.04 x86_64、glibc、原生桌面会话。交付物是 GitHub Actions 生成的单一内部 amd64 `.deb` 与 SHA-256，可发送给明确知晓实验边界的有限测试群体；不创建 tag，不发布 GitHub Release。测试者操作见[Linux 内测指南](linux-x64-beta-testing.md)。
 
 包含 API-key providers、Codex browser OAuth、Gateway、动态/静态模型目录、外部 Skill/MCP、system SSH opt-in，以及由 CSSwitch 隔离 HOME/data-dir 托管的 Science 生命周期。Linux 只提供第三方隔离模式，不显示也不接受 Official Claude。
 
@@ -54,7 +54,7 @@ Codex OAuth 使用 CSSwitch data root 下的私有文件，不引入 Secret Serv
 6. 核对 doctor/launch/stop/verify/SSH wrapper 与图标，安装 `.deb`，在临时 HOME 验证 Gateway 脱敏空状态，并在 Xvfb 下做进程启动、单实例和信号终止 smoke；
 7. 上传 `.deb` 与 SHA-256，保留 14 天。
 
-CI 不下载真实 Science、不使用凭证，也不执行 live provider。Xvfb smoke 不证明 GUI 可见、显式退出或完整生命周期清理。Actions 仅由 `codex/v090-linux-x64` 的窄范围 push、PR 或手动触发产生 artifact；本地存在 workflow 文件不等于 CI 已通过。
+CI 不下载真实 Science，不使用真实 Claude Science、Codex、Provider 或用户凭证，也不执行 live provider。Xvfb smoke 不证明 GUI 可见、显式退出或完整生命周期清理。Actions 仅由 `codex/v090-linux-x64` 的窄范围 push、PR 或手动触发产生 artifact；本地存在 workflow 文件不等于 CI 已通过。
 
 ## Ubuntu 真机验收
 

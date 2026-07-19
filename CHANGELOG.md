@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.9.0-beta.1] — Unreleased
+## [0.8.0-linux-beta.1] — Internal testing
 
 ### Added
 
@@ -19,8 +19,8 @@
 
 ### Scope and evidence boundary
 
-- This beta is not tagged or publicly released. WSL/WSLg, ARM64, musl, systemd, AppImage/rpm, remote listeners, `0.0.0.0`, and no-sandbox degradation remain out of scope.
-- Source tests on macOS do not prove the GitHub Actions artifact, installed Ubuntu desktop, real Claude Science runtime, or live Codex OAuth. Those layers must be recorded separately before distribution.
+- This beta is not tagged or publicly released. The exact Actions artifact may be shared with a limited community test group under the documented experimental boundary. WSL/WSLg, ARM64, musl, systemd, AppImage/rpm, remote listeners, `0.0.0.0`, and no-sandbox degradation remain out of scope.
+- Source tests on macOS do not prove the GitHub Actions artifact, installed Ubuntu desktop, real Claude Science runtime, or live Codex OAuth. Those layers must be recorded separately; incomplete layers must not be described as accepted or publicly released.
 
 ## [0.7.0] — 2026-07-17
 

@@ -1,6 +1,6 @@
 # CSSwitch 文档总入口
 
-当前开发基线为未发布的 `v0.9.0-beta.1`；当前公开正式版本仍是 v0.7.0。公开产品概览从根目录 [README 中文版](../README.md) / [English](../README.en.md) 进入；本目录按内容寿命和证据类型分类。
+当前 Linux 内测线为 `080-linux-beta`，技术版本 `v0.8.0-linux-beta.1`；当前公开正式版本仍是 v0.7.0。公开产品概览从根目录 [README 中文版](../README.md) / [English](../README.en.md) 进入；本目录按内容寿命和证据类型分类。
 
 ## 架构
 
@@ -15,6 +15,7 @@
 - [发布](operations/release.md)
 - [升级与回滚](operations/upgrade-and-rollback.md)
 - [Linux x64 beta](operations/linux-x64-beta.md)：Ubuntu 24.04 首期支持合同、依赖、内部 `.deb` 和验收边界。
+- [Linux x64 beta 群友内测指南](operations/linux-x64-beta-testing.md)：内测包校验、安装、测试、反馈与脱敏要求。
 
 ## 功能合同
 

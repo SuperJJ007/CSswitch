@@ -1,6 +1,6 @@
 # 系统 SSH 配置复用
 
-该功能自 v0.5.0 起提供，已发布 v0.7.0 继续支持；未发布 `v0.9.0-beta.1` Linux 开发线保持同一默认关闭合同。它让隔离 Science 在用户明确授权后，按系统 OpenSSH 语义复用真实 `~/.ssh/config`；它不是 SSH server、端口转发 UI 或公网暴露功能。
+该功能自 v0.5.0 起提供，已发布 v0.7.0 继续支持；内部 `v0.8.0-linux-beta.1` Linux 内测线保持同一默认关闭合同。它让隔离 Science 在用户明确授权后，按系统 OpenSSH 语义复用真实 `~/.ssh/config`；它不是 SSH server、端口转发 UI 或公网暴露功能。
 
 ## 默认与 opt-in
 

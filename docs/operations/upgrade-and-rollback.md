@@ -1,12 +1,12 @@
 # CSSwitch 升级与回滚 / Upgrade and rollback
 
-## v0.9.0-beta.1 开发线说明
+## v0.8.0-linux-beta.1 内测线说明
 
-当前公开安装说明仍是下方 v0.7.0 macOS 流程。未发布的 `v0.9.0-beta.1` 保持 v0.8.0 冻结基线已有的 canonical config schema v4，不增加 Linux 持久字段；`os`、`arch`、`support_tier` 与 `official_mode_supported` 都是只读投影。把 macOS 配置带到 Linux 时，若 mode 为 `official`，首次启动只会把该字段原子归一为 `proxy` 并显示一次说明，profiles、端口和 Science 隔离 data-dir 不应被删除。
+当前公开安装说明仍是下方 v0.7.0 macOS 流程。内部 `v0.8.0-linux-beta.1` 保持 v0.8.0 runtime 冻结基线已有的 canonical config schema v4，不增加 Linux 持久字段；`os`、`arch`、`support_tier` 与 `official_mode_supported` 都是只读投影。把 macOS 配置带到 Linux 时，若 mode 为 `official`，首次启动只会把该字段原子归一为 `proxy` 并显示一次说明，profiles、端口和 Science 隔离 data-dir 不应被删除。
 
 Linux beta 目前只允许全新内部 `.deb` 安装和隔离验收，不承诺从未发布 v0.8/v0.9 artifact 覆盖升级，也不应拿旧 macOS app 直接打开已经迁移到 v4 的配置。回滚前先退出所有 CSSwitch/Gateway/Science 受管进程并备份整个 CSSwitch data root；具体 artifact 流程必须等 beta 验收后单独建立。
 
-The public installation instructions below still describe the released v0.7.0 macOS artifact. The unreleased `v0.9.0-beta.1` line keeps the canonical v4 config schema already present in the frozen v0.8.0 baseline and adds no persistent Linux fields. Platform capabilities are read-only. On Linux, a migrated `official` mode is atomically normalized to `proxy` with a one-time notice, without deleting profiles, ports, or the isolated Science data-dir. No in-place Linux upgrade or rollback artifact is supported until beta acceptance establishes it.
+The public installation instructions below still describe the released v0.7.0 macOS artifact. The internal `v0.8.0-linux-beta.1` line keeps the canonical v4 config schema already present in the frozen v0.8.0 runtime baseline and adds no persistent Linux fields. Platform capabilities are read-only. On Linux, a migrated `official` mode is atomically normalized to `proxy` with a one-time notice, without deleting profiles, ports, or the isolated Science data-dir. No in-place Linux upgrade or rollback artifact is supported until beta acceptance establishes it.
 
 本说明适用于 macOS Apple Silicon 的 CSSwitch 0.7.0。0.7.0 继续复用 Science 持久化 data-dir 与外部 Skill bridge，并把 v1/v2 配置安全迁移为支持 Codex profile 和网络路由的 v3；现有 API provider、用户 MCP 配置、未知字段和精确的旧 proxy 清理保持不变。
 

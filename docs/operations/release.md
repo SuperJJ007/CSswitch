@@ -44,7 +44,7 @@ Codex OAuth 与 Gateway 不要求 Apple Developer 身份、Developer ID、Team I
 
 ### Linux 内部 beta
 
-`v0.9.0-beta.1` Linux 首期只允许 [Ubuntu 24.04 workflow](../../.github/workflows/linux-x64-internal.yml) 生成内部 amd64 `.deb` 与 SHA-256。不得在本阶段创建 tag 或公开 Release；不得把本地构建冒充 Actions artifact。workflow 需要检查 deb 架构/依赖、Desktop/Gateway、脚本/图标、安装和 Xvfb 启停，artifact 保留 14 天。完整边界见 [Linux x64 beta](linux-x64-beta.md)。
+`080-linux-beta`（技术版本 `v0.8.0-linux-beta.1`）只允许 [Ubuntu 24.04 workflow](../../.github/workflows/linux-x64-internal.yml) 生成内部 amd64 `.deb` 与 SHA-256。准确 artifact 可交给有限社区测试组，但不得在本阶段创建 tag 或公开 Release，也不得把本地构建冒充 Actions artifact。workflow 需要检查 deb 架构/依赖、Desktop/Gateway、脚本/图标、安装和 Xvfb 启停，artifact 保留 14 天。完整边界见 [Linux x64 beta](linux-x64-beta.md)。
 
 `.deb` 通过仍不等于真实 Science、Wayland/X11、Codex OAuth 或公开分发通过；Ubuntu 真机结果必须另写 dated evidence。
 

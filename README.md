@@ -5,7 +5,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
   <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/release-v0.7.0-2ea44f.svg" alt="CSSwitch v0.7.0"></a>
-  <img src="https://img.shields.io/badge/development-v0.9.0--beta.1-f0a000.svg" alt="Development v0.9.0-beta.1">
+  <img src="https://img.shields.io/badge/internal-080--linux--beta-f0a000.svg" alt="CSSwitch 080 Linux Beta">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Ubuntu%2024.04%20x64-1d1d1f.svg" alt="macOS and Ubuntu 24.04 x64">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -21,13 +21,13 @@ CSSwitch 是一个给 Claude Science 使用的本地配置转换器。它把 Sci
 
 它面向的不只是开发者：准备 Claude Science，再选择第三方 API Key 或 Codex 登录，在桌面面板里设为当前并点击「一键开始」即可。
 
-> 当前源码是 `v0.9.0-beta.1` 内部开发版：macOS 保持回归兼容，新增 Ubuntu 24.04 x86_64/glibc beta。Linux `.deb` 尚未公开发布，必须由 GitHub Actions 构建并完成 Ubuntu 真机验收后才能称为可分发版本；当前公开 latest 仍是 v0.7.0。
+> 当前源码是 `080-linux-beta` 内测线，技术版本为 `v0.8.0-linux-beta.1`：macOS 保持回归兼容，新增 Ubuntu 24.04 x86_64/glibc beta。Linux `.deb` 只允许使用 GitHub Actions 构建的准确 artifact 做有限社区测试；它尚未完成 Ubuntu 真机、真实 Science 和 live OAuth 验收，也不是公开 Release。当前公开 latest 仍是 v0.7.0。
 
 [下载最新版](https://github.com/SuperJJ007/CSSwitch/releases/latest) · [项目文档](./docs/README.md) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
 > **0.7.0：** 新增默认关闭的 Codex 实验接入：CSSwitch 独立完成浏览器 OAuth，动态读取当前账号模型目录，并通过 Rust Gateway 将 Codex Responses/SSE 转换给 Science。登录、模型获取、推理和退出共用统一网络路由，不读取或修改原生 Codex 登录；发布包继续采用 ad-hoc 签名，不要求 Apple 开发者账号。新版同时启用 1 号橙色圆角图标，并修复部分 Codex SSE 响应缺少 `Content-Type` 时被误报为 Claude 暂时不可用的问题。详见 [Codex → Claude Science 合同](./docs/features/codex-science-bridge.md)。
 
-> **0.9.0-beta.1（未发布）：** 原生 Linux 首期只面向 Ubuntu 24.04 x64，使用内部 `.deb`、`xdg-open`、固定 loopback 和 fail-closed Bubblewrap/userns preflight。Linux 只提供 CSSwitch 隔离第三方模式，不提供“官方 Claude”模式；不包含 WSL/WSLg、ARM64、musl、systemd、AppImage/rpm、远程监听或 no-sandbox 降级。安装、依赖和验收边界见 [Linux x64 beta](./docs/operations/linux-x64-beta.md)。
+> **080 Linux Beta（`0.8.0-linux-beta.1`，有限内测）：** 原生 Linux 首期只面向 Ubuntu 24.04 x64，使用内部 `.deb`、`xdg-open`、固定 loopback 和 fail-closed Bubblewrap/userns preflight。Linux 只提供 CSSwitch 隔离第三方模式，不提供“官方 Claude”模式；不包含 WSL/WSLg、ARM64、musl、systemd、AppImage/rpm、远程监听或 no-sandbox 降级。群友安装、校验、反馈和脱敏要求见 [Linux 内测指南](./docs/operations/linux-x64-beta-testing.md)，完整合同见 [Linux x64 beta](./docs/operations/linux-x64-beta.md)。
 
 ## 目录
 
