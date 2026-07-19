@@ -2,6 +2,7 @@
 
 - [2026-07-19 Linux x64 beta 源码实施记录](2026-07-19-linux-x64-beta-implementation.md)
 - [2026-07-19 Linux x64 Actions 与内部 artifact 证据](2026-07-19-linux-x64-actions-artifact.md)
+- [2026-07-19 CSSwitch 080 Linux Beta 社区内测 artifact](2026-07-19-linux-x64-080-community-artifact.md)
 - [2026-07-13 Science runtime 与外部 Skill bridge](2026-07-13-science-runtime-and-skill-bridge.md)
 - [2026-07-16 Codex → Science 实施基线](2026-07-16-codex-science-bridge-baseline.md)
 - [2026-07-16 Codex → Science 模型 ID 兼容实验](2026-07-16-codex-science-model-compat.md)
