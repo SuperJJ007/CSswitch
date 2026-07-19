@@ -83,7 +83,7 @@ jobs:
           set -euo pipefail
           mapfile -t debs < <(find desktop/src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print)
           test "${#debs[@]}" -eq 1
-          deb="${debs[0]}"
+          deb="$(realpath -- "${debs[0]}")"
           package_name="$(dpkg-deb -f "$deb" Package)"
           architecture="$(dpkg-deb -f "$deb" Architecture)"
           package_version="$(dpkg-deb -f "$deb" Version)"
