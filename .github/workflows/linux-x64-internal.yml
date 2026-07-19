@@ -1,0 +1,165 @@
+name: Linux x64 internal beta
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "codex/v090-linux-x64"
+    paths:
+      - ".github/workflows/linux-x64-internal.yml"
+      - "desktop/**"
+      - "scripts/**"
+      - "test/**"
+  pull_request:
+    paths:
+      - ".github/workflows/linux-x64-internal.yml"
+      - "desktop/**"
+      - "scripts/**"
+      - "test/**"
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-24-04-x64:
+    name: Ubuntu 24.04 x64 gate and deb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUST_TEST_THREADS: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build and runtime prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            bubblewrap \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            lsof \
+            openssh-client \
+            patchelf \
+            python3 \
+            socat \
+            wget \
+            xdg-utils \
+            xauth \
+            xvfb
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install Tauri CLI dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Run release-ready source gate
+        run: bash test/run_all.sh --require-release-ready
+
+      - name: Build internal deb
+        working-directory: desktop
+        run: npm run tauri build -- --bundles deb
+
+      - name: Inspect and smoke-test installed deb
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t debs < <(find desktop/src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -print)
+          test "${#debs[@]}" -eq 1
+          deb="${debs[0]}"
+          test "$(dpkg-deb -f "$deb" Package)" = "csswitch"
+          test "$(dpkg-deb -f "$deb" Architecture)" = "amd64"
+          package_version="$(dpkg-deb -f "$deb" Version)"
+          case "$package_version" in
+            0.9.0-beta.1|0.9.0~beta.1) ;;
+            *) echo "unexpected deb version: $package_version" >&2; exit 1 ;;
+          esac
+          depends="$(dpkg-deb -f "$deb" Depends)"
+          grep -Eq '(^|, )bubblewrap \(>= 0\.8(\.0)?\)($|, )' <<< "$depends"
+          for dependency in socat lsof xdg-utils openssh-client; do
+            grep -Eq "(^|, )${dependency}([[:space:]]|,|$)" <<< "$depends"
+          done
+
+          extract="$(mktemp -d)"
+          dpkg-deb -x "$deb" "$extract"
+          desktop_file="$(find "$extract/usr/share/applications" -maxdepth 1 -type f -name '*.desktop' -print -quit)"
+          test -n "$desktop_file"
+          desktop_exec="$(sed -n 's/^Exec=//p' "$desktop_file" | head -n 1)"
+          desktop_name="${desktop_exec%% *}"
+          desktop_name="${desktop_name#/usr/bin/}"
+          test -n "$desktop_name"
+          app_bin="$extract/usr/bin/$desktop_name"
+          test -x "$app_bin"
+
+          mapfile -t gateway_bins < <(find "$extract" -type f -name 'csswitch-gateway*' -print)
+          test "${#gateway_bins[@]}" -eq 1
+          gateway_bin="${gateway_bins[0]}"
+          test -x "$gateway_bin"
+          file "$app_bin" | grep -Eq 'ELF 64-bit.*x86-64'
+          file "$gateway_bin" | grep -Eq 'ELF 64-bit.*x86-64'
+          find "$extract/usr/share/icons" -type f \( -name '*.png' -o -name '*.svg' -o -name '*.xpm' \) -print -quit | grep -q .
+          for resource in doctor.sh launch-virtual-sandbox.sh stop-science-sandbox.sh verify-proxy.sh ssh; do
+            resource_path="$(find "$extract" -type f -path "*/scripts/*" -name "$resource" -print -quit)"
+            test -n "$resource_path"
+            test -x "$resource_path"
+          done
+
+          deb_dir="$(dirname "$deb")"
+          deb_name="$(basename "$deb")"
+          (cd "$deb_dir" && sha256sum "$deb_name" > "$deb_name.sha256")
+          (cd "$deb_dir" && sha256sum -c "$deb_name.sha256")
+          sudo apt-get install -y "$deb"
+          installed_bin="/usr/bin/$desktop_name"
+          installed_gateway="${gateway_bin#$extract}"
+          test -x "$installed_bin"
+          test -x "$installed_gateway"
+          smoke_home="$(mktemp -d)"
+          codex_status="$(HOME="$smoke_home" "$installed_gateway" codex-auth status)"
+          CODEX_STATUS_JSON="$codex_status" python3 -c 'import json, os; value=json.loads(os.environ["CODEX_STATUS_JSON"]); status=value["status"]; assert status["authenticated"] is False; assert status["reason"] == "state_missing"; encoded=json.dumps(value).lower(); assert "access_token" not in encoded and "refresh_token" not in encoded'
+          xvfb-run -a bash test/linux_x64_package_smoke.sh "$installed_bin" "$smoke_home"
+
+          summary="$RUNNER_TEMP/csswitch-linux-x64-test-summary.txt"
+          {
+            echo "source_sha=$GITHUB_SHA"
+            echo "runner=ubuntu-24.04"
+            echo "architecture=amd64"
+            echo "release_ready_gate=pass"
+            echo "deb_metadata=pass"
+            echo "gateway_fresh_home_status=state_missing"
+            echo "xvfb_process_single_instance_signal_stop_smoke=pass"
+            echo "gui_visible_explicit_quit=not_run"
+            echo "real_science=not_run"
+            echo "live_codex_oauth=not_run"
+          } > "$summary"
+
+          echo "deb=$deb" >> "$GITHUB_OUTPUT"
+          echo "sha=$deb_dir/$deb_name.sha256" >> "$GITHUB_OUTPUT"
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+
+      - name: Upload internal package
+        uses: actions/upload-artifact@v4
+        with:
+          name: csswitch-v0.9.0-beta.1-ubuntu-24.04-amd64
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ steps.package.outputs.deb }}
+            ${{ steps.package.outputs.sha }}
+            ${{ steps.package.outputs.summary }}

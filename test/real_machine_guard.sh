@@ -15,7 +15,12 @@ BASELINE="$STATE_DIR/port-8765.pids"
 PORT_STATE="$STATE_DIR/runtime-ports.v1"
 PROXY_PORT="${CSSWITCH_TEST_PROXY_PORT:-}"
 SANDBOX_PORT="${CSSWITCH_TEST_SANDBOX_PORT:-}"
-SCIENCE_BIN="${SCIENCE_BIN:-/Applications/Claude Science.app/Contents/Resources/bin/claude-science}"
+case "$(uname -s)" in
+  Darwin) DEFAULT_SCIENCE_BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science" ;;
+  Linux) DEFAULT_SCIENCE_BIN="$HOME/.local/bin/claude-science" ;;
+  *) DEFAULT_SCIENCE_BIN="" ;;
+esac
+SCIENCE_BIN="${SCIENCE_BIN:-$DEFAULT_SCIENCE_BIN}"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }

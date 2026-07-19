@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -8,9 +9,23 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+TEST_TMP_ROOT = pathlib.Path("/private/tmp")
+if not TEST_TMP_ROOT.is_dir():
+    TEST_TMP_ROOT = pathlib.Path(tempfile.gettempdir())
 
 
 class SkillRuntimeBoundary(unittest.TestCase):
+    def test_linux_ci_runs_shared_skill_core_and_verifies_one_deb_sha(self):
+        rust_gate = (ROOT / "test/run-rust.sh").read_text()
+        self.assertIn('cd "$ROOT/desktop/skill-package"', rust_gate)
+        self.assertGreaterEqual(rust_gate.count("cargo clippy --all-targets -- -D warnings"), 3)
+        self.assertGreaterEqual(rust_gate.count("cargo test || fail=1"), 3)
+
+        workflow = (ROOT / ".github/workflows/linux-x64-internal.yml").read_text()
+        self.assertIn("xauth", workflow)
+        self.assertIn('test "${#debs[@]}" -eq 1', workflow)
+        self.assertIn('sha256sum -c "$deb_name.sha256"', workflow)
+
     def test_production_startup_has_no_skill_manager_dependency(self):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
         for forbidden in (
@@ -66,7 +81,7 @@ class SkillRuntimeBoundary(unittest.TestCase):
 
     def test_fresh_data_dir_initializes_without_reading_real_science_home(self):
         with tempfile.TemporaryDirectory(
-            prefix="csswitch-runtime-init-", dir="/private/tmp"
+            prefix="csswitch-runtime-init-", dir=TEST_TMP_ROOT
         ) as raw_tmp:
             tmp = pathlib.Path(raw_tmp)
             outer_home = tmp / "outer-home"
@@ -85,7 +100,7 @@ class SkillRuntimeBoundary(unittest.TestCase):
             science.write_text(
                 "#!/bin/sh\n"
                 "mkdir -p \"$HOME/.claude-science\"\n"
-                "printf 'HOME=%s\\nARGS=%s\\n' \"$HOME\" \"$*\" > \"$CSSWITCH_TEST_MARKER\"\n"
+                f"printf 'HOME=%s\\nARGS=%s\\n' \"$HOME\" \"$*\" > {shlex.quote(str(marker))}\n"
                 "exit 0\n"
             )
             science.chmod(0o700)
@@ -95,7 +110,6 @@ class SkillRuntimeBoundary(unittest.TestCase):
                     "HOME": str(outer_home),
                     "SANDBOX_HOME": str(sandbox_home),
                     "SCIENCE_BIN": str(science),
-                    "CSSWITCH_TEST_MARKER": str(marker),
                     "PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
                 }
             )
@@ -162,6 +176,8 @@ class SkillRuntimeBoundary(unittest.TestCase):
         js = (ROOT / "desktop/src/main.js").read_text()
         runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
         system = (ROOT / "desktop/src-tauri/src/runtime/system.rs").read_text()
+        platform = (ROOT / "desktop/src-tauri/src/runtime/platform.rs").read_text()
+        html = (ROOT / "desktop/src/index.html").read_text()
 
         handler = js.split("async function openBrowser()", 1)[1].split(
             "async function runDoctor", 1
@@ -173,8 +189,11 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("正在获取新的 Science 地址", handler)
         self.assertIn("已向默认浏览器发出打开 Science 的请求", handler)
         self.assertIn('result.status === "error"', handler)
-        self.assertIn("setBrowserFallback(result.fallback_url)", handler)
+        self.assertIn(
+            "setBrowserFallback(result.fallback_url_display, !!result.retryable)", handler
+        )
         self.assertIn('setMsg("打开浏览器失败："', handler)
+        self.assertNotIn("navigator.clipboard", handler)
 
         control = js.split("function syncOpenBrowserControl()", 1)[1].split(
             "function syncActivationControls", 1
@@ -188,13 +207,19 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("sandbox_listener_matches_runtime", command)
         self.assertIn("sandbox_url(sandbox_port, &runtime)", command)
         self.assertNotIn("st.sandbox_url.clone()", command)
-        self.assertIn("manual_open_result(url.clone(), open_in_browser(&url))", command)
+        self.assertIn("manual_open_result(", command)
+        self.assertIn("open_in_browser(&url)", command)
         self.assertIn("CSSWITCH_FAKE_OPEN_FAIL_ONCE_FILE", runtime)
-        self.assertIn('failed_open["fallback_url"]', runtime)
+        self.assertIn('failed_open["fallback_url_display"]', runtime)
+        self.assertIn('failed_open["fallback_url"].is_null()', runtime)
         self.assertIn('ACCEPTANCE_OPEN_BIN_ENV: &str = "CSSWITCH_ACCEPTANCE_OPEN_BIN"', system)
         self.assertIn('TEST_OPEN_BIN_ENV: &str = "CSSWITCH_TEST_OPEN_BIN"', system)
-        self.assertIn('return Ok(PathBuf::from("/usr/bin/open"))', system)
+        self.assertIn("platform::browser_open_bin()", system)
+        self.assertIn('PathBuf::from("/usr/bin/open")', platform)
+        self.assertIn('PathBuf::from("/usr/bin/xdg-open")', platform)
         self.assertIn("if !path.is_absolute()", system)
+        self.assertIn('aria-label="脱敏的 Science 地址"', html)
+        self.assertNotIn('id="browserFallbackCopyBtn"', html)
         matrix = (ROOT / "test/installed_provider_matrix.py").read_text()
         self.assertIn('"CSSWITCH_ACCEPTANCE_OPEN_BIN": str(self.bin_dir / "open")', matrix)
 
@@ -229,10 +254,14 @@ class SkillRuntimeBoundary(unittest.TestCase):
             one_click.index('const message = r.msg ||'),
         )
         self.assertIn("setBusy(false)", one_click)
-        self.assertIn("setBrowserFallback(r.fallback_url)", one_click)
+        self.assertIn(
+            "setBrowserFallback(r.fallback_url_display, !!r.retryable)", one_click
+        )
 
         gateway_ready = session.index("verify_gateway_model_catalog(pport, &secret, active_profile)?")
-        science_spawn = session.index('Command::new("zsh")', gateway_ready)
+        science_spawn = session.index(
+            "Command::new(crate::runtime::platform::bash_bin())", gateway_ready
+        )
         self.assertLess(gateway_ready, science_spawn)
         for stage in ("start_gateway", "start_science", "verify_science_catalog"):
             self.assertIn(f'"{stage}"', session)
@@ -260,6 +289,41 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn('.env("SCIENCE_BIN", &runtime.path)', science)
         self.assertIn('"source": runtime.source.code()', runtime)
 
+    def test_linux_science_preflight_is_explicit_and_fail_closed(self):
+        platform = (ROOT / "desktop/src-tauri/src/runtime/platform.rs").read_text()
+        science = (ROOT / "desktop/src-tauri/src/runtime/science.rs").read_text()
+        launch = (ROOT / "scripts/launch-virtual-sandbox.sh").read_text()
+        session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
+        for blocker in (
+            "unsupported_linux_arch",
+            "missing_bwrap",
+            "bwrap_too_old",
+            "userns_unavailable",
+            "missing_socat",
+            "missing_lsof",
+        ):
+            self.assertIn(blocker, platform)
+        self.assertIn('"status": "environment_blocked"', science)
+        self.assertIn("platform::require_science_environment()?", science)
+        self.assertIn('/usr/bin/xdg-open', platform)
+        self.assertIn('PathBuf::from("/bin/bash")', platform)
+        self.assertIn("command.env_clear()", platform)
+        for isolated_key in (
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ):
+            self.assertIn(isolated_key, platform + launch)
+        spike = session.index('std::env::var("CSSWITCH_SCIENCE_WEBVIEW_SPIKE")')
+        self.assertIn(
+            '#[cfg(not(target_os = "linux"))]', session[max(0, spike - 200) : spike]
+        )
+        self.assertIn("validate_science_loopback_url(url, expected_port)?", session)
+        self.assertNotIn("dangerously-no-sandbox", platform + launch)
+
     def test_system_ssh_bridge_is_opt_in_and_replaces_tunnel_entry(self):
         js = (ROOT / "desktop/src/main.js").read_text()
         html = (ROOT / "desktop/src/index.html").read_text()
@@ -275,6 +339,7 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn('CSSWITCH_REUSE_SYSTEM_SSH', launch + session)
         self.assertIn('CSSWITCH_SYSTEM_SSH_CONFIG', launch + wrapper)
         self.assertIn('exec /usr/bin/ssh -F "$config" "$@"', wrapper)
+        self.assertTrue(wrapper.startswith("#!/bin/bash\n"))
         self.assertNotIn("ln -s", launch)
         self.assertNotIn("cp -R", launch)
 
@@ -301,7 +366,7 @@ class SkillRuntimeBoundary(unittest.TestCase):
 
     def test_launcher_ignores_large_external_tree_and_broken_legacy_store(self):
         with tempfile.TemporaryDirectory(
-            prefix="csswitch-skill-boundary-", dir="/private/tmp"
+            prefix="csswitch-skill-boundary-", dir=TEST_TMP_ROOT
         ) as raw_tmp:
             tmp = pathlib.Path(raw_tmp)
             outer_home = tmp / "outer-home"
@@ -327,8 +392,8 @@ class SkillRuntimeBoundary(unittest.TestCase):
             science = tmp / "fake-claude-science"
             science.write_text(
                 "#!/bin/sh\n"
-                "printf 'HOME=%s\\n' \"$HOME\" > \"$CSSWITCH_TEST_MARKER\"\n"
-                "printf 'ARGS=%s\\n' \"$*\" >> \"$CSSWITCH_TEST_MARKER\"\n"
+                f"printf 'HOME=%s\\n' \"$HOME\" > {shlex.quote(str(marker))}\n"
+                f"printf 'ARGS=%s\\n' \"$*\" >> {shlex.quote(str(marker))}\n"
                 "exit 0\n"
             )
             science.chmod(0o700)
@@ -349,7 +414,6 @@ class SkillRuntimeBoundary(unittest.TestCase):
                     "HOME": str(outer_home),
                     "SANDBOX_HOME": str(sandbox_home),
                     "SCIENCE_BIN": str(science),
-                    "CSSWITCH_TEST_MARKER": str(marker),
                     "PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
                 }
             )

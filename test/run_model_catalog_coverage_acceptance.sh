@@ -6,7 +6,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-RUN_ROOT="${CSSWITCH_MODEL_CATALOG_ACCEPTANCE_ROOT:-/private/tmp/csmc-${STAMP}}"
+SHORT_TMP_ROOT="/private/tmp"
+[ -d "$SHORT_TMP_ROOT" ] || SHORT_TMP_ROOT="/tmp"
+RUN_ROOT="${CSSWITCH_MODEL_CATALOG_ACCEPTANCE_ROOT:-$SHORT_TMP_ROOT/csmc-${STAMP}}"
 
 case "$RUN_ROOT" in
   /private/tmp/* | /tmp/*) ;;

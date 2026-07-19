@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# S0 rust 层：cargo fmt+clippy+test。无 cargo → env-blocked。无 loopback → 跳过端口 bind 测试并把本层标为 env-blocked。
+# S0 rust 层：Desktop、共享 Skill core 与 Gateway 的 cargo fmt+clippy+test。无 cargo → env-blocked。无 loopback → 跳过端口 bind 测试并把本层标为 env-blocked。
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT/desktop/src-tauri"
 
@@ -24,6 +24,11 @@ else
   skip_args=""; for t in $PORT_TESTS; do skip_args="$skip_args --skip $t"; done
   cargo test -- $skip_args || fail=1
 fi
+
+cd "$ROOT/desktop/skill-package"
+cargo fmt --check || fail=1
+cargo clippy --all-targets -- -D warnings || fail=1
+cargo test || fail=1
 
 cd "$ROOT/desktop/gateway"
 cargo fmt --check || fail=1

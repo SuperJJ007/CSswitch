@@ -28,6 +28,25 @@ class CodexBrowserAuthContractTest(unittest.TestCase):
         self.assertNotIn("deviceauth/usercode", gateway)
         self.assertNotIn("deviceauth/token", gateway)
 
+    def test_linux_uses_fixed_browser_opener_and_bounded_desktop_environment(self):
+        desktop = (ROOT / "desktop/src-tauri/src/commands/codex.rs").read_text()
+        cli = (ROOT / "desktop/gateway/src/codex_auth/cli.rs").read_text()
+        opener = (ROOT / "desktop/gateway/src/codex_auth/platform.rs").read_text()
+        login = (ROOT / "desktop/gateway/src/codex_auth/login_async.rs").read_text()
+
+        self.assertIn('target_os = "linux"', cli)
+        self.assertIn('PathBuf::from("/usr/bin/xdg-open")', opener)
+        self.assertIn("super::platform::browser_open_bin()", login)
+        self.assertIn('.env("PATH", "/usr/local/bin:/usr/bin:/bin")', desktop)
+        for name in (
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ):
+            self.assertIn(f'"{name}"', desktop)
+        self.assertIn(".env_clear()", desktop)
+
     def test_profile_repair_is_explicit_and_does_not_restart_oauth(self):
         html = (ROOT / "desktop/src/index.html").read_text()
         js = (ROOT / "desktop/src/main.js").read_text()

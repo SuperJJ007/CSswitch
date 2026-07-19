@@ -5,6 +5,18 @@ ok() { echo "ok - $1"; }
 no() { echo "NOT ok - $1"; FAILS=$((FAILS+1)); }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+for script in \
+  "$ROOT/scripts/doctor.sh" \
+  "$ROOT/scripts/launch-virtual-sandbox.sh" \
+  "$ROOT/scripts/stop-science-sandbox.sh" \
+  "$ROOT/scripts/ssh-bridge/ssh"; do
+  if [ "$(sed -n '1p' "$script")" = "#!/bin/bash" ]; then
+    ok "$(basename "$script") pins /bin/bash"
+  else
+    no "$(basename "$script") does not pin /bin/bash"
+  fi
+done
+
 # 7.6 停止脚本如实报告
 T="$(mktemp -d)"
 T="$(cd "$T" && pwd -P)"
@@ -65,7 +77,7 @@ if [ $rc -ne 0 ] && echo "$out" | grep -q "Gateway 端口冲突"; then ok "previ
 
 mkdir -p "$T/no-ssh-home"
 out="$(HOME="$T/no-ssh-home" SANDBOX_HOME="$T/vh-no-ssh" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9935 --dry-run 2>&1)"; rc=$?
-if [ $rc -ne 0 ] && echo "$out" | grep -q "未找到系统 ~/.ssh/config"; then ok "SSH bridge fails closed without system config"; else no "SSH bridge accepted missing system config (rc=$rc): $out"; fi
+if [ $rc -ne 0 ] && echo "$out" | grep -q "未找到安全的系统 ~/.ssh/config"; then ok "SSH bridge fails closed without system config"; else no "SSH bridge accepted missing system config (rc=$rc): $out"; fi
 
 BRIDGE_HOME="$T/bridge-home"
 mkdir -p "$BRIDGE_HOME/.ssh"
@@ -74,6 +86,9 @@ out="$(CSSWITCH_SYSTEM_SSH_CONFIG="$BRIDGE_HOME/.ssh/config" "$ROOT/scripts/ssh-
 if [ $rc -eq 0 ] && echo "$out" | grep -qx 'hostname 127.0.0.1' && echo "$out" | grep -qx 'port 2222'; then ok "SSH bridge injects the authorized config with -F"; else no "SSH bridge did not load authorized config (rc=$rc)"; fi
 out="$(env -u CSSWITCH_SYSTEM_SSH_CONFIG "$ROOT/scripts/ssh-bridge/ssh" -G bridge-alias 2>&1)"; rc=$?
 if [ $rc -eq 126 ] && echo "$out" | grep -q "缺少有效"; then ok "SSH bridge rejects missing authorization env"; else no "SSH bridge ran without authorization env (rc=$rc)"; fi
+ln -s "$BRIDGE_HOME/.ssh/config" "$BRIDGE_HOME/.ssh/config-link"
+out="$(CSSWITCH_SYSTEM_SSH_CONFIG="$BRIDGE_HOME/.ssh/config-link" "$ROOT/scripts/ssh-bridge/ssh" -G bridge-alias 2>&1)"; rc=$?
+if [ $rc -eq 126 ] && echo "$out" | grep -q "符号链接"; then ok "SSH bridge rejects symlinked system config"; else no "SSH bridge followed symlinked system config (rc=$rc)"; fi
 
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/arbitrary-linkhome" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9934 --dry-run 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "launch rejects arbitrary symlinked data-dir"; else no "launch followed arbitrary symlinked data-dir (rc=$rc): $out"; fi
@@ -85,9 +100,9 @@ mkdir -p "$OUTER_HOME/.claude-science/runtime"
 mkdir -p "$OUTER_HOME/.ssh"
 printf 'must-not-copy\n' > "$OUTER_HOME/.claude-science/runtime/real-user-sentinel"
 printf 'Host test-only\n  HostName 127.0.0.1\n' > "$OUTER_HOME/.ssh/config"
-printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$CAPTURE_FILE"\nif [ -n "${CAPTURE_ENV:-}" ]; then printf "PATH=%%s\\nSSH_CONFIG=%%s\\nHOME=%%s\\n" "$PATH" "${CSSWITCH_SYSTEM_SSH_CONFIG:-}" "$HOME" > "$CAPTURE_ENV"; fi\nexit 0\n' > "$FAKE_CAPTURE"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s"\nprintf "PATH=%%s\\nSSH_CONFIG=%%s\\nHOME=%%s\\n" "$PATH" "${CSSWITCH_SYSTEM_SSH_CONFIG:-}" "$HOME" > "%s"\nexit 0\n' "$CAPTURE_FILE" "$CAPTURE_ENV" > "$FAKE_CAPTURE"
 chmod +x "$FAKE_CAPTURE"
-out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CAPTURE_ENV="$CAPTURE_ENV" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && grep -qx -- '--host' "$CAPTURE_FILE" && grep -qx -- '127.0.0.1' "$CAPTURE_FILE" && grep -qx -- '--sandbox-port' "$CAPTURE_FILE" && grep -qx -- '9941' "$CAPTURE_FILE"; then ok "launch pins loopback host and explicit Science preview port"; else no "launch omitted explicit loopback/preview port (rc=$rc): $out"; fi
 if grep -Fq "PATH=$ROOT/scripts/ssh-bridge:" "$CAPTURE_ENV" && grep -Fxq "SSH_CONFIG=$OUTER_HOME/.ssh/config" "$CAPTURE_ENV" && grep -Fxq "HOME=$T/vh-capture" "$CAPTURE_ENV"; then ok "launch scopes SSH bridge to the isolated Science environment"; else no "launch omitted isolated SSH bridge environment"; fi
 if [ ! -e "$T/vh-capture/.claude-science/runtime/real-user-sentinel" ]; then ok "launch never copies real Science runtime data"; else no "launch copied real Science data into sandbox"; fi

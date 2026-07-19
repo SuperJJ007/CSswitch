@@ -33,6 +33,11 @@ from test.installed_provider_matrix import (
 from test.model_catalog_coverage_acceptance import strict_route_checks
 
 
+TEST_TMP_ROOT = Path("/private/tmp")
+if not TEST_TMP_ROOT.is_dir():
+    TEST_TMP_ROOT = Path(tempfile.gettempdir())
+
+
 class FakeInspector:
     def __init__(self):
         self.records = []
@@ -427,7 +432,7 @@ class InstalledProviderMatrixTests(unittest.TestCase):
         self.assertTrue(root.exists())
         inspector.alive.clear()
         link = root / "refuse-link"
-        link.symlink_to("/private/tmp")
+        link.symlink_to(TEST_TMP_ROOT)
         with self.assertRaisesRegex(ControllerError, "symlink"):
             session.destroy_workspace()
         link.unlink()
@@ -452,7 +457,7 @@ class InstalledProviderMatrixTests(unittest.TestCase):
         session.close()
 
     def test_sanitized_summary_exports_outside_root_without_sensitive_values(self):
-        export_temp = tempfile.TemporaryDirectory(prefix="csim-export.", dir="/private/tmp")
+        export_temp = tempfile.TemporaryDirectory(prefix="csim-export.", dir=TEST_TMP_ROOT)
         self.addCleanup(export_temp.cleanup)
         export_parent = Path(export_temp.name)
         export_parent.chmod(0o700)
@@ -476,7 +481,7 @@ class InstalledProviderMatrixTests(unittest.TestCase):
             session.close()
 
     def test_external_cli_control_uses_private_evidence_and_exits_via_socket(self):
-        external_temp = tempfile.TemporaryDirectory(prefix="csim-ext.", dir="/private/tmp")
+        external_temp = tempfile.TemporaryDirectory(prefix="csim-ext.", dir=TEST_TMP_ROOT)
         self.addCleanup(external_temp.cleanup)
         parent = Path(external_temp.name)
         parent.chmod(0o700)
@@ -498,7 +503,7 @@ class InstalledProviderMatrixTests(unittest.TestCase):
             self.assertNotIn("token", evidence_file.read_text(encoding="utf-8"))
 
     def test_external_cli_ready_failure_terminates_only_owned_subprocess(self):
-        external_temp = tempfile.TemporaryDirectory(prefix="csim-start-fail.", dir="/private/tmp")
+        external_temp = tempfile.TemporaryDirectory(prefix="csim-start-fail.", dir=TEST_TMP_ROOT)
         self.addCleanup(external_temp.cleanup)
         parent = Path(external_temp.name)
         parent.chmod(0o700)
@@ -543,7 +548,7 @@ class InstalledProviderMatrixTests(unittest.TestCase):
             )
 
     def test_default_session_mock_is_external_and_identity_checked(self):
-        external_temp = tempfile.TemporaryDirectory(prefix="csim-session.", dir="/private/tmp")
+        external_temp = tempfile.TemporaryDirectory(prefix="csim-session.", dir=TEST_TMP_ROOT)
         self.addCleanup(external_temp.cleanup)
         root = Path(external_temp.name) / "owned"
         session = InstalledProviderSession(
@@ -577,7 +582,7 @@ class InstalledProviderMatrixTests(unittest.TestCase):
         self.assertEqual(CONTROLLER_SCHEMA, "csswitch.installed-provider-controller.v1")
 
     def test_unix_control_client_keeps_token_in_memory_and_uses_reviewed_commands(self):
-        socket_temp = tempfile.TemporaryDirectory(prefix="csim-sock.", dir="/private/tmp")
+        socket_temp = tempfile.TemporaryDirectory(prefix="csim-sock.", dir=TEST_TMP_ROOT)
         self.addCleanup(socket_temp.cleanup)
         evidence = Path(socket_temp.name) / "e"
         evidence.mkdir(mode=0o700)

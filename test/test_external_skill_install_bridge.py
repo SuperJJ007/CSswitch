@@ -7,9 +7,14 @@ import tempfile
 import time
 import unittest
 
+from test.test_gateway_rust import static_catalog_fingerprint
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_GATEWAY = ROOT / "desktop/gateway/target/debug/csswitch-gateway"
+TEST_TMP_ROOT = pathlib.Path("/private/tmp")
+if not TEST_TMP_ROOT.is_dir():
+    TEST_TMP_ROOT = pathlib.Path(tempfile.gettempdir())
 
 
 def gateway_bin():
@@ -22,7 +27,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
 
     def mcp_env(self):
         handle = tempfile.NamedTemporaryFile(
-            mode="w", prefix="csswitch-skill-bridge-key-", dir="/private/tmp", delete=False
+            mode="w", prefix="csswitch-skill-bridge-key-", dir=TEST_TMP_ROOT, delete=False
         )
         try:
             handle.write(self.BRIDGE_TOKEN + "\n")
@@ -68,7 +73,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         binary = gateway_bin()
         if not binary.is_file():
             self.skipTest("csswitch-gateway binary not built")
-        with tempfile.TemporaryDirectory(prefix="csswitch-bridge-host-", dir="/private/tmp") as raw:
+        with tempfile.TemporaryDirectory(prefix="csswitch-bridge-host-", dir=TEST_TMP_ROOT) as raw:
             root = pathlib.Path(raw)
             bridge_dir = root / "CSSwitch-Skill-Bridge-test"
             data_dir = root / "science"
@@ -80,9 +85,34 @@ class ExternalSkillInstallBridge(unittest.TestCase):
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
             env = os.environ.copy()
+            selector = "claude-csswitch-deepseek-test"
+            static_catalog = {
+                "schema_version": 1,
+                "adapter": "deepseek",
+                "default_selector_id": selector,
+                "routes": [
+                    {
+                        "selector_id": selector,
+                        "display_name": "DeepSeek Test",
+                        "upstream_model": "deepseek-test",
+                        "supports_tools": True,
+                    }
+                ],
+                "role_bindings": {
+                    "sonnet": selector,
+                    "opus": selector,
+                    "haiku": selector,
+                    "fable": selector,
+                },
+                "legacy_aliases": [],
+            }
+            static_catalog["catalog_fp"] = static_catalog_fingerprint(static_catalog)
             env.update(
                 {
                     "DEEPSEEK_API_KEY": "test-only-key",
+                    "CSSWITCH_STATIC_MODEL_CATALOG_V1": json.dumps(
+                        static_catalog, separators=(",", ":"), sort_keys=True
+                    ),
                     "CSSWITCH_SKILL_DATA_DIR": str(data_dir),
                     "CSSWITCH_SKILL_BRIDGE_DIR": str(bridge_dir),
                     "CSSWITCH_SKILL_BRIDGE_TOKEN": self.BRIDGE_TOKEN,
@@ -159,7 +189,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         binary = gateway_bin()
         if not binary.is_file():
             self.skipTest("csswitch-gateway binary not built")
-        with tempfile.TemporaryDirectory(prefix="CSSwitch-Skill-Bridge-mcp-", dir="/private/tmp") as raw:
+        with tempfile.TemporaryDirectory(prefix="CSSwitch-Skill-Bridge-mcp-", dir=TEST_TMP_ROOT) as raw:
             bridge_dir = pathlib.Path(raw)
             requests = [
                 {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
@@ -215,7 +245,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         binary = gateway_bin()
         if not binary.is_file():
             self.skipTest("csswitch-gateway binary not built")
-        with tempfile.TemporaryDirectory(prefix="CSSwitch-Skill-Bridge-uninstall-", dir="/private/tmp") as raw:
+        with tempfile.TemporaryDirectory(prefix="CSSwitch-Skill-Bridge-uninstall-", dir=TEST_TMP_ROOT) as raw:
             bridge_dir = pathlib.Path(raw)
             request = {
                 "jsonrpc": "2.0",
@@ -250,7 +280,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         binary = gateway_bin()
         if not binary.is_file():
             self.skipTest("csswitch-gateway binary not built")
-        with tempfile.TemporaryDirectory(prefix="CSSwitch-Skill-Bridge-scoped-", dir="/private/tmp") as raw:
+        with tempfile.TemporaryDirectory(prefix="CSSwitch-Skill-Bridge-scoped-", dir=TEST_TMP_ROOT) as raw:
             bridge_dir = pathlib.Path(raw)
             requests = [
                 {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -287,7 +317,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         binary = gateway_bin()
         if not binary.is_file():
             self.skipTest("csswitch-gateway binary not built")
-        with tempfile.TemporaryDirectory(prefix="CSSwitch-Skill-Bridge-url-", dir="/private/tmp") as raw:
+        with tempfile.TemporaryDirectory(prefix="CSSwitch-Skill-Bridge-url-", dir=TEST_TMP_ROOT) as raw:
             bridge_dir = pathlib.Path(raw)
             request = {
                 "jsonrpc": "2.0",
@@ -318,7 +348,9 @@ class ExternalSkillInstallBridge(unittest.TestCase):
     def test_science_startup_registration_is_best_effort_and_prelaunch(self):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
         registration = session.index("register_before_science_start(")
-        launch = session.index('let status = Command::new("zsh")')
+        launch = session.index(
+            "let mut launch_command = Command::new(crate::runtime::platform::bash_bin())"
+        )
         self.assertLess(registration, launch)
         self.assertIn("失败只降级该工具，绝不阻断 Science 启动", session)
         self.assertNotIn("register_before_science_start(&app, &auth_dir)?", session)
@@ -373,11 +405,11 @@ class ExternalSkillInstallBridge(unittest.TestCase):
         self.assertIn('x-operon-csrf', gateway)
         self.assertIn('CSSWITCH_SCIENCE_CONTROL_URL', bridge)
         self.assertNotIn('.arg(control_url)', bridge)
-        self.assertIn("let control_url = sandbox_url(port, runtime);", session)
+        self.assertIn("let control_url = match sandbox_url(port, runtime)", session)
         self.assertIn(
             "configure_third_party_after_science_start(app, &control_url)", session
         )
-        self.assertIn("let url = sandbox_url(sport, &launch_runtime);", session)
+        self.assertIn("let url = sandbox_url(sport, &launch_runtime)?;", session)
         self.assertIn("A dedicated control URL is only", session)
 
     def test_skill_installer_targets_active_org_and_never_version_runtime(self):

@@ -68,7 +68,11 @@ def require_isolated_root(path: Path) -> Path:
     real_home = Path(os.path.expanduser("~")).resolve(strict=True)
     if resolved == real_home or real_home in resolved.parents:
         raise AcceptanceFailure("acceptance root resolves inside the real HOME")
-    safe_roots = [Path("/private/tmp").resolve(strict=True), Path("/tmp").resolve(strict=True)]
+    safe_roots = [
+        candidate.resolve(strict=True)
+        for candidate in (Path("/private/tmp"), Path("/tmp"))
+        if candidate.is_dir()
+    ]
     if not any(resolved == safe or safe in resolved.parents for safe in safe_roots):
         raise AcceptanceFailure("coverage-install root must be under /private/tmp or /tmp")
     return resolved
