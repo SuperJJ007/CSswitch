@@ -7,7 +7,7 @@ pub(super) const fn supported() -> bool {
 pub(super) fn browser_open_bin() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        return PathBuf::from("/usr/bin/xdg-open");
+        PathBuf::from("/usr/bin/xdg-open")
     }
     #[cfg(not(target_os = "linux"))]
     {

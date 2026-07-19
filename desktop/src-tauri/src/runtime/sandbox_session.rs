@@ -3,7 +3,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tauri::{Manager, Runtime};
+#[cfg(not(target_os = "linux"))]
+use tauri::Manager;
+use tauri::Runtime;
 
 use crate::runtime::operation::{
     self, OperationKind, OperationStage, OperationTrace, POLL_INTERVAL_MS,

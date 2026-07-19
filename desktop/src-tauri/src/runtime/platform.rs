@@ -113,7 +113,7 @@ pub(crate) fn configure_runtime_script_command(
 pub(crate) fn installed_science_bin(home: &Path) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        return home.join(".local/bin/claude-science");
+        home.join(".local/bin/claude-science")
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -125,7 +125,7 @@ pub(crate) fn installed_science_bin(home: &Path) -> PathBuf {
 pub(crate) fn browser_open_bin() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        return PathBuf::from("/usr/bin/xdg-open");
+        PathBuf::from("/usr/bin/xdg-open")
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -136,7 +136,7 @@ pub(crate) fn browser_open_bin() -> PathBuf {
 pub(crate) fn lsof_bin() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        return PathBuf::from("/usr/bin/lsof");
+        PathBuf::from("/usr/bin/lsof")
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -147,7 +147,7 @@ pub(crate) fn lsof_bin() -> PathBuf {
 pub(crate) fn ps_bin() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        return PathBuf::from("/usr/bin/ps");
+        PathBuf::from("/usr/bin/ps")
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -162,7 +162,7 @@ pub(crate) fn id_bin() -> PathBuf {
 pub(crate) fn kill_bin() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        return PathBuf::from("/usr/bin/kill");
+        PathBuf::from("/usr/bin/kill")
     }
     #[cfg(not(target_os = "linux"))]
     {

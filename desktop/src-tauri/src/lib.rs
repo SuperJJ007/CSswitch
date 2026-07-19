@@ -463,6 +463,7 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app, event| match event {
+        #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen { .. } => show_main_window(app),
         tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => cleanup_for_exit(app),
         _ => {}

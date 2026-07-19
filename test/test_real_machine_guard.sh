@@ -15,6 +15,13 @@ trap cleanup EXIT
 
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; FAILS=$((FAILS + 1)); }
+file_mode() {
+  case "$(uname -s)" in
+    Darwin) stat -f '%Lp' "$1" ;;
+    Linux) stat -c '%a' "$1" ;;
+    *) return 1 ;;
+  esac
+}
 
 mkdir -p "$REAL_HOME/.csswitch"
 printf '%s\n' 'real-config-sentinel' >"$REAL_HOME/.csswitch/config.json"
@@ -60,7 +67,7 @@ case "$PROXY_PORT:$SANDBOX_PORT" in
     ;;
 esac
 
-if [ "$(stat -f '%Lp' "$ACCEPTANCE_ROOT/state/runtime-ports.v1")" = 600 ]; then
+if [ "$(file_mode "$ACCEPTANCE_ROOT/state/runtime-ports.v1")" = 600 ]; then
   pass "persisted port state is mode 0600"
 else
   fail "persisted port state is not mode 0600"
@@ -90,8 +97,8 @@ else
   fail "Codex fixture contract mismatch"
 fi
 
-if [ "$(stat -f '%Lp' "$CFG")" = 600 ] && \
-   [ "$(stat -f '%Lp' "$ACCEPTANCE_ROOT/home/.csswitch-acceptance")" = 700 ]; then
+if [ "$(file_mode "$CFG")" = 600 ] && \
+   [ "$(file_mode "$ACCEPTANCE_ROOT/home/.csswitch-acceptance")" = 700 ]; then
   pass "Codex fixture permissions are 0600/0700"
 else
   fail "Codex fixture permissions are too broad"
@@ -159,14 +166,23 @@ else
   pass "preflight rejects runtime use of OAuth callback ports"
 fi
 
-if env PATH=/usr/bin:/bin \
+NO_LSOF_BIN="$TMP_ROOT/no-lsof-bin"
+mkdir -p "$NO_LSOF_BIN"
+for tool in awk cat chmod dirname mkdir python3 rm sort uname; do
+  tool_path="$(command -v "$tool")"
+  ln -s "$tool_path" "$NO_LSOF_BIN/$tool"
+done
+NO_LSOF_OUT="$TMP_ROOT/no-lsof.out"
+if env PATH="$NO_LSOF_BIN" \
    HOME="$REAL_HOME" \
    CSSWITCH_REAL_TEST_ROOT="$TMP_ROOT/no-lsof" \
    SCIENCE_BIN=/usr/bin/true \
-     /bin/bash "$GUARD" preflight >/dev/null 2>&1; then
+     /bin/bash "$GUARD" preflight >"$NO_LSOF_OUT" 2>&1; then
   fail "preflight treated missing lsof as an empty listener set"
-else
+elif grep -q '端口安全检查需要可执行 lsof' "$NO_LSOF_OUT"; then
   pass "preflight fails closed when lsof is unavailable"
+else
+  fail "preflight failed before reaching the missing-lsof guard"
 fi
 
 FAKE_BIN="$TMP_ROOT/fake-bin"

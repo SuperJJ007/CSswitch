@@ -255,10 +255,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_legacy_csswitch_python, parse_lsof_records, parse_ps_record,
-        stop_legacy_csswitch_python_on_port, LegacyProxyCleanup, ListenerProcess,
-    };
+    use super::{is_legacy_csswitch_python, parse_lsof_records, parse_ps_record, ListenerProcess};
+    #[cfg(target_os = "macos")]
+    use super::{stop_legacy_csswitch_python_on_port, LegacyProxyCleanup};
 
     fn process(command_name: &str, uid: u32, command: &str) -> ListenerProcess {
         ListenerProcess {
