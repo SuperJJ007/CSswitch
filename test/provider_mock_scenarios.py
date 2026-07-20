@@ -975,6 +975,18 @@ def _anthropic_sse(action: Mapping[str, Any], dsml: bool = False) -> bytes:
 def _kimi_sse() -> bytes:
     events = [
         {
+            "type": "message_start",
+            "message": {
+                "id": "msg_kimi_mock",
+                "type": "message",
+                "role": "assistant",
+                "model": "kimi-k2.7-code",
+                "content": [],
+                "stop_reason": None,
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            },
+        },
+        {
             "type": "content_block_start",
             "index": 0,
             "content_block": {"type": "server_tool_use", "name": "web_search"},

@@ -16,6 +16,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_GATEWAY_BIN = ROOT / "desktop" / "gateway" / "target" / "debug" / "csswitch-gateway"
 STAGED_GATEWAY_DIR = ROOT / "desktop" / "src-tauri" / "binaries"
+PROVIDER_CONTRACT_CATALOG = ROOT / "catalog" / "provider-contracts.v1.json"
+PROVIDER_CONTRACT_DIGEST = hashlib.sha256(PROVIDER_CONTRACT_CATALOG.read_bytes()).hexdigest()
+DEFAULT_PROVIDER_CONTRACT_IDS = {
+    "deepseek": "deepseek-native",
+    "qwen": "qwen-native",
+    "relay": "custom-anthropic",
+    "openai-custom": "custom-openai-chat",
+    "openai-responses": "custom-openai-responses",
+    "codex": "codex-oauth",
+}
 
 
 def free_port():
@@ -60,6 +70,10 @@ def static_catalog_fingerprint(catalog):
         text(route["display_name"])
         text(route["upstream_model"])
         digest.update(bytes([{None: 0, False: 1, True: 2}[route.get("supports_tools")]]))
+        capabilities = route.get("capabilities") or {}
+        text(capabilities.get("reasoning_round_trip", "none"))
+        for field in ("forced_tool_choice", "structured_output", "vision"):
+            digest.update(bytes([{None: 0, False: 1, True: 2}[capabilities.get(field)]]))
     for role in ("sonnet", "opus", "haiku", "fable"):
         text(catalog["role_bindings"][role])
     number(len(catalog["legacy_aliases"]))
@@ -283,23 +297,39 @@ class RawUpstream:
                 raise AssertionError("raw upstream worker thread did not exit")
 
 
+def complete_anthropic_sse(text=b"ok"):
+    return b"".join([
+        b'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"mock","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+        b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"' + text + b'"}}\n\n',
+        b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ])
+
+
 def delayed_stream_handler(conn):
     with conn:
         conn.recv(65536)
-        time.sleep(1.2)
         head = (
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream\r\n"
             "Transfer-Encoding: chunked\r\n\r\n"
         )
         first = b"event: message_start\n"
-        conn.sendall(head.encode() + b"15\r\n" + first + b"\r\n0\r\n\r\n")
+        conn.sendall(head.encode())
+        time.sleep(1.2)
+        conn.sendall(b"15\r\n" + first + b"\r\n0\r\n\r\n")
 
 
 def dropping_stream_handler(conn):
     with conn:
         conn.recv(65536)
-        payload = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"
+        payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message"}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+        ])
         head = (
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream\r\n"
@@ -359,6 +389,7 @@ class RustGatewayLoopback(unittest.TestCase):
         env_overrides=None,
         gateway_intent="formal",
         static_catalog=None,
+        contract_id=None,
     ):
         port = port or free_port()
         self.assertNotEqual(port, 8765)
@@ -371,6 +402,10 @@ class RustGatewayLoopback(unittest.TestCase):
                 "CSSWITCH_GATEWAY_INTENT": gateway_intent,
             }
         )
+        resolved_contract_id = contract_id or DEFAULT_PROVIDER_CONTRACT_IDS.get(provider)
+        if resolved_contract_id:
+            env["CSSWITCH_PROVIDER_CONTRACT_ID"] = resolved_contract_id
+            env["CSSWITCH_PROVIDER_CONTRACT_DIGEST"] = PROVIDER_CONTRACT_DIGEST
         if gateway_intent == "formal":
             if static_catalog is None:
                 target = openai_model or "claude-opus-4-8"
@@ -602,6 +637,8 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertEqual(body["launch_id"], "loopback-launch")
             self.assertEqual(body["intent"], "formal")
             self.assertRegex(body["catalog_fp"], r"^[0-9a-f]{64}$")
+            self.assertEqual(body["provider_contract_id"], "deepseek-native")
+            self.assertRegex(body["provider_contract_digest"], r"^[0-9a-f]{64}$")
         finally:
             self.stop_gateway(proc)
 
@@ -988,13 +1025,11 @@ class RustGatewayLoopback(unittest.TestCase):
                         headers={"content-type": "application/json"},
                     )
                     resp = conn.getresponse()
-                    first_body = resp.read(split_at)
                     release_second_chunk.set()
-                    body = first_body + resp.read()
+                    body = resp.read()
                     conn.close()
                     self.assertEqual(resp.status, 200)
                     self.assertEqual(resp.getheader("transfer-encoding"), "chunked")
-                    self.assertEqual(first_body, payload[:split_at])
                     self.assertEqual(body, payload)
                     self.assertIn(marker, body)
                     self.assertNotIn(b'"type":"tool_use"', body)
@@ -1096,6 +1131,7 @@ class RustGatewayLoopback(unittest.TestCase):
                         {
                             "message": {
                                 "content": "answer",
+                                "role": "assistant",
                                 "tool_calls": [
                                     {
                                         "id": "call_2",
@@ -1212,7 +1248,7 @@ class RustGatewayLoopback(unittest.TestCase):
                     "id": "chatcmpl_stream",
                     "choices": [
                         {
-                            "message": {"content": "streamed"},
+                            "message": {"role": "assistant", "content": "streamed"},
                             "finish_reason": "stop",
                         }
                     ],
@@ -1302,7 +1338,7 @@ class RustGatewayLoopback(unittest.TestCase):
                     "id": "chatcmpl_custom",
                     "choices": [
                         {
-                            "message": {"content": "custom ok"},
+                            "message": {"role": "assistant", "content": "custom ok"},
                             "finish_reason": "stop",
                         }
                     ],
@@ -1329,6 +1365,12 @@ class RustGatewayLoopback(unittest.TestCase):
                 "id": "claude-opus-4-8",
                 "display_name": "glm-4.5",
                 "supports_tools": None,
+                "capabilities": {
+                    "reasoning_round_trip": "none",
+                    "forced_tool_choice": None,
+                    "structured_output": None,
+                    "vision": None,
+                },
                 "created_at": "2026-01-01T00:00:00Z",
             }])
             self.assertEqual(upstream.requests, [], "forced model shell should not hit /models")
@@ -1361,6 +1403,432 @@ class RustGatewayLoopback(unittest.TestCase):
             mapped = json.loads(req["body"])
             self.assertEqual(mapped["model"], "glm-4.5")
             self.assertEqual(mapped["max_tokens"], 1000000)
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_v081_k3_reasoning_tool_round_trip_and_malformed_response_fail_closed(self):
+        upstream = MockUpstream(b"{}")
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_current_gateway(
+            provider="openai-custom",
+            contract_id="opencode-go-openai-chat",
+            openai_base_url=f"http://127.0.0.1:{upstream.server_port}/zen/go/v1",
+            openai_model="kimi-k3",
+        )
+
+        def post(request):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps(request).encode(),
+                headers={"content-type": "application/json"},
+            )
+            response = conn.getresponse()
+            raw = response.read()
+            conn.close()
+            return response.status, json.loads(raw)
+
+        tools = [{
+            "name": "read_file",
+            "description": "read a file",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        }]
+        try:
+            upstream.response_body = json.dumps({
+                "id": "chatcmpl_k3_first",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "inspect the file before answering",
+                        "tool_calls": [{
+                            "id": "call_k3_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path":"src/main.rs"}',
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 7},
+            }).encode()
+            status, first = post({
+                "model": "claude-opus-4-8",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": "inspect it"}],
+                "tools": tools,
+                "tool_choice": {"type": "auto"},
+            })
+            self.assertEqual(status, 200, first)
+            self.assertEqual(first["stop_reason"], "tool_use")
+            self.assertEqual(first["content"][0]["type"], "thinking")
+            self.assertEqual(
+                first["content"][0]["thinking"],
+                "inspect the file before answering",
+            )
+            self.assertTrue(
+                first["content"][0]["signature"].startswith(
+                    "csswitch.openai-chat-thinking.v1."
+                )
+            )
+            self.assertEqual(first["content"][1]["input"], {"path": "src/main.rs"})
+
+            upstream.response_body = json.dumps({
+                "id": "chatcmpl_k3_second",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 13, "completion_tokens": 2},
+            }).encode()
+            second_request = {
+                "model": "claude-opus-4-8",
+                "max_tokens": 256,
+                "messages": [
+                    {"role": "user", "content": "inspect it"},
+                    {"role": "assistant", "content": first["content"]},
+                    {"role": "user", "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_k3_1",
+                        "content": "fn main() {}",
+                    }]},
+                ],
+                "tools": tools,
+                "tool_choice": {"type": "auto"},
+            }
+            status, second = post(second_request)
+            self.assertEqual(status, 200, second)
+            self.assertEqual(second["content"], [{"type": "text", "text": "done"}])
+            mapped_second = json.loads(upstream.requests[1]["body"])
+            self.assertEqual(
+                mapped_second["messages"][1]["reasoning_content"],
+                "inspect the file before answering",
+            )
+            self.assertEqual(
+                json.loads(
+                    mapped_second["messages"][1]["tool_calls"][0]["function"]["arguments"]
+                ),
+                {"path": "src/main.rs"},
+            )
+            self.assertEqual(mapped_second["messages"][2], {
+                "role": "tool",
+                "tool_call_id": "call_k3_1",
+                "content": "fn main() {}",
+            })
+
+            tampered = json.loads(json.dumps(second_request))
+            tampered["messages"][1]["content"][1]["input"]["path"] = "src/changed.rs"
+            before = len(upstream.requests)
+            status, error = post(tampered)
+            self.assertEqual(status, 400, error)
+            self.assertEqual(error["error"]["type"], "invalid_request_error")
+            self.assertEqual(len(upstream.requests), before)
+
+            malformed = [
+                {"id": "bad_empty", "choices": []},
+                {
+                    "id": "bad_missing_role",
+                    "choices": [{
+                        "message": {"content": "accepted without role"},
+                        "finish_reason": "stop",
+                    }],
+                },
+                {
+                    "id": "bad_empty_length",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": None},
+                        "finish_reason": "length",
+                    }],
+                },
+                {
+                    "id": "bad_finish",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "looks fine"},
+                        "finish_reason": "mystery",
+                    }],
+                },
+                {
+                    "id": "bad_arguments",
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "call_bad",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "not-json",
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                },
+            ]
+            for payload in malformed:
+                with self.subTest(payload=payload["id"]):
+                    upstream.response_body = json.dumps(payload).encode()
+                    before = len(upstream.requests)
+                    status, error = post({
+                        "model": "claude-opus-4-8",
+                        "messages": [{"role": "user", "content": "continue"}],
+                    })
+                    self.assertEqual(status, 502, error)
+                    self.assertEqual(error["error"]["type"], "api_error")
+                    self.assertEqual(len(upstream.requests), before + 1)
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_v081_openai_compatible_providers_cover_models_title_classifier_and_two_turn_tools(self):
+        cases = [
+            ("opencode-go-openai-chat", "/zen/go/v1", "/zen/go/v1/models", "/zen/go/v1/chat/completions", "kimi-k3"),
+            ("grok-openai-chat", "/v1", "/v1/models", "/v1/chat/completions", "grok-4.5"),
+            ("gemini-openai-chat", "/v1beta/openai", "/v1beta/openai/models", "/v1beta/openai/chat/completions", "gemini-2.5-pro"),
+            ("custom-openai-chat", "/v1", "/v1/models", "/v1/chat/completions", "provider-model"),
+        ]
+        for contract_id, base_path, models_path, messages_path, upstream_model in cases:
+            with self.subTest(contract_id=contract_id):
+                upstream = MockUpstream(json.dumps({"data": [{"id": upstream_model}]}).encode())
+                thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+                thread.start()
+                scratch_proc, scratch_port = self.start_current_gateway(
+                    provider="openai-custom",
+                    contract_id=contract_id,
+                    openai_base_url=f"http://127.0.0.1:{upstream.server_port}{base_path}",
+                    gateway_intent="scratch-models",
+                )
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", scratch_port, timeout=5)
+                    conn.request("GET", "/secret/v1/models")
+                    models_response = conn.getresponse()
+                    self.assertEqual(models_response.status, 200)
+                    models_response.read()
+                    conn.close()
+                    self.assertEqual(upstream.requests[0]["path"], models_path)
+                    self.assertEqual(upstream.requests[0]["headers"]["authorization"], "Bearer fake-openai-key")
+                    self.assertNotIn("x-api-key", upstream.requests[0]["headers"])
+                finally:
+                    self.stop_gateway(scratch_proc)
+                upstream.requests.clear()
+                proc, port = self.start_current_gateway(
+                    provider="openai-custom",
+                    contract_id=contract_id,
+                    openai_base_url=f"http://127.0.0.1:{upstream.server_port}{base_path}",
+                    openai_model=upstream_model,
+                )
+
+                def post(request):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    conn.request(
+                        "POST",
+                        "/secret/v1/messages",
+                        body=json.dumps(request).encode(),
+                        headers={"content-type": "application/json"},
+                    )
+                    response = conn.getresponse()
+                    raw = response.read()
+                    conn.close()
+                    self.assertEqual(response.status, 200, raw)
+                    return json.loads(raw)
+
+                try:
+                    upstream.response_body = json.dumps({
+                        "id": "chatcmpl_title",
+                        "choices": [{"message": {"role": "assistant", "content": "Normal title"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 2},
+                    }).encode()
+                    title = post({
+                        "model": "claude-opus-4-8",
+                        "max_tokens": 64,
+                        "messages": [{"role": "user", "content": "Create a title"}],
+                        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                        "tool_choice": {"type": "auto"},
+                    })
+                    self.assertEqual(title["content"], [{"type": "text", "text": "Normal title"}])
+
+                    upstream.response_body = json.dumps({
+                        "id": "chatcmpl_classifier",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": None, "tool_calls": [{
+                                "id": "call_classify",
+                                "type": "function",
+                                "function": {"name": "classify", "arguments": '{"risk":"low"}'},
+                            }]},
+                            "finish_reason": "tool_calls",
+                        }],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 3},
+                    }).encode()
+                    classifier = post({
+                        "model": "claude-opus-4-8",
+                        "max_tokens": 128,
+                        "messages": [{"role": "user", "content": "Classify this memory"}],
+                        "tools": [{
+                            "name": "classify",
+                            "description": "classify",
+                            "input_schema": {"type": "object", "properties": {"risk": {"type": "string"}}},
+                        }, {"type": "web_fetch_20260209", "name": "web_fetch"}],
+                        "tool_choice": {"type": "tool", "name": "classify"},
+                    })
+                    self.assertEqual(classifier["content"][0]["type"], "tool_use")
+                    self.assertEqual(classifier["content"][0]["input"], {"risk": "low"})
+
+                    upstream.response_body = json.dumps({
+                        "id": "chatcmpl_round_two",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "Round two complete", "tool_calls": [{
+                                "id": "call_next",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": '{"q":"next"}'},
+                            }]},
+                            "finish_reason": "tool_calls",
+                        }],
+                        "usage": {"prompt_tokens": 8, "completion_tokens": 5},
+                    }).encode()
+                    round_two = post({
+                        "model": "claude-opus-4-8",
+                        "max_tokens": 256,
+                        "messages": [
+                            {"role": "user", "content": "First turn"},
+                            {"role": "assistant", "content": [{
+                                "type": "tool_use", "id": "call_previous", "name": "lookup", "input": {"q": "past"},
+                            }]},
+                            {"role": "user", "content": [{
+                                "type": "tool_result", "tool_use_id": "call_previous", "content": "found",
+                            }]},
+                        ],
+                        "tools": [
+                            {"type": "web_search_20250305", "name": "web_search"},
+                            {"name": "lookup", "input_schema": {"type": "object"}},
+                        ],
+                        "tool_choice": {"type": "auto"},
+                    })
+                    self.assertEqual(round_two["stop_reason"], "tool_use")
+
+                    self.assertEqual([request["path"] for request in upstream.requests], [
+                        messages_path, messages_path, messages_path,
+                    ])
+                    for captured in upstream.requests:
+                        self.assertEqual(captured["headers"]["authorization"], "Bearer fake-openai-key")
+                        self.assertNotIn("x-api-key", captured["headers"])
+                    mapped = [json.loads(request["body"]) for request in upstream.requests]
+                    self.assertTrue(all(request["model"] == upstream_model for request in mapped))
+                    self.assertTrue(all(not request["model"].startswith("opencode-go/") for request in mapped))
+                    self.assertEqual(mapped[1]["tool_choice"], {
+                        "type": "function", "function": {"name": "classify"},
+                    })
+                    self.assertNotIn("tools", mapped[0])
+                    self.assertNotIn("tool_choice", mapped[0])
+                    self.assertEqual(len(mapped[1]["tools"]), 1)
+                    self.assertEqual(len(mapped[2]["tools"]), 1)
+                    self.assertEqual(mapped[2]["messages"][1]["tool_calls"][0]["function"]["name"], "lookup")
+                    self.assertEqual(mapped[2]["messages"][2], {
+                        "role": "tool", "tool_call_id": "call_previous", "content": "found",
+                    })
+                finally:
+                    self.stop_gateway(proc)
+                    upstream.shutdown()
+                    upstream.server_close()
+
+    def test_v081_opencode_anthropic_uses_bearer_and_covers_title_classifier_and_two_turn_tools(self):
+        upstream = MockUpstream(json.dumps({"data": [{"id": "minimax-m3"}]}).encode())
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        scratch_proc, scratch_port = self.start_current_gateway(
+            provider="relay",
+            contract_id="opencode-go-anthropic",
+            openai_base_url=f"http://127.0.0.1:{upstream.server_port}/zen/go/v1",
+            gateway_intent="scratch-models",
+        )
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", scratch_port, timeout=5)
+            conn.request("GET", "/secret/v1/models")
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+            conn.close()
+            self.assertEqual(upstream.requests[0]["path"], "/zen/go/v1/models")
+            self.assertEqual(upstream.requests[0]["headers"]["authorization"], "Bearer fake-relay-key")
+            self.assertNotIn("x-api-key", upstream.requests[0]["headers"])
+        finally:
+            self.stop_gateway(scratch_proc)
+        upstream.requests.clear()
+        proc, port = self.start_current_gateway(
+            provider="relay",
+            contract_id="opencode-go-anthropic",
+            openai_base_url=f"http://127.0.0.1:{upstream.server_port}/zen/go/v1",
+            openai_model="minimax-m3",
+        )
+
+        def anthropic_response(content, stop_reason="end_turn"):
+            return json.dumps({
+                "id": "msg_go", "type": "message", "role": "assistant", "model": "minimax-m3",
+                "content": content, "stop_reason": stop_reason, "stop_sequence": None,
+                "usage": {"input_tokens": 4, "output_tokens": 3},
+            }).encode()
+
+        def post(request):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/secret/v1/messages", body=json.dumps(request).encode(), headers={"content-type": "application/json"})
+            response = conn.getresponse()
+            raw = response.read()
+            conn.close()
+            self.assertEqual(response.status, 200, raw)
+            return json.loads(raw)
+
+        try:
+            upstream.response_body = anthropic_response([{"type": "text", "text": "Normal title"}])
+            title = post({"model": "claude-opus-4-8", "messages": [{"role": "user", "content": "Create a title"}]})
+            self.assertEqual(title["content"][0]["text"], "Normal title")
+
+            upstream.response_body = anthropic_response([{
+                "type": "tool_use", "id": "toolu_classify", "name": "classify", "input": {"risk": "low"},
+            }], "tool_use")
+            classifier = post({
+                "model": "claude-opus-4-8",
+                "messages": [{"role": "user", "content": "Classify"}],
+                "tools": [{"name": "classify", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool", "name": "classify"},
+            })
+            self.assertEqual(classifier["content"][0]["name"], "classify")
+
+            upstream.response_body = anthropic_response([{
+                "type": "tool_use", "id": "toolu_next", "name": "lookup", "input": {"q": "next"},
+            }], "tool_use")
+            round_two = post({
+                "model": "claude-opus-4-8",
+                "messages": [
+                    {"role": "user", "content": "First turn"},
+                    {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_previous", "name": "lookup", "input": {"q": "past"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_previous", "content": "found"}]},
+                ],
+                "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "auto"},
+            })
+            self.assertEqual(round_two["stop_reason"], "tool_use")
+
+            self.assertEqual([request["path"] for request in upstream.requests], [
+                "/zen/go/v1/messages", "/zen/go/v1/messages", "/zen/go/v1/messages",
+            ])
+            for captured in upstream.requests:
+                self.assertEqual(captured["headers"]["authorization"], "Bearer fake-relay-key")
+                self.assertNotIn("x-api-key", captured["headers"])
+            mapped = [json.loads(request["body"]) for request in upstream.requests]
+            self.assertTrue(all(request["model"] == "minimax-m3" for request in mapped))
+            self.assertEqual(mapped[1]["tool_choice"], {"type": "tool", "name": "classify"})
+            self.assertEqual(mapped[2]["messages"][2]["content"][0]["tool_use_id"], "toolu_previous")
         finally:
             self.stop_gateway(proc)
             upstream.shutdown()
@@ -1401,6 +1869,12 @@ class RustGatewayLoopback(unittest.TestCase):
                 "id": "claude-opus-4-8",
                 "display_name": "gpt-5.2",
                 "supports_tools": None,
+                "capabilities": {
+                    "reasoning_round_trip": "none",
+                    "forced_tool_choice": None,
+                    "structured_output": None,
+                    "vision": None,
+                },
                 "created_at": "2026-01-01T00:00:00Z",
             }])
             self.assertEqual(upstream.requests, [], "forced model shell should not hit /models")
@@ -1620,9 +2094,12 @@ class RustGatewayLoopback(unittest.TestCase):
                         (401, 401),
                         (403, 403),
                         (429, 429),
-                        (500, 502),
+                        (400, 400),
+                        (404, 404),
+                        (405, 405),
+                        (500, 500),
                         (502, 502),
-                        (503, 502),
+                        (503, 503),
                     ]
                     for upstream_status, expected_status in cases:
                         with self.subTest(upstream_status=upstream_status):
@@ -1693,7 +2170,7 @@ class RustGatewayLoopback(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
 
-    def test_openai_responses_connection_drop_retries_exactly_four_times(self):
+    def test_openai_responses_connection_drop_posts_exactly_once(self):
         attempts = []
 
         def always_drop_handler(conn):
@@ -1733,14 +2210,14 @@ class RustGatewayLoopback(unittest.TestCase):
                     self.assertEqual(resp.status, 502)
                     parsed = assert_error_shape(self, raw_body, "api_error")
                     self.assertTrue(parsed["error"]["message"])
-                    self.assertEqual(len(attempts), 4)
+                    self.assertEqual(len(attempts), 1)
                     self.assertTrue(all(attempts))
                 finally:
                     self.stop_gateway(proc)
         finally:
             upstream.close()
 
-    def test_openai_responses_drop_then_success_retries_exactly_once(self):
+    def test_openai_responses_drop_then_available_does_not_automatically_repost(self):
         attempts = []
         payload = json.dumps(
             {
@@ -1799,21 +2276,18 @@ class RustGatewayLoopback(unittest.TestCase):
                         headers={"content-type": "application/json"},
                     )
                     resp = conn.getresponse()
-                    body = json.loads(resp.read())
+                    raw_body = resp.read()
                     conn.close()
-                    self.assertEqual(resp.status, 200)
-                    self.assertEqual(
-                        body["content"],
-                        [{"type": "text", "text": "retry succeeded"}],
-                    )
-                    self.assertEqual(len(attempts), 2)
+                    self.assertEqual(resp.status, 502)
+                    assert_error_shape(self, raw_body, "api_error")
+                    self.assertEqual(len(attempts), 1)
                     self.assertTrue(all(attempts))
                 finally:
                     self.stop_gateway(proc)
         finally:
             upstream.close()
 
-    def test_openai_responses_three_drops_then_success_uses_fourth_attempt(self):
+    def test_openai_responses_recovery_requires_a_new_downstream_request(self):
         attempts = []
         payload = json.dumps(
             {
@@ -1864,19 +2338,27 @@ class RustGatewayLoopback(unittest.TestCase):
                     env_overrides={"HOME": temp_home},
                 )
                 try:
-                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-                    conn.request(
-                        "POST",
-                        "/secret/v1/messages",
-                        body=request_body,
-                        headers={"content-type": "application/json"},
-                    )
-                    resp = conn.getresponse()
-                    body = json.loads(resp.read())
-                    conn.close()
-                    self.assertEqual(resp.status, 200)
+                    statuses = []
+                    final_body = None
+                    for _ in range(4):
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                        conn.request(
+                            "POST",
+                            "/secret/v1/messages",
+                            body=request_body,
+                            headers={"content-type": "application/json"},
+                        )
+                        resp = conn.getresponse()
+                        response_body = resp.read()
+                        statuses.append(resp.status)
+                        if resp.status == 200:
+                            final_body = json.loads(response_body)
+                        else:
+                            assert_error_shape(self, response_body, "api_error")
+                        conn.close()
+                    self.assertEqual(statuses, [502, 502, 502, 200])
                     self.assertEqual(
-                        body["content"],
+                        final_body["content"],
                         [{"type": "text", "text": "fourth attempt succeeded"}],
                     )
                     self.assertEqual(len(attempts), 4)
@@ -2096,6 +2578,12 @@ class RustGatewayLoopback(unittest.TestCase):
                 "id": "claude-opus-4-8",
                 "display_name": "MiniMax-M2",
                 "supports_tools": None,
+                "capabilities": {
+                    "reasoning_round_trip": "none",
+                    "forced_tool_choice": None,
+                    "structured_output": None,
+                    "vision": None,
+                },
                 "created_at": "2026-01-01T00:00:00Z",
             }])
             self.assertEqual(upstream.requests, [], "forced relay shell should not hit /models")
@@ -2373,6 +2861,11 @@ class RustGatewayLoopback(unittest.TestCase):
                 conn.recv(65536)
                 attempts.append(time.time())
                 if len(attempts) == 1:
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Content-Length: 100\r\n\r\n{"
+                    )
                     return
                 payload = b'{"data":[{"id":"glm-5.2","supported_parameters":["tools"]}]}'
                 head = (
@@ -2403,6 +2896,7 @@ class RustGatewayLoopback(unittest.TestCase):
 
     def test_relay_kimi_stream_filters_server_tool_blocks(self):
         payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"m_kimi","type":"message","role":"assistant","model":"kimi-k2.7-code","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
             b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
             b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
             b'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","name":"web_search"}}\n\n',
@@ -2412,8 +2906,13 @@ class RustGatewayLoopback(unittest.TestCase):
             b'event: content_block_stop\ndata: {"type":"content_block_stop","index":2}\n\n',
             b'event: content_block_start\ndata: {"type":"content_block_start","index":3,"content_block":{"type":"thinking","thinking":"","signature":""}}\n\n',
             b'event: content_block_stop\ndata: {"type":"content_block_stop","index":3}\n\n',
-            b'event: content_block_start\ndata: {"type":"content_block_start","index":4,"content_block":{"type":"text","text":""}}\n\n',
-            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":4,"delta":{"type":"text_delta","text":"OK"}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":4,"content_block":{"type":"thinking","thinking":"plan","signature":"opaque"}}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":4}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":5,"content_block":{"type":"text","text":""}}\n\n',
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":5,"delta":{"type":"text_delta","text":"OK"}}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":5}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
         ])
 
         def kimi_stream_handler(conn):
@@ -2461,13 +2960,293 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertEqual(headers["transfer-encoding"], "chunked")
             self.assertNotIn(b"server_tool_use", body)
             self.assertNotIn(b"web_search_tool_result", body)
-            self.assertIn(b'"type":"thinking","thinking":"","signature":""', body)
+            self.assertNotIn(b'"type":"thinking","thinking":"","signature":""', body)
+            self.assertIn(b'"type":"thinking","thinking":"plan","signature":"opaque"', body)
             self.assertIn(b'"index":1', body)
             self.assertIn(b'"index":2', body)
             self.assertIn(b'"text":"OK"', body)
         finally:
             self.stop_gateway(proc)
             upstream.close()
+
+    def test_v081_relay_kimi_stream_rejects_nonsequential_original_index(self):
+        payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"m_bad_index","type":"message","role":"assistant","model":"kimi-k3","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":77,"content_block":{"type":"text","text":""}}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":77}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ])
+
+        def invalid_index_handler(conn):
+            with conn:
+                conn.recv(65536)
+                head = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/event-stream\r\n"
+                    f"Content-Length: {len(payload)}\r\n\r\n"
+                )
+                conn.sendall(head.encode() + payload)
+
+        upstream = RawUpstream(invalid_index_handler)
+        proc, port = self.start_gateway(
+            provider="relay",
+            upstream_url=upstream.url,
+            openai_base_url=f"http://127.0.0.1:{upstream.port}/up",
+            openai_model="kimi-k3",
+        )
+        try:
+            request = {
+                "model": "claude-opus-4-8",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            raw = self.raw_request(
+                port,
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(json.dumps(request).encode())}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + json.dumps(request).encode()
+                ),
+            )
+            status, _, body = parse_raw_response(raw)
+            self.assertEqual(status, 200)
+            self.assertEqual(body.count(b"event: error"), 1)
+            self.assertNotIn(b"event: message_stop", body)
+            self.assertNotIn(b'"index":0', body)
+        finally:
+            self.stop_gateway(proc)
+            upstream.close()
+
+    def test_v081_relay_kimi_stream_rejects_malformed_dropped_delta(self):
+        payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"m_bad_hidden_delta","type":"message","role":"assistant","model":"kimi-k3","content":[],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","name":"web_search"}}\n\n',
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"OK"}}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ])
+
+        def malformed_delta_handler(conn):
+            with conn:
+                conn.recv(65536)
+                head = (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/event-stream\r\n"
+                    f"Content-Length: {len(payload)}\r\n\r\n"
+                )
+                conn.sendall(head.encode() + payload)
+
+        upstream = RawUpstream(malformed_delta_handler)
+        proc, port = self.start_gateway(
+            provider="relay",
+            upstream_url=upstream.url,
+            openai_base_url=f"http://127.0.0.1:{upstream.port}/up",
+            openai_model="kimi-k3",
+        )
+        try:
+            request = {
+                "model": "claude-opus-4-8",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            raw = self.raw_request(
+                port,
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(json.dumps(request).encode())}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + json.dumps(request).encode()
+                ),
+            )
+            status, _, body = parse_raw_response(raw)
+            self.assertEqual(status, 200)
+            self.assertEqual(body.count(b"event: error"), 1)
+            self.assertNotIn(b"event: message_stop", body)
+            self.assertNotIn(b'"text":"OK"', body)
+        finally:
+            self.stop_gateway(proc)
+            upstream.close()
+
+    def test_v081_relay_kimi_nonstream_drops_only_zero_information_thinking(self):
+        upstream = MockUpstream(json.dumps({
+            "id": "msg_kimi_nonstream",
+            "type": "message",
+            "role": "assistant",
+            "model": "kimi-k2.7-code",
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": ""},
+                {"type": "thinking", "thinking": "plan", "signature": "opaque"},
+                {"type": "text", "text": "answer"},
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 2, "output_tokens": 3},
+        }).encode())
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_current_gateway(
+            provider="relay",
+            contract_id="custom-anthropic",
+            openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            openai_model="kimi-k2.7-code",
+        )
+
+        def post():
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 128,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }).encode(),
+                headers={"content-type": "application/json"},
+            )
+            response = conn.getresponse()
+            raw = response.read()
+            conn.close()
+            return response.status, json.loads(raw)
+
+        try:
+            status, body = post()
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["content"], [
+                {"type": "thinking", "thinking": "plan", "signature": "opaque"},
+                {"type": "text", "text": "answer"},
+            ])
+            self.assertEqual(body["stop_reason"], "end_turn")
+            self.assertEqual(body["usage"], {"input_tokens": 2, "output_tokens": 3})
+
+            upstream.response_body = json.dumps({
+                "id": "msg_kimi_bad",
+                "type": "message",
+                "role": "assistant",
+                "model": "kimi-k2.7-code",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "cannot be verified",
+                    "signature": "",
+                }],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }).encode()
+            before = len(upstream.requests)
+            status, body = post()
+            self.assertEqual(status, 502, body)
+            self.assertEqual(body["error"]["type"], "api_error")
+            self.assertEqual(len(upstream.requests), before + 1)
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_v081_kimi_same_conversation_failed_tail_edit_resend_posts_once(self):
+        upstream = MockUpstream(json.dumps({
+            "id": "msg_kimi_recovered",
+            "type": "message",
+            "role": "assistant",
+            "model": "kimi-k3",
+            "content": [{"type": "text", "text": "round three recovered"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 3},
+        }).encode())
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_current_gateway(
+            provider="relay",
+            contract_id="kimi-anthropic-relay",
+            openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            openai_model="kimi-k3",
+        )
+
+        def post(messages):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps({
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 128,
+                    "messages": messages,
+                }).encode(),
+                headers={"content-type": "application/json"},
+            )
+            response = conn.getresponse()
+            raw = response.read()
+            conn.close()
+            return response.status, json.loads(raw)
+
+        complete_round = [
+            {"role": "user", "content": "round one"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_round1", "name": "lookup", "input": {"q": "a"},
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_round1", "content": "found",
+            }]},
+            {"role": "assistant", "content": [{"type": "text", "text": "round one done"}]},
+        ]
+        try:
+            invalid_histories = [
+                complete_round + [{
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "orphan", "content": "bad"}],
+                }],
+                [{"role": "user", "content": [{
+                    "type": "tool_use", "id": "wrong_role", "name": "lookup", "input": {},
+                }]}],
+                [{"role": "assistant", "content": [{
+                    "type": "tool_result", "tool_use_id": "wrong_role", "content": "bad",
+                }]}],
+                [{"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "missing_name", "input": {},
+                }]}],
+                [{"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "missing_input", "name": "lookup",
+                }]}],
+            ]
+            for invalid_history in invalid_histories:
+                status, error = post(invalid_history)
+                self.assertEqual(status, 400, error)
+                self.assertEqual(error["error"]["type"], "invalid_request_error")
+            self.assertEqual(len(upstream.requests), 0, "deterministic history errors must not post upstream")
+
+            recovered_history = complete_round + [
+                {"role": "user", "content": "round two"},
+                {"role": "assistant", "content": [
+                    {"type": "server_tool_use", "name": "web_search"},
+                    {"type": "web_search_tool_result", "content": []},
+                    {"type": "thinking", "thinking": "", "signature": ""},
+                ]},
+                {"role": "user", "content": "round two edited and resent"},
+            ]
+            status, response = post(recovered_history)
+            self.assertEqual(status, 200, response)
+            self.assertEqual(response["content"][0]["text"], "round three recovered")
+            self.assertEqual(len(upstream.requests), 1, "edited resend must post exactly once")
+            mapped = json.loads(upstream.requests[0]["body"])
+            self.assertEqual(mapped["messages"][:4], complete_round)
+            self.assertEqual(mapped["messages"][-1]["content"], "round two edited and resent")
+            self.assertFalse(any(
+                block.get("type") in {"server_tool_use", "web_search_tool_result"}
+                for message in mapped["messages"]
+                for block in (message.get("content") if isinstance(message.get("content"), list) else [])
+            ))
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
 
     def test_custom_openai_models_preserves_upstream_error(self):
         upstream = MockUpstream(b'{"error":"bad key"}', status=401)
@@ -2567,11 +3346,11 @@ class RustGatewayLoopback(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
 
-    def test_nonstream_upstream_errors_match_python_shape(self):
+    def test_nonstream_upstream_errors_preserve_http_classification(self):
         cases = [
             (401, 401),
             (429, 429),
-            (500, 502),
+            (500, 500),
         ]
         upstream_body = (
             b'{"type":"error","error":{"type":"authentication_error",'
@@ -2702,12 +3481,15 @@ class RustGatewayLoopback(unittest.TestCase):
             self.stop_gateway(proc)
 
     def test_stream_passthrough_dechunks_same_payload(self):
-        payload = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+        payload = complete_anthropic_sse()
         upstream = MockUpstream(payload, content_type="text/event-stream")
         thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         thread.start()
         proc, port = self.start_gateway(
-            upstream_url=f"http://127.0.0.1:{upstream.server_port}/anthropic/v1/messages"
+            provider="relay",
+            upstream_url=f"http://127.0.0.1:{upstream.server_port}/anthropic/v1/messages",
+            openai_base_url=f"http://127.0.0.1:{upstream.server_port}/anthropic",
+            openai_model="kimi-k2.7-code",
         )
         try:
             request = {
@@ -2733,7 +3515,38 @@ class RustGatewayLoopback(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
 
-    def test_stream_keepalive_opens_before_upstream_first_byte(self):
+    def test_stream_data_only_sse_uses_json_type_and_passes_through(self):
+        payload = re.sub(rb"event: [^\n]+\n", b"", complete_anthropic_sse())
+        upstream = MockUpstream(payload, content_type="text/event-stream")
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_gateway(
+            upstream_url=f"http://127.0.0.1:{upstream.server_port}/anthropic/v1/messages"
+        )
+        try:
+            request = {
+                "model": "claude-haiku-4-5",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps(request).encode(),
+                headers={"content-type": "application/json"},
+            )
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(body, payload)
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_stream_http_response_does_not_wait_for_upstream_first_byte(self):
         upstream = RawUpstream(delayed_stream_handler)
         proc, port = self.start_gateway(upstream_url=upstream.url)
         try:
@@ -2741,16 +3554,16 @@ class RustGatewayLoopback(unittest.TestCase):
                 b'{"model":"claude-opus-4-8","max_tokens":10,"stream":true,'
                 b'"messages":[{"role":"user","content":"hi"}]}'
             )
-            raw, elapsed = self.raw_post_until(port, body, b": csswitch-keepalive")
+            raw, elapsed = self.raw_post_until(port, body, b"HTTP/1.1", timeout=2)
             self.assertIn(b"HTTP/1.1 200", raw)
             self.assertIn(b"content-type: text/event-stream", raw)
-            self.assertIn(b": csswitch-keepalive", raw)
-            self.assertLess(elapsed, 1.1)
+            self.assertNotIn(b": csswitch-keepalive", raw)
+            self.assertLess(elapsed, 0.8)
         finally:
             self.stop_gateway(proc)
             upstream.close()
 
-    def test_stream_upstream_status_after_headers_is_sse_error(self):
+    def test_stream_upstream_status_is_http_error_before_sse_headers(self):
         upstream = MockUpstream(
             b'{"error":"bad key"}',
             content_type="application/json",
@@ -2777,14 +3590,123 @@ class RustGatewayLoopback(unittest.TestCase):
                     + body
                 ),
             )
-            head, _, tail = raw.partition(b"\r\n\r\n")
-            self.assertIn(b"HTTP/1.1 200", head)
-            self.assertIn(b"content-type: text/event-stream", head)
-            self.assertIn(b"event: error", tail)
-            self.assertIn(b'"type":"api_error"', tail)
-            self.assertIn(b"upstream 401", tail)
-            self.assertTrue(raw.rstrip().endswith(b"0"))
-            self.assertNotIn(b"HTTP/1.1 401", raw)
+            status, headers, response_body = parse_raw_response(raw)
+            self.assertEqual(status, 401)
+            self.assertEqual(headers["content-type"], "application/json")
+            parsed = assert_error_shape(self, response_body, "api_error")
+            self.assertIn("upstream 401", parsed["error"]["message"])
+            self.assertNotIn(b"event: error", raw)
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_stream_non_sse_200_is_http_error_before_sse_headers(self):
+        upstream = MockUpstream(
+            b'{"message":"not an event stream"}',
+            content_type="application/json",
+            status=200,
+        )
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_gateway(
+            upstream_url=f"http://127.0.0.1:{upstream.server_port}/anthropic/v1/messages"
+        )
+        try:
+            body = (
+                b'{"model":"claude-opus-4-8","max_tokens":10,"stream":true,'
+                b'"messages":[{"role":"user","content":"hi"}]}'
+            )
+            raw = self.raw_request(
+                port,
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                ),
+            )
+            status, headers, response_body = parse_raw_response(raw)
+            self.assertEqual(status, 502)
+            self.assertEqual(headers["content-type"], "application/json")
+            parsed = assert_error_shape(self, response_body, "api_error")
+            self.assertIn("non-SSE Content-Type", parsed["error"]["message"])
+            self.assertNotIn(b"event: error", raw)
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_stream_empty_sse_200_emits_one_terminal_error_after_sse_headers(self):
+        upstream = MockUpstream(b"", content_type="text/event-stream", status=200)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_gateway(
+            upstream_url=f"http://127.0.0.1:{upstream.server_port}/anthropic/v1/messages"
+        )
+        try:
+            body = (
+                b'{"model":"claude-opus-4-8","max_tokens":10,"stream":true,'
+                b'"messages":[{"role":"user","content":"hi"}]}'
+            )
+            raw = self.raw_request(
+                port,
+                (
+                    b"POST /secret/v1/messages HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                ),
+            )
+            status, headers, response_body = parse_raw_response(raw)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["content-type"], "text/event-stream")
+            self.assertEqual(response_body.count(b"event: error"), 1)
+            self.assertIn(b'"type":"api_error"', response_body)
+            self.assertNotIn(b"event: message_stop", response_body)
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_stream_missing_message_stop_emits_one_terminal_error(self):
+        payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message"}}\n\n',
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+            b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+        ])
+        upstream = MockUpstream(payload, content_type="text/event-stream", status=200)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_gateway(
+            upstream_url=f"http://127.0.0.1:{upstream.server_port}/anthropic/v1/messages"
+        )
+        try:
+            request = {
+                "model": "claude-opus-4-8",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps(request).encode(),
+                headers={"content-type": "application/json"},
+            )
+            resp = conn.getresponse()
+            response_body = resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(response_body.count(b"event: error"), 1)
+            self.assertNotIn(b"event: message_stop", response_body)
+            self.assertIn(b'"type":"api_error"', response_body)
         finally:
             self.stop_gateway(proc)
             upstream.shutdown()
@@ -2821,6 +3743,7 @@ class RustGatewayLoopback(unittest.TestCase):
 
     def test_kimi_filtered_truncation_does_not_finalize_after_sse_error(self):
         payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message"}}\n\n',
             b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
             b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"BUFFERED_KIMI"}}',
         ])
@@ -2868,6 +3791,7 @@ class RustGatewayLoopback(unittest.TestCase):
             "</｜｜DSML｜｜tool_calls>"
         )
         payload = b"".join([
+            b'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message"}}\n\n',
             b'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
             (
                 "event: content_block_delta\ndata: "

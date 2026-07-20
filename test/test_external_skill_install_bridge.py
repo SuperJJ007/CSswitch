@@ -7,9 +7,6 @@ import tempfile
 import time
 import unittest
 
-from test.test_gateway_rust import static_catalog_fingerprint
-
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_GATEWAY = ROOT / "desktop/gateway/target/debug/csswitch-gateway"
 TEST_TMP_ROOT = pathlib.Path("/private/tmp")
@@ -85,34 +82,10 @@ class ExternalSkillInstallBridge(unittest.TestCase):
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
             env = os.environ.copy()
-            selector = "claude-csswitch-deepseek-test"
-            static_catalog = {
-                "schema_version": 1,
-                "adapter": "deepseek",
-                "default_selector_id": selector,
-                "routes": [
-                    {
-                        "selector_id": selector,
-                        "display_name": "DeepSeek Test",
-                        "upstream_model": "deepseek-test",
-                        "supports_tools": True,
-                    }
-                ],
-                "role_bindings": {
-                    "sonnet": selector,
-                    "opus": selector,
-                    "haiku": selector,
-                    "fable": selector,
-                },
-                "legacy_aliases": [],
-            }
-            static_catalog["catalog_fp"] = static_catalog_fingerprint(static_catalog)
             env.update(
                 {
                     "DEEPSEEK_API_KEY": "test-only-key",
-                    "CSSWITCH_STATIC_MODEL_CATALOG_V1": json.dumps(
-                        static_catalog, separators=(",", ":"), sort_keys=True
-                    ),
+                    "CSSWITCH_GATEWAY_INTENT": "scratch-models",
                     "CSSWITCH_SKILL_DATA_DIR": str(data_dir),
                     "CSSWITCH_SKILL_BRIDGE_DIR": str(bridge_dir),
                     "CSSWITCH_SKILL_BRIDGE_TOKEN": self.BRIDGE_TOKEN,

@@ -35,6 +35,15 @@ pub(crate) enum AuthMode {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum AuthScheme {
+    AnthropicXApiKey,
+    AnthropicDual,
+    Bearer,
+    CsswitchOauth,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ModelDiscovery {
     BuiltinStatic,
     AnthropicModelsOrManual,
@@ -57,6 +66,15 @@ pub(crate) enum Transport {
 pub(crate) enum EndpointPolicy {
     GatewayManagedOfficial,
     ProfileRequired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EndpointJoin {
+    ManagedOfficial,
+    AnthropicV1,
+    OpenaiV1,
+    OpenaiPath,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -90,6 +108,7 @@ pub(crate) struct ProviderContract {
     pub(crate) api_formats: Vec<String>,
     pub(crate) adapter: String,
     pub(crate) auth_mode: AuthMode,
+    pub(crate) auth_scheme: AuthScheme,
     pub(crate) credential_sources: Vec<CredentialSource>,
     pub(crate) default_credential_source: CredentialSource,
     pub(crate) model_policies: Vec<ModelPolicy>,
@@ -97,6 +116,7 @@ pub(crate) struct ProviderContract {
     pub(crate) model_discovery: ModelDiscovery,
     pub(crate) transport: Transport,
     pub(crate) endpoint_policy: EndpointPolicy,
+    pub(crate) endpoint_join: EndpointJoin,
     pub(crate) api_key_env: Option<String>,
     pub(crate) scratch_policy: ScratchPolicy,
     pub(crate) thinking_policy: String,
@@ -113,35 +133,11 @@ pub(crate) struct ProviderContractCatalog {
     pub(crate) contracts: Vec<ProviderContract>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GatewayContractIdentity {
-    pub(crate) contract_id: String,
-    pub(crate) catalog_digest: String,
-}
-
 pub(crate) fn static_catalog_digest() -> String {
     format!(
         "{:x}",
         Sha256::digest(STATIC_PROVIDER_CONTRACTS_JSON.as_bytes())
     )
-}
-
-pub(crate) fn gateway_contract_identity(
-    provider: &str,
-) -> Result<Option<GatewayContractIdentity>, String> {
-    if provider != "codex" {
-        return Ok(None);
-    }
-    let catalog = load_provider_contracts()?;
-    let contract = catalog
-        .contracts
-        .iter()
-        .find(|contract| contract.adapter == provider)
-        .ok_or("Codex provider contract 不存在")?;
-    Ok(Some(GatewayContractIdentity {
-        contract_id: contract.id.clone(),
-        catalog_digest: static_catalog_digest(),
-    }))
 }
 
 pub(crate) fn load_provider_contracts() -> Result<ProviderContractCatalog, String> {
@@ -308,6 +304,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                 && contract.api_formats == ["openai_responses"]
                 && contract.adapter == "codex"
                 && contract.auth_mode == AuthMode::CsswitchOauth
+                && contract.auth_scheme == AuthScheme::CsswitchOauth
                 && contract.credential_sources == [CredentialSource::CsswitchOauth]
                 && contract.default_credential_source == CredentialSource::CsswitchOauth
                 && contract.model_policies == [ModelPolicy::DynamicCatalog]
@@ -315,6 +312,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                 && contract.model_discovery == ModelDiscovery::CodexAccountCatalog
                 && contract.transport == Transport::CodexResponsesSse
                 && contract.endpoint_policy == EndpointPolicy::GatewayManagedOfficial
+                && contract.endpoint_join == EndpointJoin::ManagedOfficial
                 && contract.api_key_env.is_none()
                 && contract.scratch_policy == ScratchPolicy::GatewayOwnedAuth
                 && contract.thinking_policy.is_empty()
@@ -340,10 +338,34 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                 "deepseek" | "qwen" => EndpointPolicy::GatewayManagedOfficial,
                 _ => EndpointPolicy::ProfileRequired,
             };
+            let expected_join = match contract.id.as_str() {
+                "gemini-openai-chat" => EndpointJoin::OpenaiPath,
+                _ => match contract.adapter.as_str() {
+                    "deepseek" | "qwen" => EndpointJoin::ManagedOfficial,
+                    "relay" => EndpointJoin::AnthropicV1,
+                    "openai-custom" | "openai-responses" => EndpointJoin::OpenaiV1,
+                    _ => {
+                        return Err(format!("非 Codex contract adapter 非法：{}", contract.id));
+                    }
+                },
+            };
+            let expected_auth_scheme = match contract.id.as_str() {
+                "opencode-go-anthropic" => AuthScheme::Bearer,
+                _ => match contract.adapter.as_str() {
+                    "deepseek" => AuthScheme::AnthropicXApiKey,
+                    "relay" => AuthScheme::AnthropicDual,
+                    "qwen" | "openai-custom" | "openai-responses" => AuthScheme::Bearer,
+                    _ => {
+                        return Err(format!("非 Codex contract adapter 非法：{}", contract.id));
+                    }
+                },
+            };
             if contract.auth_mode != AuthMode::ApiKey
+                || contract.auth_scheme != expected_auth_scheme
                 || contract.scratch_policy != ScratchPolicy::UpstreamProbe
                 || contract.transport != expected_transport
                 || contract.endpoint_policy != expected_endpoint
+                || contract.endpoint_join != expected_join
                 || contract.cache.normal_ttl_seconds != 0
                 || contract.cache.stale_ttl_seconds != 0
                 || contract.upstream_client_version.is_some()
@@ -365,6 +387,8 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     ModelDiscovery::BuiltinStatic,
                     Transport::AnthropicMessages,
                     EndpointPolicy::GatewayManagedOfficial,
+                    EndpointJoin::ManagedOfficial,
+                    AuthScheme::AnthropicXApiKey,
                     "",
                 ),
                 "qwen-native" => (
@@ -377,6 +401,8 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     ModelDiscovery::BuiltinStatic,
                     Transport::OpenaiChat,
                     EndpointPolicy::GatewayManagedOfficial,
+                    EndpointJoin::ManagedOfficial,
+                    AuthScheme::Bearer,
                     "",
                 ),
                 "anthropic-relay" => (
@@ -389,6 +415,8 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     ModelDiscovery::AnthropicModelsOrManual,
                     Transport::AnthropicMessages,
                     EndpointPolicy::ProfileRequired,
+                    EndpointJoin::AnthropicV1,
+                    AuthScheme::AnthropicDual,
                     "adaptive",
                 ),
                 "kimi-anthropic-relay" => (
@@ -401,6 +429,8 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     ModelDiscovery::AnthropicModelsOrManual,
                     Transport::AnthropicMessages,
                     EndpointPolicy::ProfileRequired,
+                    EndpointJoin::AnthropicV1,
+                    AuthScheme::AnthropicDual,
                     "enabled",
                 ),
                 "custom-anthropic" => (
@@ -413,6 +443,8 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     ModelDiscovery::AnthropicModelsOrManual,
                     Transport::AnthropicMessages,
                     EndpointPolicy::ProfileRequired,
+                    EndpointJoin::AnthropicV1,
+                    AuthScheme::AnthropicDual,
                     "adaptive",
                 ),
                 "custom-openai-chat" => (
@@ -425,6 +457,8 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     ModelDiscovery::OpenaiModelsOrManual,
                     Transport::OpenaiChat,
                     EndpointPolicy::ProfileRequired,
+                    EndpointJoin::OpenaiV1,
+                    AuthScheme::Bearer,
                     "",
                 ),
                 "custom-openai-responses" => (
@@ -437,6 +471,64 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     ModelDiscovery::OpenaiModelsOrManual,
                     Transport::OpenaiResponses,
                     EndpointPolicy::ProfileRequired,
+                    EndpointJoin::OpenaiV1,
+                    AuthScheme::Bearer,
+                    "",
+                ),
+                "opencode-go-openai-chat" => (
+                    &["opencode-go-openai"][..],
+                    &["openai_chat"][..],
+                    "openai-custom",
+                    "CSSWITCH_OPENAI_KEY",
+                    &[ModelPolicy::SavedCatalog][..],
+                    ModelPolicy::SavedCatalog,
+                    ModelDiscovery::OpenaiModelsOrManual,
+                    Transport::OpenaiChat,
+                    EndpointPolicy::ProfileRequired,
+                    EndpointJoin::OpenaiV1,
+                    AuthScheme::Bearer,
+                    "",
+                ),
+                "opencode-go-anthropic" => (
+                    &["opencode-go-anthropic"][..],
+                    &["anthropic"][..],
+                    "relay",
+                    "CSSWITCH_RELAY_KEY",
+                    &[ModelPolicy::SavedCatalog][..],
+                    ModelPolicy::SavedCatalog,
+                    ModelDiscovery::AnthropicModelsOrManual,
+                    Transport::AnthropicMessages,
+                    EndpointPolicy::ProfileRequired,
+                    EndpointJoin::AnthropicV1,
+                    AuthScheme::Bearer,
+                    "",
+                ),
+                "grok-openai-chat" => (
+                    &["grok"][..],
+                    &["openai_chat"][..],
+                    "openai-custom",
+                    "CSSWITCH_OPENAI_KEY",
+                    &[ModelPolicy::SavedCatalog][..],
+                    ModelPolicy::SavedCatalog,
+                    ModelDiscovery::OpenaiModelsOrManual,
+                    Transport::OpenaiChat,
+                    EndpointPolicy::ProfileRequired,
+                    EndpointJoin::OpenaiV1,
+                    AuthScheme::Bearer,
+                    "",
+                ),
+                "gemini-openai-chat" => (
+                    &["gemini"][..],
+                    &["openai_chat"][..],
+                    "openai-custom",
+                    "CSSWITCH_OPENAI_KEY",
+                    &[ModelPolicy::SavedCatalog][..],
+                    ModelPolicy::SavedCatalog,
+                    ModelDiscovery::OpenaiModelsOrManual,
+                    Transport::OpenaiChat,
+                    EndpointPolicy::ProfileRequired,
+                    EndpointJoin::OpenaiPath,
+                    AuthScheme::Bearer,
                     "",
                 ),
                 _ => {
@@ -459,7 +551,9 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                 || contract.model_discovery != expected.6
                 || contract.transport != expected.7
                 || contract.endpoint_policy != expected.8
-                || contract.thinking_policy != expected.9
+                || contract.endpoint_join != expected.9
+                || contract.auth_scheme != expected.10
+                || contract.thinking_policy != expected.11
             {
                 return Err(format!(
                     "API provider contract 偏离已验证运行时矩阵：{}",
@@ -485,6 +579,10 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
         "custom-anthropic",
         "custom-openai-chat",
         "custom-openai-responses",
+        "opencode-go-openai-chat",
+        "opencode-go-anthropic",
+        "grok-openai-chat",
+        "gemini-openai-chat",
         "codex-oauth",
     ]
     .into_iter()
@@ -528,16 +626,8 @@ mod tests {
     fn static_provider_contracts_load_and_are_unambiguous() {
         let catalog = load_provider_contracts().unwrap();
         assert_eq!(catalog.schema_version, 1);
-        assert_eq!(catalog.contracts.len(), 8);
+        assert_eq!(catalog.contracts.len(), 12);
         assert_eq!(static_catalog_digest().len(), 64);
-        assert_eq!(
-            gateway_contract_identity("codex").unwrap(),
-            Some(GatewayContractIdentity {
-                contract_id: "codex-oauth".into(),
-                catalog_digest: static_catalog_digest(),
-            })
-        );
-        assert_eq!(gateway_contract_identity("relay").unwrap(), None);
         assert_eq!(
             contract_for("codex", "openai_responses")
                 .unwrap()
@@ -573,6 +663,7 @@ mod tests {
     fn api_contract_runtime_matrix_rejects_behavior_mutations() {
         for (field, value) in [
             ("api_key_env", serde_json::json!("TYPO_API_KEY")),
+            ("auth_scheme", serde_json::json!("bearer")),
             ("model_discovery", serde_json::json!("none")),
             ("api_formats", serde_json::json!(["openai_responses"])),
             ("thinking_policy", serde_json::json!("enabled")),
@@ -599,7 +690,7 @@ mod tests {
             ("upstream_client_version", serde_json::json!("0.0.0")),
         ] {
             let mut mutated = parsed_catalog_value();
-            mutated["contracts"][7][field] = value;
+            mutated["contracts"][11][field] = value;
             assert!(
                 validate_value(mutated).is_err(),
                 "Codex mutation {field} must fail closed"

@@ -144,6 +144,11 @@ fn set_mode_inner(
             move |c| c.mode = mode
         })
         .map_err(|e| e.to_string())?;
+        {
+            let mut app_state = lock(&state);
+            app_state.history_recovery = None;
+            app_state.boot_attention = None;
+        }
         Ok(())
     })
 }
@@ -234,6 +239,11 @@ fn set_settings_inner(
             c.reuse_system_ssh = cfg.reuse_system_ssh;
         })
         .map_err(|e| e.to_string())?;
+        {
+            let mut app_state = lock(&state);
+            app_state.history_recovery = None;
+            app_state.boot_attention = None;
+        }
         Ok(())
     })
 }
@@ -432,6 +442,120 @@ pub(crate) fn one_click_login_cmd(
     }
 }
 
+#[tauri::command]
+pub(crate) async fn restore_history_choice(
+    app: tauri::AppHandle,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+    reference: String,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || {
+        lifecycle.with_serialized(|| {
+            let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
+            if cfg.mode != "proxy" {
+                return Err("当前已不是第三方模型模式，本次历史恢复选择已作废".into());
+            }
+            if cfg.runtime_transaction.is_some() {
+                return Err("当前有新的运行事务尚未完成，已拒绝覆盖其历史身份".into());
+            }
+            let active_profile_id = cfg
+                .active_profile()
+                .map(|profile| profile.id.clone())
+                .ok_or("当前生效配置已变化，本次历史恢复选择已作废")?;
+            let (auth_dir, sandbox_root, candidate, expected_port) = {
+                let app_state = lock(&state);
+                let session = app_state
+                    .history_recovery
+                    .as_ref()
+                    .ok_or("历史恢复选择已过期，请重新点击一键开始")?;
+                if session.active_profile_id != active_profile_id
+                    || session.sandbox_port != cfg.sandbox_port
+                {
+                    return Err("当前配置或端口已变化，本次历史恢复选择已作废".into());
+                }
+                let choice = session
+                    .choices
+                    .iter()
+                    .find(|choice| choice.reference == reference)
+                    .ok_or("历史恢复引用无效或已过期")?;
+                (
+                    session.auth_dir.clone(),
+                    session.sandbox_root.clone(),
+                    choice.candidate.clone(),
+                    session.sandbox_port,
+                )
+            };
+
+            // A user may discover after opening Science that A/B was the wrong
+            // history. Keep the one-shot mapping in memory for this app session,
+            // but stop only the exact managed runtime before changing credentials.
+            {
+                let mut app_state = lock(&state);
+                if app_state.science_runtime.is_some() {
+                    stop_sandbox_state(&app, &mut app_state)?;
+                } else if proc::loopback_port_in_use(
+                    expected_port,
+                    operation::LOCAL_HEALTH_TIMEOUT_MS,
+                ) {
+                    return Err("Science 端口被未知进程占用，已拒绝改写历史身份".into());
+                }
+            }
+            let current_cfg =
+                config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
+            if current_cfg.mode != "proxy"
+                || current_cfg.sandbox_port != expected_port
+                || current_cfg.runtime_transaction.is_some()
+                || current_cfg
+                    .active_profile()
+                    .map(|profile| profile.id.as_str())
+                    != Some(active_profile_id.as_str())
+            {
+                return Err("运行配置或事务在恢复前已变化，本次选择已作废".into());
+            }
+            let _ = crate::oauth_forge::restore_history_choice(
+                &auth_dir,
+                "virtual@localhost.invalid",
+                &sandbox_root,
+                &candidate,
+            )?;
+            // Consume every old reference after a successful selection. Fresh
+            // references preserve the in-session "choose again" escape hatch
+            // without making an invoke token replayable.
+            let refreshed_choices = {
+                let mut app_state = lock(&state);
+                app_state.boot_attention = None;
+                let session = app_state
+                    .history_recovery
+                    .as_mut()
+                    .ok_or("历史恢复会话已过期")?;
+                session
+                    .choices
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(index, choice)| {
+                        choice.reference = config::new_id();
+                        let label = if index < 26 {
+                            format!("历史记录 {}", (b'A' + index as u8) as char)
+                        } else {
+                            format!("历史记录 {}", index + 1)
+                        };
+                        json!({"reference": choice.reference, "label": label})
+                    })
+                    .collect::<Vec<_>>()
+            };
+            Ok(json!({
+                "status": "ok",
+                "action": "history_choice_restored",
+                "message": "已恢复所选历史记录；其他历史记录未被删除。",
+                "choices": refreshed_choices
+            }))
+        })
+    })
+    .await
+}
+
 fn one_click_failure_value(message: String) -> serde_json::Value {
     let recovery_status = config::load_from(&config::default_dir())
         .ok()
@@ -500,6 +624,8 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         launched_gateway_kind,
         launched_shim_mode,
         launched_launch_id,
+        active_contract_id,
+        active_contract_digest,
         science_runtime,
     ) = {
         let mut st = lock(state.inner());
@@ -519,14 +645,37 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         };
         let tracked_proxy_child_alive = proc::tracked_child_is_running(&mut st.proxy);
         // 上游灯读生效 profile 的 adapter/base_url；无生效配置 → 空（灯显黄，不误探）。
-        let (adapter, base_url, active_profile, catalog_profile) = match cfg.active_profile() {
+        let (
+            adapter,
+            base_url,
+            active_contract_id,
+            active_contract_digest,
+            active_profile,
+            catalog_profile,
+        ) = match cfg.active_profile() {
             Some(p) => {
-                let (adapter, endpoint) = resolve_launch_plan(p)
-                    .map(|plan| (plan.adapter, plan.endpoint))
-                    .unwrap_or_else(|_| ("unsupported".to_string(), String::new()));
+                let (adapter, endpoint, contract_id, contract_digest) = resolve_launch_plan(p)
+                    .map(|plan| {
+                        (
+                            plan.adapter,
+                            plan.endpoint,
+                            plan.contract_id,
+                            plan.contract_digest,
+                        )
+                    })
+                    .unwrap_or_else(|_| {
+                        (
+                            "unsupported".to_string(),
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                        )
+                    });
                 (
                     adapter,
                     endpoint,
+                    contract_id,
+                    contract_digest,
                     json!({
                         "id": p.id,
                         "name": p.name,
@@ -538,7 +687,14 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
                     Some(p.clone()),
                 )
             }
-            None => (String::new(), String::new(), serde_json::Value::Null, None),
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                serde_json::Value::Null,
+                None,
+            ),
         };
         (
             pport,
@@ -553,6 +709,8 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             st.gateway_kind.clone(),
             st.shim_mode.clone(),
             st.launch_id.clone(),
+            active_contract_id,
+            active_contract_digest,
             st.science_runtime.clone(),
         )
     };
@@ -566,10 +724,14 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             pport,
             Some(&secret),
             operation::STATUS_HEALTH_TIMEOUT_MS,
-            &launched_gateway_kind,
-            Some(&launched_provider),
-            Some(launched_shim_mode.as_str()),
-            Some(launched_launch_id.as_str()),
+            proc::GatewayHealthExpectation {
+                gateway: &launched_gateway_kind,
+                provider: Some(&launched_provider),
+                shim: Some(launched_shim_mode.as_str()),
+                launch_id: Some(launched_launch_id.as_str()),
+                provider_contract_id: Some(active_contract_id.as_str()),
+                provider_contract_digest: Some(active_contract_digest.as_str()),
+            },
         );
     let last_error = proxy_status_last_error(!secret.is_empty(), proxy_ok, pport);
     let sandbox_ok = proc::http_health(sport, None, operation::STATUS_HEALTH_TIMEOUT_MS);
@@ -612,6 +774,11 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
 #[tauri::command]
 pub(crate) fn boot_error(state: State<'_, SharedAppState>) -> Option<String> {
     lock(state.inner()).boot_error.clone()
+}
+
+#[tauri::command]
+pub(crate) fn boot_attention(state: State<'_, SharedAppState>) -> Option<serde_json::Value> {
+    lock(state.inner()).boot_attention.take()
 }
 
 fn manual_open_result(port: u16, result: Result<(), String>) -> serde_json::Value {

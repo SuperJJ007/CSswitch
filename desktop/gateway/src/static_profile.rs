@@ -11,6 +11,28 @@ const MAX_SELECTOR_BYTES: usize = 160;
 const MAX_DISPLAY_BYTES: usize = 256;
 const MAX_UPSTREAM_BYTES: usize = 512;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningRoundTrip {
+    #[default]
+    None,
+    Native,
+    CsswitchOpaque,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireRouteCapabilities {
+    #[serde(default)]
+    reasoning_round_trip: ReasoningRoundTrip,
+    #[serde(default)]
+    forced_tool_choice: Option<bool>,
+    #[serde(default)]
+    structured_output: Option<bool>,
+    #[serde(default)]
+    vision: Option<bool>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireRoute {
@@ -18,6 +40,8 @@ struct WireRoute {
     display_name: String,
     upstream_model: String,
     supports_tools: Option<bool>,
+    #[serde(default)]
+    capabilities: WireRouteCapabilities,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -76,6 +100,22 @@ impl ResolvedRoute<'_> {
     pub fn upstream_model(&self) -> &str {
         &self.route.upstream_model
     }
+
+    pub fn reasoning_round_trip(&self) -> ReasoningRoundTrip {
+        self.route.capabilities.reasoning_round_trip
+    }
+
+    pub fn supports_forced_tool_choice(&self) -> Option<bool> {
+        self.route.capabilities.forced_tool_choice
+    }
+
+    pub fn supports_structured_output(&self) -> Option<bool> {
+        self.route.capabilities.structured_output
+    }
+
+    pub fn supports_vision(&self) -> Option<bool> {
+        self.route.capabilities.vision
+    }
 }
 
 fn valid_text(value: &str, max: usize) -> bool {
@@ -94,7 +134,7 @@ fn valid_selector(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn official_role_alias(value: &str) -> Option<&'static str> {
+pub(crate) fn official_role_alias(value: &str) -> Option<&'static str> {
     if !value.is_ascii() || value.len() > MAX_SELECTOR_BYTES {
         return None;
     }
@@ -286,6 +326,16 @@ impl StaticProfileResolver {
                     "id": route.selector_id,
                     "display_name": display_name,
                     "supports_tools": route.supports_tools,
+                    "capabilities": {
+                        "reasoning_round_trip": match route.capabilities.reasoning_round_trip {
+                            ReasoningRoundTrip::None => "none",
+                            ReasoningRoundTrip::Native => "native",
+                            ReasoningRoundTrip::CsswitchOpaque => "csswitch_opaque",
+                        },
+                        "forced_tool_choice": route.capabilities.forced_tool_choice,
+                        "structured_output": route.capabilities.structured_output,
+                        "vision": route.capabilities.vision,
+                    },
                     "created_at": "2026-01-01T00:00:00Z",
                 })
             })
@@ -320,6 +370,25 @@ fn wire_catalog_fingerprint(catalog: &WireCatalog) -> String {
             Some(false) => 1,
             Some(true) => 2,
         }]);
+        fingerprint_text(
+            &mut digest,
+            match route.capabilities.reasoning_round_trip {
+                ReasoningRoundTrip::None => "none",
+                ReasoningRoundTrip::Native => "native",
+                ReasoningRoundTrip::CsswitchOpaque => "csswitch_opaque",
+            },
+        );
+        for capability in [
+            route.capabilities.forced_tool_choice,
+            route.capabilities.structured_output,
+            route.capabilities.vision,
+        ] {
+            digest.update([match capability {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            }]);
+        }
     }
     for role in [
         &catalog.role_bindings.sonnet,
@@ -389,6 +458,13 @@ mod tests {
             resolver.resolve("qwen-plus").unwrap().kind,
             ResolutionKind::LegacyExact
         );
+        let resolved = resolver
+            .resolve("claude-csswitch-qwen-plus-111111111111")
+            .unwrap();
+        assert_eq!(resolved.reasoning_round_trip(), ReasoningRoundTrip::None);
+        assert_eq!(resolved.supports_forced_tool_choice(), None);
+        assert_eq!(resolved.supports_structured_output(), None);
+        assert_eq!(resolved.supports_vision(), None);
         assert_eq!(
             resolver
                 .resolve("claude-opus-4-8-20250514")

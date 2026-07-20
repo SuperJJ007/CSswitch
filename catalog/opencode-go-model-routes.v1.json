@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "catalog_id": "opencode-go-model-routes",
+  "source": {
+    "url": "https://opencode.ai/docs/zh-cn/go/",
+    "updated_at": "2026-07-19"
+  },
+  "routes": [
+    { "model_id": "grok-4.5", "protocol": "openai_chat" },
+    { "model_id": "glm-5.2", "protocol": "openai_chat" },
+    { "model_id": "glm-5.1", "protocol": "openai_chat" },
+    { "model_id": "kimi-k3", "protocol": "openai_chat" },
+    { "model_id": "kimi-k2.7-code", "protocol": "openai_chat" },
+    { "model_id": "kimi-k2.6", "protocol": "openai_chat" },
+    { "model_id": "deepseek-v4-pro", "protocol": "openai_chat" },
+    { "model_id": "deepseek-v4-flash", "protocol": "openai_chat" },
+    { "model_id": "mimo-v2.5", "protocol": "openai_chat" },
+    { "model_id": "mimo-v2.5-pro", "protocol": "openai_chat" },
+    { "model_id": "minimax-m3", "protocol": "anthropic" },
+    { "model_id": "minimax-m2.7", "protocol": "anthropic" },
+    { "model_id": "minimax-m2.5", "protocol": "anthropic" },
+    { "model_id": "qwen3.7-max", "protocol": "anthropic" },
+    { "model_id": "qwen3.7-plus", "protocol": "anthropic" },
+    { "model_id": "qwen3.6-plus", "protocol": "anthropic" }
+  ]
+}

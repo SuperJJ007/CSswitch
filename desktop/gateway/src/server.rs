@@ -85,27 +85,29 @@ enum StreamFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamTermination {
     NormalEof,
+    UpstreamTerminalError,
     UpstreamReadError,
+    ProtocolError,
     DownstreamWriteError,
 }
 
 impl StreamFilter {
-    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+    fn feed(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
         match self {
             StreamFilter::Kimi(filter) => filter.feed(chunk),
             StreamFilter::DsmlDetect(detector) => {
                 detector.feed(chunk);
-                chunk.to_vec()
+                Ok(chunk.to_vec())
             }
-            StreamFilter::DsmlRewrite(rewriter) => rewriter.feed(chunk),
+            StreamFilter::DsmlRewrite(rewriter) => Ok(rewriter.feed(chunk)),
         }
     }
 
-    fn finalize(&mut self) -> Vec<u8> {
+    fn finalize(&mut self) -> Result<Vec<u8>, String> {
         match self {
             StreamFilter::Kimi(filter) => filter.finalize(),
-            StreamFilter::DsmlDetect(_) => Vec::new(),
-            StreamFilter::DsmlRewrite(rewriter) => rewriter.finalize(),
+            StreamFilter::DsmlDetect(_) => Ok(Vec::new()),
+            StreamFilter::DsmlRewrite(rewriter) => Ok(rewriter.finalize()),
         }
     }
 
@@ -256,6 +258,16 @@ fn route_unknown_json(stream: &mut TcpStream, detail: &str) {
     typed_error_json(stream, 400, "Bad Request", "route_unknown", detail);
 }
 
+fn codex_model_unavailable_json(stream: &mut TcpStream, detail: &str) {
+    typed_error_json(
+        stream,
+        503,
+        "Service Unavailable",
+        "codex_model_unavailable",
+        detail,
+    );
+}
+
 fn request_too_large_json(stream: &mut TcpStream) {
     typed_error_json(
         stream,
@@ -331,7 +343,7 @@ fn handle_get(
             if let Some(resolver) = cfg.static_model_resolver.as_ref() {
                 health["catalog_fp"] = Value::String(resolver.catalog_fp().to_string());
             }
-            if let Some(contract) = cfg.codex_contract.as_ref() {
+            if let Some(contract) = cfg.provider_contract.as_ref() {
                 let object = health
                     .as_object_mut()
                     .expect("health response is an object");
@@ -496,13 +508,43 @@ where
     R: Read,
     F: FnMut(&[u8]) -> std::io::Result<()>,
 {
-    let first = if let Some(filter) = filter.as_mut() {
-        filter.feed(first)
-    } else {
-        first.to_vec()
+    let mut validator = crate::anthropic_sse::Validator::default();
+
+    let filter_error = |emit: &mut F| {
+        if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
+            StreamTermination::DownstreamWriteError
+        } else {
+            StreamTermination::ProtocolError
+        }
     };
-    if !first.is_empty() && emit(&first).is_err() {
-        return StreamTermination::DownstreamWriteError;
+
+    let process = |chunk: &[u8], validator: &mut crate::anthropic_sse::Validator, emit: &mut F| {
+        let validated = match validator.feed(chunk) {
+            Ok(validated) => validated,
+            Err(_) => {
+                if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
+                    return Some(StreamTermination::DownstreamWriteError);
+                }
+                return Some(StreamTermination::ProtocolError);
+            }
+        };
+        if !validated.bytes.is_empty() && emit(&validated.bytes).is_err() {
+            return Some(StreamTermination::DownstreamWriteError);
+        }
+        validated
+            .terminal_error
+            .then_some(StreamTermination::UpstreamTerminalError)
+    };
+
+    let first = match filter.as_mut() {
+        Some(filter) => match filter.feed(first) {
+            Ok(chunk) => chunk,
+            Err(_) => return filter_error(&mut emit),
+        },
+        None => first.to_vec(),
+    };
+    if let Some(termination) = process(&first, &mut validator, &mut emit) {
+        return termination;
     }
 
     let mut buf = [0_u8; 8192];
@@ -510,25 +552,46 @@ where
         match upstream.read(&mut buf) {
             Ok(0) => {
                 if let Some(filter) = filter.as_mut() {
-                    let tail = filter.finalize();
-                    if !tail.is_empty() && emit(&tail).is_err() {
-                        return StreamTermination::DownstreamWriteError;
+                    let tail = match filter.finalize() {
+                        Ok(tail) => tail,
+                        Err(_) => return filter_error(&mut emit),
+                    };
+                    if let Some(termination) = process(&tail, &mut validator, &mut emit) {
+                        return termination;
                     }
                 }
-                return StreamTermination::NormalEof;
+                return match validator.finish() {
+                    Ok(terminal) => {
+                        if !terminal.is_empty() && emit(&terminal).is_err() {
+                            StreamTermination::DownstreamWriteError
+                        } else {
+                            StreamTermination::NormalEof
+                        }
+                    }
+                    Err(_) => {
+                        if emit(&stream_error_event("upstream SSE protocol error")).is_err() {
+                            StreamTermination::DownstreamWriteError
+                        } else {
+                            StreamTermination::ProtocolError
+                        }
+                    }
+                };
             }
             Ok(n) => {
                 let chunk = if let Some(filter) = filter.as_mut() {
-                    filter.feed(&buf[..n])
+                    match filter.feed(&buf[..n]) {
+                        Ok(chunk) => chunk,
+                        Err(_) => return filter_error(&mut emit),
+                    }
                 } else {
                     buf[..n].to_vec()
                 };
-                if !chunk.is_empty() && emit(&chunk).is_err() {
-                    return StreamTermination::DownstreamWriteError;
+                if let Some(termination) = process(&chunk, &mut validator, &mut emit) {
+                    return termination;
                 }
             }
-            Err(e) => {
-                if emit(&stream_error_event(&e.to_string())).is_err() {
+            Err(_) => {
+                if emit(&stream_error_event("upstream stream read failed")).is_err() {
                     return StreamTermination::DownstreamWriteError;
                 }
                 return StreamTermination::UpstreamReadError;
@@ -543,6 +606,13 @@ fn handle_stream(
     body: Vec<u8>,
     mut filter: Option<StreamFilter>,
 ) {
+    let mut upstream = match messages::open_stream(cfg, body) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            api_error_json(stream, error.status, &error.detail);
+            return;
+        }
+    };
     if write!(
         stream,
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
@@ -552,51 +622,19 @@ fn handle_stream(
     {
         return;
     }
-    let (tx, rx) = mpsc::channel();
-    let cfg_for_open = cfg.clone();
-    thread::spawn(move || {
-        let _ = tx.send(messages::open_stream(&cfg_for_open, body));
+    let termination = forward_stream_body(&mut upstream.response, &[], &mut filter, |chunk| {
+        write_chunk(stream, chunk)
     });
-    let upstream = loop {
-        match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(result) => break result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if write_chunk(stream, b": csswitch-keepalive\n\n").is_err() {
-                    return;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break Err(messages::UpstreamError {
-                    status: 502,
-                    upstream_status: None,
-                    detail: "upstream stream failed".to_string(),
-                });
+    match termination {
+        StreamTermination::NormalEof => {
+            if let Some(filter) = filter.as_ref() {
+                filter.log_stats();
             }
         }
-    };
-    match upstream {
-        Ok(mut upstream) => {
-            let termination = forward_stream_body(
-                &mut upstream.response,
-                &upstream.first,
-                &mut filter,
-                |chunk| write_chunk(stream, chunk),
-            );
-            match termination {
-                StreamTermination::NormalEof => {
-                    if let Some(filter) = filter.as_ref() {
-                        filter.log_stats();
-                    }
-                }
-                StreamTermination::UpstreamReadError => {}
-                StreamTermination::DownstreamWriteError => return,
-            }
-        }
-        Err(e) => {
-            if write_chunk(stream, &stream_error_event(&e.detail)).is_err() {
-                return;
-            }
-        }
+        StreamTermination::UpstreamTerminalError
+        | StreamTermination::UpstreamReadError
+        | StreamTermination::ProtocolError => {}
+        StreamTermination::DownstreamWriteError => return,
     }
     let _ = stream.write_all(b"0\r\n\r\n");
     let _ = stream.flush();
@@ -663,6 +701,27 @@ fn known_tools_from_request(raw: &Value) -> Map<String, Value> {
         out.insert(name.to_string(), schema);
     }
     out
+}
+
+fn openai_chat_reasoning_signer(
+    cfg: &GatewayConfig,
+) -> Result<openai_chat::ReasoningSigner, String> {
+    // The loopback auth token rotates with each managed Gateway launch, so it
+    // cannot key history that must survive an application restart. API keys are
+    // stable profile credentials; contract + endpoint keep signatures scoped to
+    // the exact provider route instead of portable across profiles.
+    let secret = cfg
+        .api_key
+        .as_deref()
+        .or(cfg.auth_secret.as_deref())
+        .unwrap_or("");
+    let contract_scope = cfg
+        .provider_contract
+        .as_ref()
+        .map(|contract| contract.contract_id.as_str())
+        .unwrap_or(cfg.provider.as_str());
+    let context = format!("{contract_scope}\0{}", cfg.upstream_url);
+    openai_chat::ReasoningSigner::new(secret, &context)
 }
 
 fn dsml_stream_filter(
@@ -1207,12 +1266,22 @@ fn handle_codex_messages_with_catalog(
             return;
         }
     };
-    let Some(target_model) = snapshot.resolve_science_model(requested_model) else {
-        route_unknown_json(
-            stream,
-            "model selector is not available for this Codex account",
-        );
-        return;
+    let target_model = match snapshot.resolve_request_model(requested_model) {
+        Ok(model) => model,
+        Err(codex_models::CodexModelResolutionError::UnknownSelector) => {
+            route_unknown_json(
+                stream,
+                "model selector is not available for this Codex account",
+            );
+            return;
+        }
+        Err(codex_models::CodexModelResolutionError::NoCompatibleStandardResponsesModel) => {
+            codex_model_unavailable_json(
+                stream,
+                "this Codex account has no compatible standard Responses model for the requested Claude role",
+            );
+            return;
+        }
     };
     let mut mapped_request = raw.clone();
     mapped_request["model"] = Value::String(target_model.raw_id().to_string());
@@ -1296,6 +1365,13 @@ fn handle_messages(
         || cfg.provider == "openai-custom"
         || cfg.provider == "openai-responses"
     {
+        let reasoning_signer = match openai_chat_reasoning_signer(cfg) {
+            Ok(signer) => signer,
+            Err(error) => {
+                api_error_json(stream, 500, &error);
+                return;
+            }
+        };
         let model_id = raw
             .get("model")
             .and_then(Value::as_str)
@@ -1309,9 +1385,11 @@ fn handle_messages(
             )
             .map(|(body, metadata)| (body, Some(metadata)))
         } else if cfg.provider == "openai-custom" {
-            openai_chat::anthropic_to_openai_custom(&raw, &target_model).map(|body| (body, None))
+            openai_chat::anthropic_to_openai_custom(&raw, &target_model, &reasoning_signer)
+                .map(|body| (body, None))
         } else {
-            openai_chat::anthropic_to_openai(&raw, &target_model).map(|body| (body, None))
+            openai_chat::anthropic_to_openai(&raw, &target_model, &reasoning_signer)
+                .map(|body| (body, None))
         };
         let (transformed, responses_metadata) = match transformed {
             Ok(result) => result,
@@ -1340,9 +1418,24 @@ fn handle_messages(
                     }
                 };
                 let anthropic_resp = if cfg.provider == "openai-responses" {
-                    openai_responses::openai_to_anthropic(&openai_resp, &model_id)
+                    Ok(openai_responses::openai_to_anthropic(
+                        &openai_resp,
+                        &model_id,
+                    ))
                 } else {
-                    openai_chat::openai_to_anthropic(&openai_resp, &model_id)
+                    openai_chat::openai_to_anthropic(
+                        &openai_resp,
+                        &model_id,
+                        &target_model,
+                        &reasoning_signer,
+                    )
+                };
+                let anthropic_resp = match anthropic_resp {
+                    Ok(response) => response,
+                    Err(error) => {
+                        api_error_json(stream, 502, &error);
+                        return;
+                    }
                 };
                 if is_stream {
                     let _ = write!(
@@ -1400,13 +1493,24 @@ fn handle_messages(
             return;
         }
         match messages::post_nonstream(cfg, transformed) {
-            Ok(resp) => write_response(
-                stream,
-                resp.status,
-                status_reason(resp.status),
-                &resp.content_type,
-                &resp.body,
-            ),
+            Ok(mut resp) => {
+                if metadata.target_model.to_ascii_lowercase().contains("kimi") {
+                    resp.body = match anthropic_compat::filter_kimi_nonstream_response(&resp.body) {
+                        Ok(body) => body,
+                        Err(error) => {
+                            api_error_json(stream, 502, &error);
+                            return;
+                        }
+                    };
+                }
+                write_response(
+                    stream,
+                    resp.status,
+                    status_reason(resp.status),
+                    &resp.content_type,
+                    &resp.body,
+                )
+            }
             Err(e) => api_error_json(stream, e.status, &e.detail),
         }
         return;
@@ -2112,11 +2216,11 @@ mod tests {
         write_bridge_response_once, write_bridge_status, BridgeProgress,
     };
     use super::{
-        collect_codex_nonstream, forward_stream_body, handle_codex_messages_with_catalog,
-        handle_codex_messages_with_secrets, handle_post, map_codex_auth_error, pump_codex_stream,
-        stream_error_event, write_codex_models_response, CodexComponents, CodexNonstreamError,
-        CodexPumpError, KimiServerToolFilter, RequestHead, RequestNonceGenerator, StreamFilter,
-        StreamTermination,
+        apply_dsml_nonstream, collect_codex_nonstream, dsml_stream_filter, forward_stream_body,
+        handle_codex_messages_with_catalog, handle_codex_messages_with_secrets, handle_post,
+        map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream, stream_error_event,
+        write_codex_models_response, CodexComponents, CodexNonstreamError, CodexPumpError,
+        KimiServerToolFilter, RequestHead, RequestNonceGenerator, StreamFilter, StreamTermination,
     };
     use crate::codex_auth::{InferenceSecrets, OAuthErrorCode, OAuthFlowError};
     use crate::codex_models::CodexModelCatalog;
@@ -2572,6 +2676,287 @@ mod tests {
     }
 
     #[test]
+    fn codex_role_alias_uses_first_standard_model_and_preserves_forced_tool() {
+        let models = vec![
+            json!({
+                "slug": "gpt-lite-first",
+                "display_name": "Lite",
+                "visibility": "list",
+                "priority": 0,
+                "use_responses_lite": true,
+            }),
+            json!({
+                "slug": "gpt-standard",
+                "display_name": "Standard",
+                "visibility": "list",
+                "priority": 1,
+                "supports_parallel_tool_calls": true,
+            }),
+        ];
+        let (catalog, models_server, root) = mock_codex_model_catalog_with_models(models);
+        let (transport, posts, requests, upstream) =
+            mock_codex_transport(http_sse_response(&complete_codex_sse()));
+        let mut request = codex_request(false);
+        request["model"] = json!("claude-haiku-4-5-20251001");
+        request["tools"] = json!([{
+            "name": "create_work_item",
+            "strict": true,
+            "input_schema": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"],
+                "additionalProperties": false,
+            },
+        }]);
+        request["tool_choice"] = json!({"type": "tool", "name": "create_work_item"});
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_catalog(
+                stream,
+                &request,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &transport,
+                &catalog,
+                |_, _| panic!("successful request must not reject auth"),
+            )
+        });
+        models_server.join().unwrap();
+        upstream.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        let upstream_body: Value =
+            serde_json::from_slice(http_body(&requests.lock().unwrap()[0])).unwrap();
+        assert_eq!(upstream_body["model"], "gpt-standard");
+        assert_eq!(
+            upstream_body["tool_choice"],
+            json!({"type": "function", "name": "create_work_item"})
+        );
+        assert_eq!(upstream_body["tools"][0]["strict"], true);
+
+        let (transport, posts, requests, upstream) =
+            mock_codex_transport(http_sse_response(&complete_codex_sse()));
+        let mut classifier = codex_request(false);
+        classifier["model"] = json!("claude-sonnet-4-6");
+        classifier["tools"] = json!([{
+            "name": "classify_memory",
+            "strict": true,
+            "input_schema": {
+                "type": "object",
+                "properties": {"risk": {"type": "string"}},
+                "required": ["risk"],
+                "additionalProperties": false,
+            },
+        }]);
+        classifier["tool_choice"] = json!({"type": "tool", "name": "classify_memory"});
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_catalog(
+                stream,
+                &classifier,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &transport,
+                &catalog,
+                |_, _| panic!("successful classifier must not reject auth"),
+            )
+        });
+        upstream.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        let classifier_body: Value =
+            serde_json::from_slice(http_body(&requests.lock().unwrap()[0])).unwrap();
+        assert_eq!(classifier_body["model"], "gpt-standard");
+        assert_eq!(
+            classifier_body["tool_choice"],
+            json!({"type": "function", "name": "classify_memory"})
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_role_without_standard_model_and_lite_forced_tool_fail_before_post() {
+        let models = vec![json!({
+            "slug": "gpt-lite",
+            "display_name": "Lite",
+            "visibility": "list",
+            "priority": 0,
+            "use_responses_lite": true,
+        })];
+        let (catalog, models_server, root) = mock_codex_model_catalog_with_models(models);
+        let unreachable = CodexTransport::for_test("http://127.0.0.1:1/responses".into()).unwrap();
+
+        let mut role_request = codex_request(false);
+        role_request["model"] = json!("claude-sonnet-4-6");
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_catalog(
+                stream,
+                &role_request,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &unreachable,
+                &catalog,
+                |_, _| panic!("unavailable model must not reject auth"),
+            )
+        });
+        models_server.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable"));
+        assert!(String::from_utf8_lossy(&response).contains("codex_model_unavailable"));
+
+        let mut exact_request = codex_request(false);
+        exact_request["model"] = json!("claude-csswitch-codex-gpt-lite");
+        exact_request["tools"] = json!([{
+            "name": "classify_memory",
+            "input_schema": {"type": "object"},
+        }]);
+        exact_request["tool_choice"] = json!({"type": "tool", "name": "classify_memory"});
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_catalog(
+                stream,
+                &exact_request,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &unreachable,
+                &catalog,
+                |_, _| panic!("invalid Lite request must not reject auth"),
+            )
+        });
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+        assert!(String::from_utf8_lossy(&response)
+            .contains("tool choice is unsupported for Responses Lite"));
+
+        for tool_choice in [json!({"type": "none"}), json!({"type": "required"})] {
+            let mut empty_tools_request = codex_request(false);
+            empty_tools_request["model"] = json!("claude-csswitch-codex-gpt-lite");
+            empty_tools_request["tools"] = json!([]);
+            empty_tools_request["tool_choice"] = tool_choice;
+            let response = capture_tcp_response(|stream| {
+                handle_codex_messages_with_catalog(
+                    stream,
+                    &empty_tools_request,
+                    false,
+                    InferenceSecrets::for_test("access", "account"),
+                    &unreachable,
+                    &catalog,
+                    |_, _| panic!("invalid Lite request must not reject auth"),
+                )
+            });
+            assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+            assert!(String::from_utf8_lossy(&response)
+                .contains("tool choice is unsupported for Responses Lite"));
+        }
+
+        let mut incompatible_schema_request = codex_request(false);
+        incompatible_schema_request["model"] = json!("claude-csswitch-codex-gpt-lite");
+        incompatible_schema_request["output_config"] = json!({
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["title"],
+                    "additionalProperties": false,
+                },
+            },
+        });
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_catalog(
+                stream,
+                &incompatible_schema_request,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &unreachable,
+                &catalog,
+                |_, _| panic!("incompatible schema must not reject auth"),
+            )
+        });
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+        assert!(String::from_utf8_lossy(&response)
+            .contains("schema is incompatible with OpenAI strict mode"));
+
+        let mut malformed_ref_request = codex_request(false);
+        malformed_ref_request["model"] = json!("claude-csswitch-codex-gpt-lite");
+        malformed_ref_request["output_config"] = json!({
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"value": {"$ref": "#/$defs"}},
+                    "$defs": {"item": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": false,
+                },
+            },
+        });
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_catalog(
+                stream,
+                &malformed_ref_request,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &unreachable,
+                &catalog,
+                |_, _| panic!("malformed ref schema must not reject auth"),
+            )
+        });
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+        assert!(String::from_utf8_lossy(&response)
+            .contains("schema is incompatible with OpenAI strict mode"));
+
+        let mut level_eleven = json!({"type": "string"});
+        for _ in 0..9 {
+            level_eleven = json!({"type": "array", "items": level_eleven});
+        }
+        let mut deep_schema_request = codex_request(false);
+        deep_schema_request["model"] = json!("claude-csswitch-codex-gpt-lite");
+        deep_schema_request["output_config"] = json!({
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {"value": level_eleven},
+                    "required": ["value"],
+                    "additionalProperties": false,
+                },
+            },
+        });
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_catalog(
+                stream,
+                &deep_schema_request,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &unreachable,
+                &catalog,
+                |_, _| panic!("level-eleven schema must not reject auth"),
+            )
+        });
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+        assert!(String::from_utf8_lossy(&response)
+            .contains("schema is incompatible with OpenAI strict mode"));
+
+        let mut unsupported_effort_request = codex_request(false);
+        unsupported_effort_request["model"] = json!("claude-csswitch-codex-gpt-lite");
+        unsupported_effort_request["output_config"] = json!({"effort": "high"});
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_catalog(
+                stream,
+                &unsupported_effort_request,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &unreachable,
+                &catalog,
+                |_, _| panic!("unsupported effort must not reject auth"),
+            )
+        });
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+        assert!(String::from_utf8_lossy(&response)
+            .contains("output_config.effort is unsupported for Codex"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn codex_models_response_exposes_science_aliases_and_cache_diagnostics() {
         let models = [
             ("gpt-5.6-sol", "GPT-5.6-Sol"),
@@ -2943,6 +3328,7 @@ mod tests {
             upstream_url: DEFAULT_CODEX_UPSTREAM_URL.into(),
             models_url: None,
             relay_thinking: None,
+            provider_contract: None,
             intent: crate::config::GatewayIntent::Formal,
             static_model_resolver: None,
             shim_mode: "off".into(),
@@ -3180,6 +3566,8 @@ mod tests {
 
     fn kimi_complete_then_partial() -> Vec<u8> {
         concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"}}\n\n",
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\n",
@@ -3189,9 +3577,40 @@ mod tests {
         .to_vec()
     }
 
+    fn complete_kimi_envelope() -> Vec<u8> {
+        concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"opaque\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"name\":\"web_search\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
     fn dsml_complete_start_then_partial_tool_delta() -> Vec<u8> {
         let start = format!(
-            "event: content_block_start\ndata: {}\n\n",
+            "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n",
+            json!({
+                "type": "message_start",
+                "message": {"id": "m", "type": "message"},
+            }),
             json!({
                 "type": "content_block_start",
                 "index": 0,
@@ -3234,7 +3653,13 @@ mod tests {
 
     #[test]
     fn kimi_read_error_is_terminal_and_does_not_finalize_buffer() {
-        let first = b"event: content_block_start\ndata: {\"type\":\"content_block_start\"}";
+        let first = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\"}"
+        )
+        .as_bytes();
         let mut upstream = FailingReader;
         let mut filter = Some(StreamFilter::Kimi(KimiServerToolFilter::new()));
         let mut output = Vec::new();
@@ -3245,14 +3670,196 @@ mod tests {
         });
 
         assert_eq!(termination, StreamTermination::UpstreamReadError);
-        assert_eq!(output, stream_error_event("mock read failure"));
+        assert!(String::from_utf8_lossy(&output).contains("event: message_start"));
+        assert!(output.ends_with(&stream_error_event("upstream stream read failed")));
         let StreamFilter::Kimi(filter) = filter.as_mut().unwrap() else {
             panic!("expected Kimi filter");
         };
-        assert!(
-            !filter.finalize().is_empty(),
-            "buffer must remain unflushed"
+        assert!(filter.finalize().is_err(), "buffer must remain unflushed");
+    }
+
+    #[test]
+    fn kimi_complete_envelope_preserves_thinking_usage_terminal_and_compacts_indexes() {
+        let first = complete_kimi_envelope();
+        let mut upstream = Cursor::new(Vec::<u8>::new());
+        let mut filter = Some(StreamFilter::Kimi(KimiServerToolFilter::new()));
+        let mut output = Vec::new();
+        let termination = forward_stream_body(&mut upstream, &first, &mut filter, |chunk| {
+            output.extend_from_slice(chunk);
+            Ok(())
+        });
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(termination, StreamTermination::NormalEof);
+        assert!(text.contains("\"thinking\":\"plan\""));
+        assert!(text.contains("\"signature\":\"opaque\""));
+        assert!(!text.contains("server_tool_use"));
+        assert!(text.contains("\"index\":1"));
+        assert!(text.contains("\"stop_reason\":\"end_turn\""));
+        assert!(text.contains("\"output_tokens\":9"));
+        assert_eq!(text.matches("event: message_stop").count(), 1);
+        assert!(!text.contains("event: error"));
+    }
+
+    #[test]
+    fn kimi_invalid_thinking_emits_one_terminal_error_without_message_stop() {
+        let first = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"secret\",\"signature\":\"\"}}\n\n",
         );
+        let tail = concat!(
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut upstream = Cursor::new(tail.as_bytes());
+        let mut filter = Some(StreamFilter::Kimi(KimiServerToolFilter::new()));
+        let mut output = Vec::new();
+        let termination =
+            forward_stream_body(&mut upstream, first.as_bytes(), &mut filter, |chunk| {
+                output.extend_from_slice(chunk);
+                Ok(())
+            });
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(termination, StreamTermination::ProtocolError);
+        assert!(text.contains("event: message_start"));
+        assert_eq!(text.matches("event: error").count(), 1);
+        assert!(!text.contains("message_stop"));
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn deepseek_dsml_modes_never_select_or_apply_kimi_rules() {
+        let mut tools = Map::new();
+        tools.insert("lookup".to_string(), json!({"type": "object"}));
+        let base = GatewayConfig {
+            provider: "deepseek".into(),
+            port: 0,
+            auth_secret: Some("test-secret".into()),
+            api_key: Some("test-key".into()),
+            upstream_url: "https://api.deepseek.com/anthropic/v1/messages".into(),
+            models_url: None,
+            relay_thinking: None,
+            provider_contract: None,
+            intent: crate::config::GatewayIntent::Formal,
+            static_model_resolver: None,
+            shim_mode: "off".into(),
+            codex_state_root: None,
+            codex_contract: None,
+            launch_id: "test".into(),
+            skill_data_dir: None,
+            skill_bridge_dir: None,
+            skill_bridge_token: None,
+            science_host_context: None,
+        };
+        assert!(dsml_stream_filter(&base, &tools, Some("nonce")).is_none());
+        let mut detect = base.clone();
+        detect.shim_mode = "detect".into();
+        assert!(matches!(
+            dsml_stream_filter(&detect, &tools, Some("nonce")),
+            Some(StreamFilter::DsmlDetect(_))
+        ));
+        let mut rewrite = base.clone();
+        rewrite.shim_mode = "rewrite".into();
+        assert!(matches!(
+            dsml_stream_filter(&rewrite, &tools, Some("nonce")),
+            Some(StreamFilter::DsmlRewrite(_))
+        ));
+        let body =
+            br#"{"type":"message","content":[{"type":"thinking","thinking":"","signature":""}]}"#
+                .to_vec();
+        assert_eq!(
+            apply_dsml_nonstream(&base, &tools, body.clone(), Some("nonce")),
+            body
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_history_survives_loopback_token_rotation_but_not_profile_changes() {
+        let base = GatewayConfig {
+            provider: "openai-custom".into(),
+            port: 0,
+            auth_secret: Some("launch-token-a".into()),
+            api_key: Some("stable-provider-key".into()),
+            upstream_url: "https://example.invalid/v1/chat/completions".into(),
+            models_url: None,
+            relay_thinking: None,
+            provider_contract: None,
+            intent: crate::config::GatewayIntent::Formal,
+            static_model_resolver: None,
+            shim_mode: "off".into(),
+            codex_state_root: None,
+            codex_contract: None,
+            launch_id: "launch-a".into(),
+            skill_data_dir: None,
+            skill_bridge_dir: None,
+            skill_bridge_token: None,
+            science_host_context: None,
+        };
+        let first_signer = openai_chat_reasoning_signer(&base).unwrap();
+        let first = crate::openai_chat::openai_to_anthropic(
+            &json!({
+                "id": "chatcmpl_restart",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": "stable across restart",
+                        "tool_calls": [{
+                            "id": "call_restart",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+            }),
+            "claude-opus-4-8",
+            "kimi-k3",
+            &first_signer,
+        )
+        .unwrap();
+        let next_request = json!({
+            "messages": [
+                {"role": "assistant", "content": first["content"]},
+                {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "call_restart", "content": "ok",
+                }]},
+            ],
+        });
+
+        let mut restarted = base.clone();
+        restarted.auth_secret = Some("launch-token-b".into());
+        restarted.launch_id = "launch-b".into();
+        let restarted_signer = openai_chat_reasoning_signer(&restarted).unwrap();
+        assert!(crate::openai_chat::anthropic_to_openai_custom(
+            &next_request,
+            "kimi-k3",
+            &restarted_signer,
+        )
+        .is_ok());
+
+        let mut changed_key = restarted.clone();
+        changed_key.api_key = Some("different-provider-key".into());
+        assert!(crate::openai_chat::anthropic_to_openai_custom(
+            &next_request,
+            "kimi-k3",
+            &openai_chat_reasoning_signer(&changed_key).unwrap(),
+        )
+        .is_err());
+        let mut changed_endpoint = restarted;
+        changed_endpoint.upstream_url = "https://other.invalid/v1/chat/completions".into();
+        assert!(crate::openai_chat::anthropic_to_openai_custom(
+            &next_request,
+            "kimi-k3",
+            &openai_chat_reasoning_signer(&changed_endpoint).unwrap(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -3267,7 +3874,7 @@ mod tests {
             Ok(())
         });
 
-        let error = stream_error_event("mock read failure");
+        let error = stream_error_event("upstream stream read failed");
         assert_eq!(termination, StreamTermination::UpstreamReadError);
         assert!(output.ends_with(&error));
         assert!(!String::from_utf8_lossy(&output).contains("tool_use"));
@@ -3282,7 +3889,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_eof_finalizes_kimi_and_dsml_buffers() {
+    fn incomplete_clean_eof_finalizes_filters_but_fails_protocol() {
         let kimi_first = kimi_complete_then_partial();
         let mut kimi_upstream = Cursor::new(Vec::<u8>::new());
         let mut kimi_filter = Some(StreamFilter::Kimi(KimiServerToolFilter::new()));
@@ -3292,8 +3899,10 @@ mod tests {
                 kimi_output.extend_from_slice(chunk);
                 Ok(())
             });
-        assert_eq!(kimi_termination, StreamTermination::NormalEof);
-        assert!(String::from_utf8_lossy(&kimi_output).contains("buffered"));
+        assert_eq!(kimi_termination, StreamTermination::ProtocolError);
+        assert!(String::from_utf8_lossy(&kimi_output).contains("message_start"));
+        assert!(String::from_utf8_lossy(&kimi_output).contains("event: error"));
+        assert!(!String::from_utf8_lossy(&kimi_output).contains("message_stop"));
 
         let dsml_first = dsml_complete_start_then_partial_tool_delta();
         let mut dsml_upstream = Cursor::new(Vec::<u8>::new());
@@ -3304,9 +3913,10 @@ mod tests {
                 dsml_output.extend_from_slice(chunk);
                 Ok(())
             });
-        assert_eq!(dsml_termination, StreamTermination::NormalEof);
+        assert_eq!(dsml_termination, StreamTermination::ProtocolError);
         assert!(String::from_utf8_lossy(&dsml_output).contains("tool_use"));
-        assert!(!String::from_utf8_lossy(&dsml_output).contains("event: error"));
+        assert!(String::from_utf8_lossy(&dsml_output).contains("event: error"));
+        assert!(!String::from_utf8_lossy(&dsml_output).contains("message_stop"));
     }
 
     #[test]
@@ -3328,7 +3938,7 @@ mod tests {
             panic!("expected Kimi filter");
         };
         assert!(
-            String::from_utf8_lossy(&filter.finalize()).contains("buffered"),
+            filter.finalize().is_err(),
             "buffer must remain unflushed after client write failure"
         );
     }

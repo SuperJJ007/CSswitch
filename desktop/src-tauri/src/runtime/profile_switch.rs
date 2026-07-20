@@ -48,6 +48,8 @@ pub(crate) fn scratch_validate_candidate(
         &backend,
         &scratch::ScratchTarget {
             provider: &scratch_plan.provider,
+            contract_id: &scratch_plan.contract_id,
+            contract_digest: &scratch_plan.contract_digest,
             key_env,
             base_url: &scratch_plan.endpoint,
             key,
@@ -104,15 +106,23 @@ fn current_gateway_journal_identity(
         Some(&st.secret),
         crate::runtime::operation::LOCAL_HEALTH_TIMEOUT_MS,
     )?;
+    let formal = crate::runtime::provider::resolve_launch_plan(cfg.active_profile()?)
+        .ok()?
+        .formal();
     (health.gateway == "rust"
         && health.intent == "formal"
         && health.provider == st.provider
+        && health.provider == formal.adapter
         && health.shim == st.shim_mode
-        && health.launch_id == st.launch_id)
+        && health.launch_id == st.launch_id
+        && health.provider_contract_id == formal.contract_id
+        && health.provider_contract_digest == formal.contract_digest)
         .then_some(config::GatewayRuntimeJournalIdentity {
             provider: health.provider,
             shim: health.shim,
             launch_id: health.launch_id,
+            provider_contract_id: health.provider_contract_id,
+            provider_contract_digest: health.provider_contract_digest,
             catalog_fp: health.catalog_fp,
         })
 }
@@ -219,6 +229,8 @@ pub(crate) fn set_active_profile_txn(
             &backend,
             &scratch::ScratchTarget {
                 provider: &scratch_plan.provider,
+                contract_id: &scratch_plan.contract_id,
+                contract_digest: &scratch_plan.contract_digest,
                 key_env,
                 base_url: &scratch_plan.endpoint,
                 key,
@@ -511,6 +523,8 @@ mod tests {
             provider: "qwen".into(),
             shim: "off".into(),
             launch_id: "launch-old".into(),
+            provider_contract_id: "qwen-native".into(),
+            provider_contract_digest: "contract-digest-old".into(),
             catalog_fp: "gateway-catalog-old".into(),
         };
         apply_candidate_transaction(

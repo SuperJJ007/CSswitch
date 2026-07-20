@@ -37,7 +37,7 @@
     {
       "id": "siliconflow",
       "default_upstream_model": "deepseek-ai/DeepSeek-V4-Pro",
-      "role_bindings": {"sonnet": "deepseek-ai/DeepSeek-V4-Flash", "opus": "deepseek-ai/DeepSeek-V4-Pro", "haiku": "deepseek-ai/DeepSeek-V4-Flash", "fable": "deepseek-ai/DeepSeek-V4-Pro"},
+      "role_bindings": {"sonnet": "deepseek-ai/DeepSeek-V4-Pro", "opus": "deepseek-ai/DeepSeek-V4-Pro", "haiku": "deepseek-ai/DeepSeek-V4-Flash", "fable": "deepseek-ai/DeepSeek-V4-Pro"},
       "models": [
         {"upstream_model": "deepseek-ai/DeepSeek-V4-Pro", "display_name": "DeepSeek V4 Pro", "supports_tools": true},
         {"upstream_model": "deepseek-ai/DeepSeek-V4-Flash", "display_name": "DeepSeek V4 Flash", "supports_tools": true},
@@ -47,9 +47,10 @@
     },
     {
       "id": "kimi",
-      "default_upstream_model": "kimi-k2.7-code",
-      "role_bindings": {"sonnet": "kimi-k2.7-code", "opus": "kimi-k2.7-code", "haiku": "kimi-k2.7-code-highspeed", "fable": "kimi-k2.7-code"},
+      "default_upstream_model": "kimi-k3",
+      "role_bindings": {"sonnet": "kimi-k3", "opus": "kimi-k3", "haiku": "kimi-k3", "fable": "kimi-k3"},
       "models": [
+        {"upstream_model": "kimi-k3", "display_name": "Kimi K3", "supports_tools": true},
         {"upstream_model": "kimi-k2.7-code", "display_name": "Kimi K2.7 Code", "supports_tools": null},
         {"upstream_model": "kimi-k2.7-code-highspeed", "display_name": "Kimi K2.7 Code Highspeed", "supports_tools": null},
         {"upstream_model": "kimi-k2.6", "display_name": "Kimi K2.6", "supports_tools": null}
@@ -58,7 +59,7 @@
     {
       "id": "minimax",
       "default_upstream_model": "MiniMax-M3",
-      "role_bindings": {"sonnet": "MiniMax-M2.7", "opus": "MiniMax-M3", "haiku": "MiniMax-M2.7-highspeed", "fable": "MiniMax-M3"},
+      "role_bindings": {"sonnet": "MiniMax-M3", "opus": "MiniMax-M3", "haiku": "MiniMax-M2.7-highspeed", "fable": "MiniMax-M3"},
       "models": [
         {"upstream_model": "MiniMax-M3", "display_name": "MiniMax M3", "supports_tools": null},
         {"upstream_model": "MiniMax-M2.7", "display_name": "MiniMax M2.7", "supports_tools": null},

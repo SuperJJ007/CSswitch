@@ -499,7 +499,7 @@ fn set_active_profile_inner_cmd(
                 .profile_by_id(&id)
                 .ok_or_else(|| format!("找不到 profile：{id}"))?;
             config::require_template_enabled(&cfg, &profile.template_id)?;
-            set_active_profile_txn(
+            let result = set_active_profile_txn(
                 &app,
                 &state,
                 lifecycle.as_ref(),
@@ -507,7 +507,13 @@ fn set_active_profile_inner_cmd(
                 skip_verify,
                 None,
                 prepared.as_ref().map(|prepared| prepared.proof()),
-            )
+            )?;
+            if result.get("committed").and_then(serde_json::Value::as_bool) == Some(true) {
+                let mut app_state = crate::lock(&state);
+                app_state.history_recovery = None;
+                app_state.boot_attention = None;
+            }
+            Ok(result)
         })
         .map_err(crate::commands::codex::RuntimeCommandError::from)
 }

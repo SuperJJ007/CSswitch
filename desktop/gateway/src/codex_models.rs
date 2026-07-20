@@ -263,6 +263,12 @@ pub(crate) struct ResolvedCodexModel<'a> {
     model: &'a CachedModel,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CodexModelResolutionError {
+    UnknownSelector,
+    NoCompatibleStandardResponsesModel,
+}
+
 impl ResolvedCodexModel<'_> {
     pub(crate) fn raw_id(&self) -> &str {
         &self.model.id
@@ -300,6 +306,30 @@ impl CodexModelsSnapshot {
             .iter()
             .find(|candidate| candidate.id == raw_id)
             .map(|candidate| ResolvedCodexModel { model: candidate })
+    }
+
+    pub(crate) fn resolve_request_model<'a>(
+        &'a self,
+        requested: &str,
+    ) -> Result<ResolvedCodexModel<'a>, CodexModelResolutionError> {
+        if requested.starts_with(SCIENCE_MODEL_PREFIX) {
+            return self
+                .resolve_science_model(requested)
+                .ok_or(CodexModelResolutionError::UnknownSelector);
+        }
+        if crate::static_profile::official_role_alias(requested).is_none() {
+            return Err(CodexModelResolutionError::UnknownSelector);
+        }
+        self.models
+            .iter()
+            .filter(|candidate| !candidate.use_responses_lite)
+            .min_by(|left, right| {
+                left.priority
+                    .cmp(&right.priority)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .map(|model| ResolvedCodexModel { model })
+            .ok_or(CodexModelResolutionError::NoCompatibleStandardResponsesModel)
     }
 
     pub(crate) fn source(&self) -> CatalogSource {
@@ -1347,7 +1377,7 @@ mod tests {
 
     use super::{
         parse_official_models, science_model_alias, CatalogSource, CodexModelCatalog,
-        ModelsCacheFile, CACHE_EPOCH_FILE, CACHE_FILE,
+        CodexModelResolutionError, ModelsCacheFile, CACHE_EPOCH_FILE, CACHE_FILE,
     };
     use crate::codex_auth::InferenceSecrets;
 
@@ -1411,7 +1441,6 @@ mod tests {
                     "slug": id,
                     "display_name": format!("Display {id}"),
                     "visibility": "list",
-                    "supported_in_api": true,
                     "priority": priority,
                     "default_reasoning_level": "medium",
                     "supported_reasoning_levels": [{"effort": "medium", "description": "default"}],
@@ -1471,6 +1500,7 @@ mod tests {
                     "slug": "gpt-test",
                     "display_name": "GPT Test",
                     "visibility": "list",
+                    "supported_in_api": true,
                     "priority": 1
                 });
                 entry
@@ -1724,6 +1754,32 @@ mod tests {
         assert!(snapshot
             .resolve_science_model("claude-csswitch-codex-hidden")
             .is_none());
+        for role in [
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-6",
+            "claude-opus-4-8-20260501",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            assert_eq!(
+                snapshot.resolve_request_model(role).unwrap().raw_id(),
+                "chatgpt-only"
+            );
+        }
+        assert!(matches!(
+            snapshot.resolve_request_model("gpt-a"),
+            Err(CodexModelResolutionError::UnknownSelector)
+        ));
+        for malformed in [
+            "claude-sonnet",
+            "claude-sonnet-latest",
+            "claude-sonnet-4-6-notadate",
+            "claude-unknown-4-6",
+        ] {
+            assert!(matches!(
+                snapshot.resolve_request_model(malformed),
+                Err(CodexModelResolutionError::UnknownSelector)
+            ));
+        }
         assert_eq!(count.load(Ordering::SeqCst), 1);
         let request = String::from_utf8_lossy(&requests.lock().unwrap()[0]).to_ascii_lowercase();
         assert!(request.contains("authorization: bearer access-secret"));
@@ -1875,6 +1931,10 @@ mod tests {
         assert!(snapshot
             .resolve_science_model("claude-csswitch-codex-gpt-5.6-terra")
             .is_some_and(|model| model.supports_reasoning_summary()));
+        assert!(matches!(
+            snapshot.resolve_request_model("claude-sonnet-4-6"),
+            Err(CodexModelResolutionError::NoCompatibleStandardResponsesModel)
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
