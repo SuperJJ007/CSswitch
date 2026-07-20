@@ -143,3 +143,9 @@ bash test/run_all.sh
 ```
 
 [更新日志](./CHANGELOG.md) · [开发与测试](./docs/operations/development.md) · [发布证据](./docs/evidence/releases/README.md)
+
+## 社区
+
+<p align="center">
+  <img src="docs/assets/wechat-group.jpg" alt="CSSwitch 社区微信群二维码" width="420">
+</p>
