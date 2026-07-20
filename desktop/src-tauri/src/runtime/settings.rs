@@ -1,4 +1,8 @@
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+const SSH_STUB_MARKER: &str = "# CSSwitch managed system SSH config bridge v1";
 
 fn system_ssh_config_path_for_home(home: &Path) -> Result<PathBuf, String> {
     if !home.is_absolute() {
@@ -18,6 +22,82 @@ pub(crate) fn system_ssh_config_path() -> Result<PathBuf, String> {
     system_ssh_config_path_for_home(&home)
 }
 
+/// Revoke only the narrow config stub created by CSSwitch. Foreign files,
+/// symlinks and special files fail closed instead of being deleted or exposed
+/// to a later isolated Science launch.
+pub(crate) fn remove_managed_sandbox_ssh_stub(sandbox_home: &Path) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("无法确认系统 HOME，不能撤销系统 SSH 配置。")?;
+    if !home.is_absolute() {
+        return Err("无法确认系统 HOME，不能撤销系统 SSH 配置。".into());
+    }
+    remove_managed_sandbox_ssh_stub_for_config(sandbox_home, &home.join(".ssh/config"))
+}
+
+fn remove_managed_sandbox_ssh_stub_for_config(
+    sandbox_home: &Path,
+    expected_system_config: &Path,
+) -> Result<(), String> {
+    let mut ancestor = Some(sandbox_home);
+    for _ in 0..3 {
+        let Some(path) = ancestor else { break };
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("隔离 SSH 配置路径包含符号链接，拒绝撤销授权".into())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("检查隔离 SSH 配置路径失败：{error}")),
+        }
+        ancestor = path.parent();
+    }
+    let ssh_dir = sandbox_home.join(".ssh");
+    let dir_metadata = match std::fs::symlink_metadata(&ssh_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("检查隔离 SSH 配置目录失败：{error}")),
+    };
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let uid = unsafe { libc::geteuid() };
+    if !dir_metadata.file_type().is_dir() || dir_metadata.uid() != uid {
+        return Err("隔离 SSH 配置目录不安全，拒绝撤销授权".into());
+    }
+    let config = ssh_dir.join("config");
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&config)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let _ = std::fs::remove_dir(&ssh_dir);
+            return Ok(());
+        }
+        Err(error) => return Err(format!("检查隔离 SSH config 失败：{error}")),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("检查隔离 SSH config 失败：{error}"))?;
+    if !metadata.is_file() || metadata.uid() != uid || metadata.len() > 4096 {
+        return Err("隔离 SSH config 不是 CSSwitch 管理的安全普通文件".into());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| format!("读取隔离 SSH config 失败：{error}"))?;
+    let escaped = expected_system_config
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let expected = format!("{SSH_STUB_MARKER}\nInclude \"{escaped}\"\n");
+    if text != expected {
+        return Err("隔离 SSH config 不是 CSSwitch 管理的入口，拒绝删除".into());
+    }
+    std::fs::remove_file(&config).map_err(|error| format!("撤销隔离 SSH config 失败：{error}"))?;
+    let _ = std::fs::remove_dir(&ssh_dir);
+    Ok(())
+}
+
 pub(crate) fn validate_runtime_ports(proxy_port: u16, sandbox_port: u16) -> Result<(), String> {
     crate::config::validate_runtime_ports(proxy_port, sandbox_port)?;
     let preview_port = sandbox_port
@@ -34,7 +114,12 @@ pub(crate) fn validate_runtime_ports(proxy_port: u16, sandbox_port: u16) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{system_ssh_config_path_for_home, validate_runtime_ports};
+    use std::os::unix::fs::FileTypeExt;
+
+    use super::{
+        remove_managed_sandbox_ssh_stub_for_config, system_ssh_config_path_for_home,
+        validate_runtime_ports, SSH_STUB_MARKER,
+    };
 
     #[test]
     fn validate_runtime_ports_rejects_reserved_real_science_port() {
@@ -77,5 +162,73 @@ mod tests {
             home.join(".ssh/config")
         );
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn managed_sandbox_ssh_stub_is_revoked_without_touching_foreign_files() {
+        let home = std::env::temp_dir().join(format!(
+            "csswitch-system-ssh-stub-test-{}",
+            crate::config::new_id()
+        ));
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let config = home.join(".ssh/config");
+        let expected_system_config = home.join("real-home/.ssh/config");
+        std::fs::write(
+            &config,
+            format!(
+                "{SSH_STUB_MARKER}\nInclude \"{}\"\n",
+                expected_system_config.display()
+            ),
+        )
+        .unwrap();
+        remove_managed_sandbox_ssh_stub_for_config(&home, &expected_system_config).unwrap();
+        assert!(!config.exists());
+
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(
+            &config,
+            format!("{SSH_STUB_MARKER}\nInclude \"/different/config\"\n\nHost foreign\n"),
+        )
+        .unwrap();
+        assert!(
+            remove_managed_sandbox_ssh_stub_for_config(&home, &expected_system_config).is_err()
+        );
+        assert!(std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("Host foreign"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn sandbox_ssh_revocation_rejects_fifo_and_symlinked_home_without_blocking() {
+        let base = std::env::temp_dir().join(format!(
+            "csswitch-system-ssh-special-test-{}",
+            crate::config::new_id()
+        ));
+        let home = base.join("home");
+        let expected = base.join("real/.ssh/config");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let fifo = home.join(".ssh/config");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid NUL-terminated path and mode is conventional.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(remove_managed_sandbox_ssh_stub_for_config(&home, &expected).is_err());
+        assert!(std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join(".ssh")).unwrap();
+        std::fs::write(
+            outside.join(".ssh/config"),
+            format!("{SSH_STUB_MARKER}\nInclude \"{}\"\n", expected.display()),
+        )
+        .unwrap();
+        let linked_home = base.join("linked-home");
+        std::os::unix::fs::symlink(&outside, &linked_home).unwrap();
+        assert!(remove_managed_sandbox_ssh_stub_for_config(&linked_home, &expected).is_err());
+        assert!(outside.join(".ssh/config").is_file());
+        let _ = std::fs::remove_dir_all(base);
     }
 }

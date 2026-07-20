@@ -11,6 +11,28 @@ const MAX_SELECTOR_BYTES: usize = 160;
 const MAX_DISPLAY_NAME_BYTES: usize = 256;
 const MAX_MODEL_TEXT_BYTES: usize = 512;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningRoundTrip {
+    #[default]
+    None,
+    Native,
+    CsswitchOpaque,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteCapabilities {
+    #[serde(default)]
+    pub reasoning_round_trip: ReasoningRoundTrip,
+    #[serde(default)]
+    pub forced_tool_choice: Option<bool>,
+    #[serde(default)]
+    pub structured_output: Option<bool>,
+    #[serde(default)]
+    pub vision: Option<bool>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ModelRoute {
     pub selector_id: String,
@@ -18,6 +40,8 @@ pub struct ModelRoute {
     pub upstream_model: String,
     #[serde(default)]
     pub supports_tools: Option<bool>,
+    #[serde(default)]
+    pub capabilities: RouteCapabilities,
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -57,6 +81,8 @@ struct PresetModel {
     upstream_model: String,
     display_name: String,
     supports_tools: Option<bool>,
+    #[serde(default)]
+    capabilities: RouteCapabilities,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -120,6 +146,12 @@ fn validate_presets(catalog: &ModelPresetCatalog) -> Result<(), String> {
             || !models.contains(preset.default_upstream_model.as_str())
         {
             return Err(format!("model preset 默认项或重复项无效：{}", preset.id));
+        }
+        if preset.default_upstream_model != preset.role_bindings.sonnet {
+            return Err(format!(
+                "model preset 默认项必须与均衡/Sonnet 一致：{}",
+                preset.id
+            ));
         }
         for model in &preset.models {
             validate_text("upstream_model", &model.upstream_model)?;
@@ -223,6 +255,7 @@ pub(crate) fn single_route_catalog(
         display_name: display_name.to_string(),
         upstream_model: upstream_model.to_string(),
         supports_tools,
+        capabilities: RouteCapabilities::default(),
         extra: BTreeMap::new(),
     };
     Ok((
@@ -256,6 +289,7 @@ pub(crate) fn preset_catalog(
             display_name: model.display_name.clone(),
             upstream_model: model.upstream_model.clone(),
             supports_tools: model.supports_tools,
+            capabilities: model.capabilities.clone(),
             extra: BTreeMap::new(),
         });
     }
@@ -310,8 +344,11 @@ pub(crate) fn new_profile_catalog(
     let requested = requested_upstream
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    if let Some(requested) = requested {
+        crate::opencode_go_models::validate_model_for_template(template_id, requested)?;
+    }
     if let Some(preset_id) = template.preset_catalog_id {
-        let (mut routes, mut default, bindings) = preset_catalog(preset_id)?;
+        let (mut routes, mut default, mut bindings) = preset_catalog(preset_id)?;
         if let Some(requested) = requested {
             if let Some(index) = routes.iter().position(|route| {
                 route.upstream_model == requested || route.selector_id == requested
@@ -328,6 +365,11 @@ pub(crate) fn new_profile_catalog(
                 routes.insert(0, manual.into_iter().next().expect("single route"));
                 default = manual_default;
             }
+            // The legacy single-model field represents the simplified
+            // default/balanced choice. Canonical catalog edits may still bind
+            // Sonnet independently, but this compatibility entry point must
+            // not display one default while routing Sonnet to another model.
+            bindings.sonnet = default.clone();
         }
         return Ok((routes, default, bindings));
     }
@@ -350,6 +392,9 @@ pub(crate) fn static_resolver_payload(
     bindings: &RoleBindings,
 ) -> Result<String, String> {
     validate_saved_catalog(routes, default_selector, bindings)?;
+    for route in routes {
+        crate::opencode_go_models::validate_model_for_template(template_id, &route.upstream_model)?;
+    }
     let legacy_aliases: Vec<(String, String)> = routes
         .iter()
         .filter(|route| match template_id {
@@ -374,6 +419,7 @@ pub(crate) fn static_resolver_payload(
             "display_name": route.display_name,
             "upstream_model": route.upstream_model,
             "supports_tools": route.supports_tools,
+            "capabilities": route.capabilities,
         })).collect::<Vec<_>>(),
         "role_bindings": {
             "sonnet": bindings.sonnet,
@@ -424,6 +470,25 @@ fn static_catalog_fingerprint(
             Some(false) => 1,
             Some(true) => 2,
         }]);
+        static_fp_text(
+            &mut digest,
+            match route.capabilities.reasoning_round_trip {
+                ReasoningRoundTrip::None => "none",
+                ReasoningRoundTrip::Native => "native",
+                ReasoningRoundTrip::CsswitchOpaque => "csswitch_opaque",
+            },
+        );
+        for capability in [
+            route.capabilities.forced_tool_choice,
+            route.capabilities.structured_output,
+            route.capabilities.vision,
+        ] {
+            digest.update([match capability {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            }]);
+        }
     }
     for role in [
         &bindings.sonnet,
@@ -457,6 +522,7 @@ pub(crate) fn set_profile_default_route(
     if requested.is_empty() {
         return Err("默认模型不能为空".into());
     }
+    crate::opencode_go_models::validate_model_for_template(template_id, requested)?;
     if let Some(route) = routes
         .iter()
         .find(|route| route.selector_id == requested || route.upstream_model == requested)
@@ -484,6 +550,10 @@ pub(crate) fn set_profile_default_route(
             *bindings = added_bindings;
         }
     }
+    // This function is used only by the legacy single-model edit path. Keep
+    // its simplified default/balanced contract aligned; callers that need
+    // independent role bindings use normalize_catalog_edit instead.
+    bindings.sonnet = default_selector.clone();
     validate_saved_catalog(routes, default_selector, bindings)?;
     routes
         .iter()
@@ -502,6 +572,7 @@ pub(crate) fn normalize_catalog_edit(
     let namespace = namespace_for(template_id, api_format);
     for route in &mut routes {
         route.upstream_model = route.upstream_model.trim().to_string();
+        crate::opencode_go_models::validate_model_for_template(template_id, &route.upstream_model)?;
         if route.display_name.trim().is_empty()
             || route.display_name.trim().eq_ignore_ascii_case("default")
         {
@@ -663,9 +734,71 @@ mod tests {
     fn every_preset_builds_a_valid_multi_model_catalog() {
         let catalog = presets().unwrap();
         for preset in &catalog.presets {
+            assert_eq!(
+                preset.default_upstream_model, preset.role_bindings.sonnet,
+                "{} must keep the simplified default/balanced contract",
+                preset.id
+            );
             let (routes, default, bindings) = preset_catalog(&preset.id).unwrap();
             validate_saved_catalog(&routes, &default, &bindings).unwrap();
         }
+        assert_eq!(
+            catalog
+                .presets
+                .iter()
+                .find(|preset| preset.id == "kimi")
+                .unwrap()
+                .default_upstream_model,
+            "kimi-k3"
+        );
+    }
+
+    #[test]
+    fn opencode_catalog_edits_enforce_known_protocols_and_bare_ids() {
+        assert!(new_profile_catalog("opencode-go-openai", "openai_chat", Some("kimi-k3")).is_ok());
+        assert!(
+            new_profile_catalog("opencode-go-openai", "openai_chat", Some("future-model")).is_ok()
+        );
+        assert!(
+            new_profile_catalog("opencode-go-openai", "openai_chat", Some("minimax-m3")).is_err()
+        );
+        assert!(new_profile_catalog(
+            "opencode-go-anthropic",
+            "anthropic",
+            Some("opencode-go/minimax-m3")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_single_model_paths_keep_default_and_sonnet_aligned() {
+        let (mut routes, mut default, mut bindings) = new_profile_catalog(
+            "siliconflow",
+            "anthropic",
+            Some("deepseek-ai/DeepSeek-V4-Flash"),
+        )
+        .unwrap();
+        assert_eq!(bindings.sonnet, default);
+        assert_eq!(
+            routes
+                .iter()
+                .find(|route| route.selector_id == default)
+                .unwrap()
+                .upstream_model,
+            "deepseek-ai/DeepSeek-V4-Flash"
+        );
+        let opus_before = bindings.opus.clone();
+        set_profile_default_route(
+            "siliconflow",
+            "anthropic",
+            &mut routes,
+            &mut default,
+            &mut bindings,
+            "deepseek-ai/DeepSeek-V4-Pro",
+        )
+        .unwrap();
+        assert_eq!(bindings.sonnet, default);
+        assert_eq!(bindings.opus, opus_before);
     }
 
     #[test]
@@ -676,6 +809,7 @@ mod tests {
             display_name: "Second shell".into(),
             upstream_model: routes[0].upstream_model.clone(),
             supports_tools: None,
+            capabilities: RouteCapabilities::default(),
             extra: BTreeMap::new(),
         });
         validate_saved_catalog(&routes, &default, &bindings).unwrap();
@@ -690,6 +824,7 @@ mod tests {
             display_name: "default".into(),
             upstream_model: "kimi-k3".into(),
             supports_tools: None,
+            capabilities: RouteCapabilities::default(),
             extra: BTreeMap::new(),
         };
         let (routes, _, _, model) = normalize_catalog_edit(
@@ -716,6 +851,7 @@ mod tests {
                 display_name: format!("Route {index}"),
                 upstream_model: format!("upstream-{index}"),
                 supports_tools: None,
+                capabilities: RouteCapabilities::default(),
                 extra: BTreeMap::new(),
             });
         }

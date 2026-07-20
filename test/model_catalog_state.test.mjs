@@ -8,6 +8,7 @@ import {
   mergeCatalogCandidates,
   preferredCatalogReference,
   projectSimpleModelFields,
+  summarizeProfileRoleModels,
 } from "../desktop/src/model-catalog-state.js";
 
 test("saved selectors survive discovery metadata refresh", () => {
@@ -76,6 +77,12 @@ test("one freely entered model maps every Science role without a default pseudo 
     display_name: "kimi-k3",
     upstream_model: "kimi-k3",
     supports_tools: null,
+    capabilities: {
+      reasoning_round_trip: "none",
+      forced_tool_choice: null,
+      structured_output: null,
+      vision: null,
+    },
   }]);
   assert.deepEqual(payload.role_bindings, {
     sonnet: "kimi-k3",
@@ -83,6 +90,30 @@ test("one freely entered model maps every Science role without a default pseudo 
     haiku: "kimi-k3",
     fable: "kimi-k3",
   });
+});
+
+test("saved route capabilities survive discovery unless the contract supplies replacements", () => {
+  const saved = [{
+    selector_id: "claude-csswitch-k3-0123456789ab",
+    upstream_model: "kimi-k3",
+    display_name: "K3",
+    supports_tools: true,
+    capabilities: {
+      reasoning_round_trip: "csswitch_opaque",
+      forced_tool_choice: true,
+      structured_output: false,
+      vision: null,
+    },
+    enabled: true,
+  }];
+  const preserved = mergeCatalogCandidates(saved, [{ id: "kimi-k3", supports_tools: true }]);
+  assert.equal(preserved[0].capabilities.reasoning_round_trip, "csswitch_opaque");
+  const replaced = mergeCatalogCandidates(saved, [{
+    id: "kimi-k3",
+    supports_tools: true,
+    capabilities: { reasoning_round_trip: "native", forced_tool_choice: true },
+  }]);
+  assert.equal(replaced[0].capabilities.reasoning_round_trip, "native");
 });
 
 test("four freely entered model fields map independently and deduplicate equal IDs", () => {
@@ -105,6 +136,32 @@ test("four freely entered model fields map independently and deduplicate equal I
     default_model: "same", quality_model: "same", fast_model: "same", fable_model: "same",
   });
   assert.equal(deduped.model_catalog.length, 1);
+});
+
+test("scratch discovery enriches only explicitly selected models and never writes the full probe", () => {
+  const payload = buildSimpleModelSubmission({ default_model: "kimi-k3" }, {
+    candidate_routes: [
+      { id: "kimi-k3", display_name: "Kimi K3", supports_tools: true, origin: "discovered" },
+      { id: "deepseek-v4-pro", display_name: "DeepSeek V4 Pro", supports_tools: true, origin: "discovered" },
+      { id: "unknown-future", display_name: "Future", supports_tools: null, origin: "discovered" },
+    ],
+  });
+  assert.equal(payload.model_catalog.length, 1);
+  assert.deepEqual(payload.model_catalog[0], {
+    selector_id: "",
+    display_name: "Kimi K3",
+    upstream_model: "kimi-k3",
+    supports_tools: true,
+    capabilities: {
+      reasoning_round_trip: "none",
+      forced_tool_choice: null,
+      structured_output: null,
+      vision: null,
+    },
+  });
+  assert.throws(() => buildSimpleModelSubmission({ default_model: "no-tools" }, {
+    candidate_routes: [{ id: "no-tools", supports_tools: false, origin: "discovered" }],
+  }), /明确不支持 tools/);
 });
 
 test("simple model projection preserves selectors and unbound legacy routes", () => {
@@ -176,7 +233,56 @@ test("editing preserves a legacy sonnet selector until the default model actuall
   assert.equal(newProfile.role_bindings.sonnet, newProfile.default_model_route_id);
 });
 
-test("provider forms expose four free model inputs and no static discovery checklist", () => {
+test("role summary exposes every bound DeepSeek model without including extra routes", () => {
+  const profile = {
+    model_catalog: [
+      { selector_id: "sel-flash", upstream_model: "deepseek-v4-flash", display_name: "DeepSeek V4 Flash" },
+      { selector_id: "sel-pro", upstream_model: "deepseek-v4-pro", display_name: "DeepSeek V4 Pro" },
+      { selector_id: "sel-extra", upstream_model: "unused", display_name: "Unused" },
+    ],
+    default_model_route_id: "sel-flash",
+    role_bindings: {
+      sonnet: "deepseek-v4-flash",
+      opus: "sel-pro",
+      haiku: "sel-flash",
+      fable: "deepseek-v4-pro",
+    },
+  };
+  const before = structuredClone(profile);
+  assert.deepEqual(summarizeProfileRoleModels(profile), {
+    primary: "默认/均衡/快速：DeepSeek V4 Flash",
+    secondary: "高质量/Fable：DeepSeek V4 Pro",
+    inline: "默认/均衡/快速：DeepSeek V4 Flash · 高质量/Fable：DeepSeek V4 Pro",
+    split: true,
+  });
+  assert.deepEqual(profile, before);
+});
+
+test("role summary groups SiliconFlow roles and stays quiet for one model or dynamic catalogs", () => {
+  assert.deepEqual(summarizeProfileRoleModels({
+    model_catalog: [
+      { selector_id: "sel-pro", upstream_model: "deepseek-ai/DeepSeek-V4-Pro", display_name: "DeepSeek V4 Pro" },
+      { selector_id: "sel-flash", upstream_model: "deepseek-ai/DeepSeek-V4-Flash", display_name: "DeepSeek V4 Flash" },
+    ],
+    default_model_route_id: "sel-pro",
+    role_bindings: { sonnet: "sel-pro", opus: "sel-pro", haiku: "sel-flash", fable: "sel-pro" },
+  }), {
+    primary: "默认/均衡/高质量/Fable：DeepSeek V4 Pro",
+    secondary: "快速：DeepSeek V4 Flash",
+    inline: "默认/均衡/高质量/Fable：DeepSeek V4 Pro · 快速：DeepSeek V4 Flash",
+    split: true,
+  });
+  assert.deepEqual(summarizeProfileRoleModels({
+    model_catalog: [{ selector_id: "k3", upstream_model: "kimi-k3", display_name: "Kimi K3" }],
+    default_model_route_id: "k3",
+    role_bindings: { sonnet: "k3", opus: "k3", haiku: "k3", fable: "k3" },
+  }), {
+    primary: "Kimi K3", secondary: "", inline: "Kimi K3", split: false,
+  });
+  assert.equal(summarizeProfileRoleModels({ model_catalog: [] }), null);
+});
+
+test("provider forms expose four free model inputs plus read-only scratch discovery", () => {
   const html = readFileSync(new URL("../desktop/src/index.html", import.meta.url), "utf8");
   for (const prefix of ["wiz", "conn"]) {
     for (const id of [`${prefix}Model`, `${prefix}RoleQuality`, `${prefix}RoleFast`, `${prefix}RoleFable`]) {
@@ -184,8 +290,9 @@ test("provider forms expose four free model inputs and no static discovery check
     }
   }
   assert.doesNotMatch(html, /搜索已发现模型|添加精确 ID|勾选白名单|同步最新推荐/);
-  assert.doesNotMatch(html, />获取模型</);
-  assert.match(html, /刷新账号模型/);
+  assert.match(html, /id="wizFetchBtn"[^>]*>获取可用模型</);
+  assert.match(html, /id="connFetchBtn"[^>]*>获取可用模型</);
+  assert.match(html, /尚未探测模型/);
 });
 
 test("Codex profile action aligns with providers as a permanently disabled edit button", () => {

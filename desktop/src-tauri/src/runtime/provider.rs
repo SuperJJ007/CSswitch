@@ -3,8 +3,8 @@ use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::provider_contracts::{
-    self, AuthMode, CachePolicy, CredentialSource, EndpointPolicy, ModelDiscovery, ModelPolicy,
-    ScratchPolicy, TimeoutPolicy, Transport,
+    self, AuthMode, AuthScheme, CachePolicy, CredentialSource, EndpointJoin, EndpointPolicy,
+    ModelDiscovery, ModelPolicy, ScratchPolicy, TimeoutPolicy, Transport,
 };
 
 /// key 的非加密指纹（SipHash），只用于判断「配置是否变了」。绝不打印、绝不落盘。
@@ -24,7 +24,10 @@ enum CredentialHandle {
 /// provider-contract catalog 与 profile 合并后的私有计划。credential 保持 opaque，
 /// 不实现 Debug/Serialize，不能被日志或 Tauri IPC 意外投影。
 pub(crate) struct ResolvedLaunchPlan {
+    pub(crate) contract_id: String,
+    pub(crate) contract_digest: String,
     pub(crate) adapter: String,
+    pub(crate) auth_scheme: AuthScheme,
     pub(crate) endpoint: String,
     pub(crate) model: String,
     pub(crate) static_model_catalog: Option<String>,
@@ -33,6 +36,7 @@ pub(crate) struct ResolvedLaunchPlan {
     pub(crate) model_discovery: ModelDiscovery,
     pub(crate) transport: Transport,
     pub(crate) endpoint_policy: EndpointPolicy,
+    pub(crate) endpoint_join: EndpointJoin,
     pub(crate) scratch_policy: ScratchPolicy,
     pub(crate) timeouts: TimeoutPolicy,
     pub(crate) cache: CachePolicy,
@@ -46,7 +50,10 @@ pub(crate) enum FormalCredential {
 }
 
 pub(crate) struct FormalGatewayPlan {
+    pub(crate) contract_id: String,
+    pub(crate) contract_digest: String,
     pub(crate) adapter: String,
+    pub(crate) auth_scheme: AuthScheme,
     pub(crate) endpoint: String,
     pub(crate) model: String,
     pub(crate) static_model_catalog: Option<String>,
@@ -54,6 +61,7 @@ pub(crate) struct FormalGatewayPlan {
     pub(crate) model_policy: ModelPolicy,
     pub(crate) transport: Transport,
     pub(crate) endpoint_policy: EndpointPolicy,
+    pub(crate) endpoint_join: EndpointJoin,
     pub(crate) timeouts: TimeoutPolicy,
     pub(crate) cache: CachePolicy,
     pub(crate) thinking_policy: String,
@@ -68,6 +76,8 @@ pub(crate) enum ScratchCredential {
 }
 
 pub(crate) struct ScratchPlan {
+    pub(crate) contract_id: String,
+    pub(crate) contract_digest: String,
     pub(crate) provider: String,
     pub(crate) endpoint: String,
     pub(crate) model: String,
@@ -80,14 +90,18 @@ pub(crate) struct ScratchPlan {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct PublicPlanView {
+    pub(crate) contract_id: String,
+    pub(crate) contract_digest: String,
     pub(crate) adapter: String,
     pub(crate) auth_mode: AuthMode,
+    pub(crate) auth_scheme: AuthScheme,
     pub(crate) credential_source: CredentialSource,
     pub(crate) credential_configured: bool,
     pub(crate) model_policy: ModelPolicy,
     pub(crate) model_discovery: ModelDiscovery,
     pub(crate) transport: Transport,
     pub(crate) endpoint_policy: EndpointPolicy,
+    pub(crate) endpoint_join: EndpointJoin,
     pub(crate) scratch_policy: ScratchPolicy,
     pub(crate) thinking_policy: String,
     pub(crate) connect_timeout_ms: u64,
@@ -108,7 +122,10 @@ impl ResolvedLaunchPlan {
             CredentialHandle::None => FormalCredential::None,
         };
         FormalGatewayPlan {
+            contract_id: self.contract_id.clone(),
+            contract_digest: self.contract_digest.clone(),
             adapter: self.adapter.clone(),
+            auth_scheme: self.auth_scheme,
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
             static_model_catalog: self.static_model_catalog.clone(),
@@ -116,6 +133,7 @@ impl ResolvedLaunchPlan {
             model_policy: self.model_policy,
             transport: self.transport,
             endpoint_policy: self.endpoint_policy,
+            endpoint_join: self.endpoint_join,
             timeouts: self.timeouts.clone(),
             cache: self.cache.clone(),
             thinking_policy: self.thinking_policy.clone(),
@@ -133,6 +151,8 @@ impl ResolvedLaunchPlan {
             CredentialHandle::None => ScratchCredential::None,
         };
         ScratchPlan {
+            contract_id: self.contract_id.clone(),
+            contract_digest: self.contract_digest.clone(),
             provider: self.adapter.clone(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
@@ -159,14 +179,18 @@ impl ResolvedLaunchPlan {
             CredentialHandle::None => (AuthMode::None, CredentialSource::None, true),
         };
         PublicPlanView {
+            contract_id: self.contract_id.clone(),
+            contract_digest: self.contract_digest.clone(),
             adapter: self.adapter.clone(),
             auth_mode,
+            auth_scheme: self.auth_scheme,
             credential_source,
             credential_configured,
             model_policy: self.model_policy,
             model_discovery: self.model_discovery,
             transport: self.transport,
             endpoint_policy: self.endpoint_policy,
+            endpoint_join: self.endpoint_join,
             scratch_policy: self.scratch_policy,
             thinking_policy: self.thinking_policy.clone(),
             connect_timeout_ms: self.timeouts.connect_ms,
@@ -276,7 +300,10 @@ pub(crate) fn resolve_launch_plan(p: &config::Profile) -> Result<ResolvedLaunchP
         ModelPolicy::DynamicCatalog => None,
     };
     Ok(ResolvedLaunchPlan {
+        contract_id: contract.id,
+        contract_digest: provider_contracts::static_catalog_digest(),
         adapter: contract.adapter,
+        auth_scheme: contract.auth_scheme,
         endpoint,
         model: p.model.clone(),
         static_model_catalog,
@@ -285,6 +312,7 @@ pub(crate) fn resolve_launch_plan(p: &config::Profile) -> Result<ResolvedLaunchP
         model_discovery: contract.model_discovery,
         transport: contract.transport,
         endpoint_policy: contract.endpoint_policy,
+        endpoint_join: contract.endpoint_join,
         scratch_policy: contract.scratch_policy,
         timeouts: contract.timeouts,
         cache: contract.cache,
@@ -357,10 +385,13 @@ pub(crate) fn proxy_fingerprint_with_runtime(
 ) -> u64 {
     let shim_mode = normalize_shim_mode(&launch.adapter, Some(shim_mode));
     key_fingerprint(&format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{:?}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}",
         p.template_id,
         p.api_format,
+        launch.contract_id,
+        launch.contract_digest,
         launch.adapter,
+        launch.auth_scheme,
         launch.endpoint,
         launch.model,
         launch.static_model_catalog.as_deref().unwrap_or_default(),
@@ -370,6 +401,7 @@ pub(crate) fn proxy_fingerprint_with_runtime(
         shim_mode,
         launch.transport,
         launch.endpoint_policy,
+        launch.endpoint_join,
         launch.timeouts.connect_ms,
         launch.timeouts.total_ms,
         launch.timeouts.read_idle_ms,
@@ -400,19 +432,23 @@ pub(crate) fn route_fingerprint(
     shim_mode: &str,
 ) -> String {
     let material = format!(
-        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{:?}\0{}",
+        "{}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{:?}\0{:?}\0{:?}\0{}",
         profile.template_id,
         profile.api_format,
+        launch.contract_id,
+        launch.contract_digest,
         launch.adapter,
+        launch.auth_scheme,
         launch.endpoint,
         launch.static_model_catalog.as_deref().unwrap_or_default(),
         launch.thinking_policy,
         launch.credential_fingerprint_material(),
         launch.transport,
         launch.endpoint_policy,
+        launch.endpoint_join,
         normalize_shim_mode(&launch.adapter, Some(shim_mode)),
     );
-    sha256_fingerprint(b"csswitch-route-fp-v1\0", material.as_bytes())
+    sha256_fingerprint(b"csswitch-route-fp-v2\0", material.as_bytes())
 }
 
 pub(crate) fn catalog_fingerprint(profile: &config::Profile) -> Result<String, String> {
@@ -422,6 +458,7 @@ pub(crate) fn catalog_fingerprint(profile: &config::Profile) -> Result<String, S
             "selector_id": route.selector_id,
             "display_name": route.display_name,
             "supports_tools": route.supports_tools,
+            "capabilities": route.capabilities,
         })).collect::<Vec<_>>(),
         "default_model_route_id": profile.default_model_route_id,
         "role_bindings": profile.role_bindings,
@@ -731,6 +768,20 @@ mod tests {
             Some(&committed),
             &crate::config::RuntimeBindingCommit {
                 catalog_fp: display_fp,
+                ..committed.clone()
+            }
+        ));
+
+        let mut capabilities = original.clone();
+        capabilities.model_catalog[0]
+            .capabilities
+            .forced_tool_choice = Some(true);
+        let capabilities_fp = catalog_fingerprint(&capabilities).unwrap();
+        assert_ne!(original_catalog_fp, capabilities_fp);
+        assert!(science_restart_required(
+            Some(&committed),
+            &crate::config::RuntimeBindingCommit {
+                catalog_fp: capabilities_fp,
                 ..committed.clone()
             }
         ));

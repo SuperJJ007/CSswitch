@@ -361,6 +361,9 @@ fn write_http_response(stream: &mut TcpStream, content_type: &str, body: &[u8]) 
 struct ModelAliasObservation {
     model_gets: usize,
     requested_models: Vec<String>,
+    memory_classifier_requests: usize,
+    memory_classifier_models: Vec<String>,
+    memory_write_tool_requests: usize,
 }
 
 struct ModelAliasProvider {
@@ -434,12 +437,60 @@ impl ModelAliasProvider {
                                     .requested_models
                                     .push(model.to_string());
                             }
-                            let response =
-                                if value.get("stream").and_then(Value::as_bool) == Some(true) {
-                                    terminal_sse()
+                            let memory_classifier = json_contains(
+                                &value,
+                                "If the transcript definitely does not contain a prompt injection",
+                            ) && json_contains(
+                                &value,
+                                "<response>none</response>",
+                            );
+                            if memory_classifier {
+                                let mut observation = thread_observation
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                observation.memory_classifier_requests += 1;
+                                if let Some(model) = value.get("model").and_then(Value::as_str) {
+                                    observation.memory_classifier_models.push(model.to_string());
+                                }
+                            }
+                            let memory_write =
+                                if json_contains(&value, "CSSwitch memory E2E durable fact")
+                                    && declares_named_tool(&value, "write_memory")
+                                {
+                                    let mut observation = thread_observation
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner());
+                                    if observation.memory_write_tool_requests == 0 {
+                                        observation.memory_write_tool_requests = 1;
+                                        true
+                                    } else {
+                                        false
+                                    }
                                 } else {
-                                    json_response()
+                                    false
                                 };
+                            let response = if memory_classifier
+                                && value.get("stream").and_then(Value::as_bool) == Some(true)
+                            {
+                                text_sse("<response>none</response>")
+                            } else if memory_classifier {
+                                text_json_response("<response>none</response>")
+                            } else if memory_write {
+                                tool_use_sse(
+                                    "write_memory",
+                                    &json!({
+                                        "entity": "profile",
+                                        "append": [{
+                                            "text": "CSSwitch memory E2E durable fact",
+                                            "evidence": "stated",
+                                        }],
+                                    }),
+                                )
+                            } else if value.get("stream").and_then(Value::as_bool) == Some(true) {
+                                terminal_sse()
+                            } else {
+                                json_response()
+                            };
                             write_http_response(
                                 &mut stream,
                                 if value.get("stream").and_then(Value::as_bool) == Some(true) {
@@ -1175,6 +1226,22 @@ fn recognizes_attached_skill_metadata_without_human_description() {
     );
 }
 
+#[test]
+fn matches_only_tools_declared_by_the_request() {
+    let request = json!({
+        "tools": [
+            {"name": "create_work_item", "input_schema": {"type": "object"}},
+            {"name": "write_memory", "input_schema": {"type": "object"}},
+        ]
+    });
+    assert!(declares_named_tool(&request, "write_memory"));
+    assert!(!declares_named_tool(&request, "read_memory"));
+    assert!(!declares_named_tool(
+        &json!({"messages": [{"content": "write_memory"}]}),
+        "write_memory"
+    ));
+}
+
 fn json_contains(value: &Value, expected: &str) -> bool {
     match value {
         Value::String(text) => text.contains(expected),
@@ -1205,13 +1272,28 @@ fn collect_tool_use_names(value: &Value, names: &mut Vec<String>) {
     }
 }
 
+fn declares_named_tool(value: &Value, expected: &str) -> bool {
+    value
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some(expected))
+        })
+}
+
 fn json_response() -> Vec<u8> {
+    text_json_response("ok")
+}
+
+fn text_json_response(text: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "id": "msg_csswitch_aux",
         "type": "message",
         "role": "assistant",
         "model": "csswitch-local-mock",
-        "content": [{"type": "text", "text": "ok"}],
+        "content": [{"type": "text", "text": text}],
         "stop_reason": "end_turn",
         "stop_sequence": null,
         "usage": {"input_tokens": 1, "output_tokens": 1}
@@ -1220,16 +1302,61 @@ fn json_response() -> Vec<u8> {
 }
 
 fn terminal_sse() -> Vec<u8> {
-    concat!(
-        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_csswitch_done\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"csswitch-local-mock\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
-        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
-        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
-        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-    )
-    .as_bytes()
-    .to_vec()
+    text_sse("done")
+}
+
+fn text_sse(text: &str) -> Vec<u8> {
+    [
+        (
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_csswitch_done",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "csswitch-local-mock",
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }),
+        ),
+        (
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }),
+        ),
+        (
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        (
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": 1},
+            }),
+        ),
+        ("message_stop", json!({"type": "message_stop"})),
+    ]
+    .into_iter()
+    .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+    .collect::<String>()
+    .into_bytes()
 }
 
 fn tool_use_sse(tool_name: &str, input: &Value) -> Vec<u8> {
@@ -1339,7 +1466,11 @@ fn playwright_output(guard: &ScienceGuard, args: &[&str]) -> Result<String, Stri
     command
         .args(args)
         .current_dir(&guard.workdir)
-        .env("PLAYWRIGHT_CLI_SESSION", &guard.session);
+        .env("PLAYWRIGHT_CLI_SESSION", &guard.session)
+        .env(
+            "npm_config_cache",
+            "/private/tmp/csswitch-e2e-playwright-npm-cache",
+        );
     if let Some(path) = std::env::var_os("CSSWITCH_PLAYWRIGHT_BROWSERS_PATH") {
         command.env("PLAYWRIGHT_BROWSERS_PATH", path);
     }
@@ -1367,6 +1498,10 @@ fn snapshot(guard: &ScienceGuard) -> Result<String, String> {
 
 fn snapshot_ref(snapshot: &str, needle: &str) -> Option<String> {
     let line = snapshot.lines().find(|line| line.contains(needle))?;
+    snapshot_line_ref(line)
+}
+
+fn snapshot_line_ref(line: &str) -> Option<String> {
     let start = line.find("[ref=")? + 5;
     let end = line[start..].find(']')? + start;
     Some(line[start..end].to_string())
@@ -2170,5 +2305,217 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
     let stderr = fs::read_to_string(science_stderr).unwrap_or_default();
     assert!(!stderr.contains("ANTHROPIC_API_KEY"));
     assert!(!stderr.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore = "explicit installed Science memory-write E2E; temp HOME/data-dir and local mock/browser only"]
+fn isolated_science_memory_classifier_writes_a_real_row() {
+    use sha2::{Digest, Sha256};
+
+    assert_eq!(
+        std::env::var("CSSWITCH_REAL_SCIENCE_MEMORY_E2E").as_deref(),
+        Ok("1"),
+        "必须显式设置 CSSWITCH_REAL_SCIENCE_MEMORY_E2E=1"
+    );
+    let root = temp_dir("real-memory-write");
+    let outer_home = root.join("home");
+    let sandbox_home = outer_home.join(".csswitch/sandbox/home");
+    let data_dir = sandbox_home.join(".claude-science");
+    let safe_bin = prepare_safe_bin(&sandbox_home);
+    let workdir = root.join("browser-workdir");
+    fs::create_dir_all(&workdir).unwrap();
+    crate::oauth_forge::ensure_virtual_login(&data_dir, "virtual@localhost.invalid", &sandbox_home)
+        .unwrap();
+
+    let science_bin =
+        PathBuf::from("/Applications/Claude Science.app/Contents/Resources/bin/claude-science")
+            .canonicalize()
+            .unwrap();
+    let playwright =
+        PathBuf::from("/Users/superjj/.codex/skills/playwright/scripts/playwright_cli.sh");
+    let gateway =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../gateway/target/debug/csswitch-gateway");
+    assert!(science_bin.is_file());
+    assert!(playwright.is_file());
+    assert!(gateway.is_file());
+
+    let provider = ModelAliasProvider::start(vec![
+        ("mock-standard".into(), "Mock Standard".into()),
+        (
+            "mock-memory-classifier".into(),
+            "Mock Memory Classifier".into(),
+        ),
+    ]);
+    let (mut routes, default_selector, mut bindings) = crate::model_catalog::single_route_catalog(
+        "memory-e2e",
+        "mock-standard",
+        Some("Mock Standard"),
+        Some(true),
+    )
+    .unwrap();
+    let (classifier_routes, classifier_selector, _) = crate::model_catalog::single_route_catalog(
+        "memory-e2e",
+        "mock-memory-classifier",
+        Some("Mock Memory Classifier"),
+        Some(true),
+    )
+    .unwrap();
+    routes.extend(classifier_routes);
+    bindings.sonnet = classifier_selector;
+    let static_catalog = crate::model_catalog::static_resolver_payload(
+        "relay",
+        "custom",
+        &routes,
+        &default_selector,
+        &bindings,
+    )
+    .unwrap();
+    let contract_catalog = fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../catalog/provider-contracts.v1.json"),
+    )
+    .unwrap();
+    let contract_digest = format!("{:x}", Sha256::digest(contract_catalog));
+    let gateway_port = free_port();
+    let gateway_secret = "csswitch-memory-e2e-secret";
+    let gateway_stderr = root.join("gateway.stderr.log");
+    let mut gateway_command = safe_command(&gateway, &sandbox_home, &safe_bin);
+    let gateway_child = gateway_command
+        .arg("--provider")
+        .arg("relay")
+        .arg("--port")
+        .arg(gateway_port.to_string())
+        .env("CSSWITCH_AUTH_TOKEN", gateway_secret)
+        .env("CSSWITCH_GATEWAY_INTENT", "formal")
+        .env("CSSWITCH_TOOLUSE_SHIM", "off")
+        .env("CSSWITCH_PROVIDER_CONTRACT_ID", "custom-anthropic")
+        .env("CSSWITCH_PROVIDER_CONTRACT_DIGEST", contract_digest)
+        .env("CSSWITCH_RELAY_KEY", "fake-memory-e2e-key")
+        .env("CSSWITCH_RELAY_BASE_URL", provider.base_url())
+        .env("CSSWITCH_STATIC_MODEL_CATALOG_V1", static_catalog)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(File::create(&gateway_stderr).unwrap()))
+        .spawn()
+        .unwrap();
+    wait_port(gateway_port);
+
+    let port = free_port();
+    let sandbox_port = free_port();
+    let science_stderr = root.join("science.stderr.log");
+    let child = spawn_science(
+        &science_bin,
+        &sandbox_home,
+        &safe_bin,
+        &data_dir,
+        port,
+        sandbox_port,
+        &format!("http://127.0.0.1:{gateway_port}/{gateway_secret}"),
+        &root.join("science.stdout.log"),
+        &science_stderr,
+    );
+    let mut guard = ScienceGuard {
+        science_bin,
+        sandbox_home,
+        safe_bin,
+        data_dir: data_dir.clone(),
+        child: Some(child),
+        gateway_child: Some(gateway_child),
+        install_bridge: root.join("unused-install-bridge"),
+        playwright,
+        session: format!("csswitch-memory-write-{}", std::process::id()),
+        workdir,
+        browser_open: false,
+        port,
+    };
+    wait_port(port);
+    let chat = open_chat(&mut guard).unwrap();
+    click(&guard, &chat, "button \"Customize\"").unwrap();
+    let customize = wait_control(&guard, "button \"Memory\"", 30).unwrap();
+    click(&guard, &customize, "button \"Memory\"").unwrap();
+    let memory = wait_control(&guard, "button \"Turn on\"", 30).unwrap();
+    click(&guard, &memory, "button \"Turn on\"").unwrap();
+    let enabled = snapshot(&guard).unwrap();
+    click(&guard, &enabled, "button \"Close settings\"").unwrap();
+    let chat = wait_chat_idle(&guard, 40).unwrap();
+    send_prompt(
+        &guard,
+        &chat,
+        "Remember this exact profile note: CSSwitch memory E2E durable fact",
+    )
+    .unwrap();
+
+    let mut observation = provider.snapshot();
+    for _ in 0..600 {
+        observation = provider.snapshot();
+        if observation.memory_write_tool_requests >= 1
+            && observation.memory_classifier_requests >= 1
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(observation.memory_write_tool_requests, 1, "{observation:?}");
+    assert_eq!(observation.memory_classifier_requests, 1, "{observation:?}");
+    assert_eq!(
+        observation.memory_classifier_models,
+        ["mock-memory-classifier"],
+        "{observation:?}"
+    );
+
+    let active_org: Value = serde_json::from_slice(
+        &fs::read(data_dir.join("active-org.json")).expect("missing Science active-org.json"),
+    )
+    .expect("invalid Science active-org.json");
+    let org_uuid = active_org
+        .get("org_uuid")
+        .and_then(Value::as_str)
+        .expect("Science active-org.json is missing org_uuid");
+    let database = data_dir.join("orgs").join(org_uuid).join("operon-cli.db");
+    let mut stored = false;
+    for _ in 0..300 {
+        let output = Command::new("/usr/bin/sqlite3")
+            .arg("-readonly")
+            .arg(&database)
+            .arg(
+                "select body || '|' || origin from memories where body = 'CSSwitch memory E2E durable fact';",
+            )
+            .output()
+            .unwrap();
+        if output.status.success()
+            && String::from_utf8_lossy(&output.stdout).trim()
+                == "CSSwitch memory E2E durable fact|agent_tool"
+        {
+            stored = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        stored,
+        "classifier returned but durable memory row was not written"
+    );
+
+    guard.stop();
+    drop(provider);
+    let stderr = fs::read_to_string(&science_stderr).unwrap_or_default();
+    let gateway_stderr = fs::read_to_string(&gateway_stderr).unwrap_or_default();
+    assert!(!stderr.contains("Memory classifier unavailable"));
+    assert!(!stderr.contains("ANTHROPIC_API_KEY"));
+    assert!(!stderr.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+    for secret in [
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "fake-memory-e2e-key",
+        gateway_secret,
+    ] {
+        assert!(!gateway_stderr.contains(secret), "gateway leaked {secret}");
+    }
+    if let Some(real_home) = std::env::var_os("HOME") {
+        let real_home = real_home.to_string_lossy();
+        assert!(
+            !gateway_stderr.contains(real_home.as_ref()),
+            "gateway stderr leaked the real HOME"
+        );
+    }
     let _ = fs::remove_dir_all(root);
 }

@@ -4,7 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -12,8 +13,9 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 const KEY_NAMES: [&str; 4] = [
     "ANTHROPIC_API_KEY_ENCRYPTION_KEY",
@@ -36,10 +38,67 @@ pub struct ForgeResult {
 /// 一键登录本次对沙箱虚拟登录做了什么（供上层据实提示）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LoginAction {
-    Reused,   // 现有登录完整自洽，原样复用，未写任何文件
+    Reused,   // 现有登录完整自洽，凭证原样复用（升级时可能仅补 CSSwitch 私有标记）
     Repaired, // 部分损坏，重写但沿用原 org（旧对话不丢）
     Created,  // 真首次，铸全新 org
 }
+
+/// A candidate history organization stays backend-only. The frontend receives
+/// a random, one-time reference instead of this UUID or its filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryOrgCandidate {
+    org_uuid: String,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum EnsureVirtualLoginError {
+    Message(String),
+    HistoryChoiceRequired(Vec<HistoryOrgCandidate>),
+}
+
+impl std::fmt::Display for EnsureVirtualLoginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => f.write_str(message),
+            Self::HistoryChoiceRequired(candidates) => write!(
+                f,
+                "检测到 {} 份历史记录，需在 CSSwitch 中选择要恢复的一份。",
+                candidates.len()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EnsureVirtualLoginError {}
+
+impl From<String> for EnsureVirtualLoginError {
+    fn from(value: String) -> Self {
+        Self::Message(value)
+    }
+}
+
+impl From<&str> for EnsureVirtualLoginError {
+    fn from(value: &str) -> Self {
+        Self::Message(value.to_string())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VirtualOrgMarker {
+    schema_version: u8,
+    auth_dir_fingerprint: String,
+    org_uuid: String,
+}
+
+enum MarkerRead {
+    Missing,
+    Valid(VirtualOrgMarker),
+}
+
+const VIRTUAL_ORG_MARKER_MAX_BYTES: u64 = 4096;
+const VIRTUAL_ORG_MARKER_FILE: &str = "virtual-org.v1.json";
 
 // ---------- 随机与编码 ----------
 fn rand_bytes(n: usize) -> std::io::Result<Vec<u8>> {
@@ -191,6 +250,178 @@ fn chmod_best_effort(p: &Path, mode: u32) {
     let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode));
 }
 
+fn current_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    unsafe { libc::geteuid() }
+}
+
+fn marker_path(sandbox_root: &Path) -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if sandbox_root.file_name().and_then(|name| name.to_str()) != Some("home") {
+        return Ok(sandbox_root
+            .join(".csswitch-test-state")
+            .join(VIRTUAL_ORG_MARKER_FILE));
+    }
+    let sandbox_dir = sandbox_root
+        .parent()
+        .ok_or("沙箱 HOME 无父目录，无法定位 CSSwitch 私有状态目录")?;
+    Ok(sandbox_dir.join("state").join(VIRTUAL_ORG_MARKER_FILE))
+}
+
+fn validate_marker_location(path: &Path, sandbox_root: &Path) -> Result<(), String> {
+    let sandbox_dir = sandbox_root
+        .parent()
+        .ok_or("沙箱 HOME 无父目录，无法校验 CSSwitch 私有状态目录")?;
+    let state_dir = path.parent().ok_or("虚拟组织标记无父目录")?;
+    for (candidate, label) in [
+        (sandbox_dir, "沙箱目录"),
+        (sandbox_root, "沙箱 HOME"),
+        (state_dir, "CSSwitch 私有状态目录"),
+    ] {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink()
+                    || !metadata.file_type().is_dir()
+                    || metadata.uid() != current_uid()
+                    || (candidate == state_dir && metadata.mode() & 0o077 != 0)
+                {
+                    return Err(format!("{label} 类型或所有者不安全，已拒绝使用历史标记"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("检查{label}失败：{error}")),
+        }
+    }
+    Ok(())
+}
+
+fn open_marker_parent_nofollow(path: &Path) -> Result<Option<std::fs::File>, String> {
+    let parent = path.parent().ok_or("虚拟组织标记无父目录")?;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("打开 CSSwitch 私有状态目录失败：{error}")),
+    }
+}
+
+fn auth_dir_fingerprint(resolved: &Path) -> String {
+    let canonical = std::fs::canonicalize(resolved).unwrap_or_else(|_| real_ancestor(resolved));
+    let mut digest = Sha256::new();
+    digest.update(canonical.as_os_str().as_encoded_bytes());
+    hex(&digest.finalize())
+}
+
+fn ensure_marker_parent(path: &Path, sandbox_root: &Path) -> Result<(), String> {
+    let sandbox_dir = sandbox_root
+        .parent()
+        .ok_or("沙箱 HOME 无父目录，无法创建 CSSwitch 私有状态目录")?;
+    assert_not_symlink(sandbox_dir)?;
+    assert_not_symlink(sandbox_root)?;
+    let parent = path.parent().ok_or("虚拟组织标记无父目录")?;
+    assert_not_symlink(parent)?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("创建 CSSwitch 私有状态目录失败：{e}"))?;
+    let metadata = std::fs::symlink_metadata(parent)
+        .map_err(|e| format!("检查 CSSwitch 私有状态目录失败：{e}"))?;
+    if !metadata.is_dir() || metadata.uid() != current_uid() {
+        return Err("拒绝使用非当前用户所有的 CSSwitch 私有状态目录".into());
+    }
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("收紧 CSSwitch 私有状态目录权限失败：{e}"))?;
+    validate_marker_location(path, sandbox_root)?;
+    Ok(())
+}
+
+fn read_marker(resolved: &Path, sandbox_root: &Path) -> Result<MarkerRead, String> {
+    let path = marker_path(sandbox_root)?;
+    validate_marker_location(&path, sandbox_root)?;
+    let Some(parent) = open_marker_parent_nofollow(&path)? else {
+        return Ok(MarkerRead::Missing);
+    };
+    let name = std::ffi::CString::new(VIRTUAL_ORG_MARKER_FILE).expect("static filename");
+    // SAFETY: parent is an owned directory fd; name is NUL-terminated; flags
+    // request a read-only, non-following descriptor.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(MarkerRead::Missing);
+        }
+        return Err(format!("读取 CSSwitch 历史标记失败：{error}"));
+    }
+    // SAFETY: fd was returned uniquely by openat and is transferred to File.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("检查 CSSwitch 历史标记失败：{e}"))?;
+    if !metadata.is_file()
+        || metadata.uid() != current_uid()
+        || metadata.len() > VIRTUAL_ORG_MARKER_MAX_BYTES
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err("CSSwitch 历史标记类型、所有者、大小或权限不安全，已拒绝使用".into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("读取 CSSwitch 历史标记失败：{e}"))?;
+    if bytes.len() as u64 > VIRTUAL_ORG_MARKER_MAX_BYTES {
+        return Err("CSSwitch 历史标记超过大小限制，已拒绝使用".into());
+    }
+    let marker: VirtualOrgMarker =
+        serde_json::from_slice(&bytes).map_err(|_| "CSSwitch 历史标记不是合法 JSON")?;
+    if marker.schema_version != 1
+        || !looks_like_uuid(&marker.org_uuid)
+        || marker.auth_dir_fingerprint != auth_dir_fingerprint(resolved)
+    {
+        return Err("CSSwitch 历史标记与当前隔离目录不匹配，已拒绝自动恢复".into());
+    }
+    Ok(MarkerRead::Valid(marker))
+}
+
+/// Upgrade bridge for an already-running, intact v0.8.0 virtual login. This
+/// writes only CSSwitch-owned marker state; Science credentials stay read-only.
+pub(crate) fn bootstrap_marker_for_intact_login(
+    auth_dir: &Path,
+    email: &str,
+    sandbox_root: &Path,
+) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("无 HOME 环境变量")?;
+    let resolved = resolve_guarded(auth_dir, email, sandbox_root, &home.join(".claude-science"))?;
+    let intact = read_intact_login(&resolved, email).ok_or("隔离虚拟登录不完整，不能补历史标记")?;
+    match read_marker(&resolved, sandbox_root)? {
+        MarkerRead::Missing => write_marker(&resolved, sandbox_root, &intact.org_uuid),
+        MarkerRead::Valid(marker) if marker.org_uuid == intact.org_uuid => Ok(()),
+        MarkerRead::Valid(_) => Err("CSSwitch 历史标记与当前完整登录不一致".into()),
+    }
+}
+
+fn write_marker(resolved: &Path, sandbox_root: &Path, org_uuid: &str) -> Result<(), String> {
+    if !looks_like_uuid(org_uuid) {
+        return Err("拒绝写入非法历史组织标记".into());
+    }
+    let path = marker_path(sandbox_root)?;
+    ensure_marker_parent(&path, sandbox_root)?;
+    let marker = VirtualOrgMarker {
+        schema_version: 1,
+        auth_dir_fingerprint: auth_dir_fingerprint(resolved),
+        org_uuid: org_uuid.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|e| format!("序列化 CSSwitch 历史标记失败：{e}"))?;
+    safe_write(&path, &bytes, 0o600)
+}
+
 // ---------- 主流程 ----------
 // 注：一次性 `forge`（总是铸新 org）已被幂等的 `ensure_virtual_login` 取代（修 #3/#6），
 // 应用不再需要它。`forge_guarded`（= 护栏 + 一次性铸新）仍保留：既是 `ensure_virtual_login`
@@ -206,7 +437,9 @@ fn forge_guarded(
     real_cred_dir: &Path,
 ) -> Result<ForgeResult, String> {
     let resolved = resolve_guarded(auth_dir, email, sandbox_root, real_cred_dir)?;
-    write_login(&resolved, email, None, None)
+    let forged = write_login(&resolved, email, None, None)?;
+    write_marker(&resolved, sandbox_root, &forged.org_uuid)?;
+    Ok(forged)
 }
 
 /// 护栏（写任何东西之前；`real_ancestor` 已看穿符号链接）：真实目录保护（护栏 0，铁律最高
@@ -444,49 +677,43 @@ fn read_active_org(resolved: &Path) -> Option<String> {
     }
 }
 
-/// 尽力从旧 .enc 解出合法 UUID 的 account_uuid（供修复时复用；失败/非法无害，None 即新铸）。
-fn read_prior_account(resolved: &Path) -> Option<String> {
-    let key = parse_oauth_key(resolved)?;
-    let body = std::fs::read_to_string(single_enc(resolved)?).ok()?;
-    let blob: serde_json::Value =
-        serde_json::from_slice(&decrypt_token_v2(&body, &key).ok()?).ok()?;
-    let a = blob.get("account_uuid")?.as_str()?;
-    if looks_like_uuid(a) {
-        Some(a.to_string())
-    } else {
-        None
-    }
-}
-
-/// 从唯一可解 .enc 的 token blob 取合法 org_uuid（active-org.json 丢失时的回退来源）。
-fn read_token_org(resolved: &Path) -> Option<String> {
-    let key = parse_oauth_key(resolved)?;
-    let body = std::fs::read_to_string(single_enc(resolved)?).ok()?;
-    let blob: serde_json::Value =
-        serde_json::from_slice(&decrypt_token_v2(&body, &key).ok()?).ok()?;
-    let o = blob.get("org_uuid")?.as_str()?;
-    if looks_like_uuid(o) {
-        Some(o.to_string())
-    } else {
-        None
-    }
-}
-
-/// 扫 `<auth_dir>/orgs/` 下形如 UUID 的历史组织目录名（active-org 与 token 都没了时的最后回退）。
-fn scan_org_dirs(resolved: &Path) -> Vec<String> {
+/// Scan owned, real directories only. A symlink named like an organization is
+/// never a recovery candidate, even when its target is a directory.
+fn scan_org_dirs(resolved: &Path) -> Vec<HistoryOrgCandidate> {
     let mut v = Vec::new();
     if let Ok(rd) = std::fs::read_dir(resolved.join("orgs")) {
         for e in rd.flatten() {
-            if e.path().is_dir() {
-                if let Some(name) = e.file_name().to_str() {
-                    if looks_like_uuid(name) {
-                        v.push(name.to_string());
-                    }
+            let Ok(metadata) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if !metadata.file_type().is_dir() || metadata.uid() != current_uid() {
+                continue;
+            }
+            if let Some(name) = e.file_name().to_str() {
+                if looks_like_uuid(name) {
+                    v.push(HistoryOrgCandidate {
+                        org_uuid: name.to_string(),
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    });
                 }
             }
         }
     }
+    v.sort_by(|left, right| left.org_uuid.cmp(&right.org_uuid));
     v
+}
+
+fn candidate_is_current(resolved: &Path, candidate: &HistoryOrgCandidate) -> bool {
+    let path = resolved.join("orgs").join(&candidate.org_uuid);
+    std::fs::symlink_metadata(path)
+        .map(|metadata| {
+            metadata.file_type().is_dir()
+                && metadata.uid() == current_uid()
+                && metadata.dev() == candidate.device
+                && metadata.ino() == candidate.inode
+        })
+        .unwrap_or(false)
 }
 
 /// 今天的 UTC 日期 `YYYY-MM-DD`（无外部 crate；Howard Hinnant civil-from-days）。
@@ -583,7 +810,7 @@ pub fn ensure_virtual_login(
     auth_dir: &Path,
     email: &str,
     sandbox_root: &Path,
-) -> Result<(ForgeResult, LoginAction), String> {
+) -> Result<(ForgeResult, LoginAction), EnsureVirtualLoginError> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("无 HOME 环境变量")?;
@@ -596,38 +823,80 @@ fn ensure_virtual_login_guarded(
     email: &str,
     sandbox_root: &Path,
     real_cred_dir: &Path,
-) -> Result<(ForgeResult, LoginAction), String> {
+) -> Result<(ForgeResult, LoginAction), EnsureVirtualLoginError> {
     let resolved = resolve_guarded(auth_dir, email, sandbox_root, real_cred_dir)?;
-    // 完整自洽 → 原样复用，不碰任何文件（operon 可能正在读）。
+    let marker = read_marker(&resolved, sandbox_root)?;
+    // 完整自洽 → 凭证原样复用。0.8.0 升级时只在 CSSwitch 私有状态目录补标记，
+    // 不重写 Science 凭证；以后 Sign out 才能可靠找回同一份历史。
     if let Some(fr) = read_intact_login(&resolved, email) {
-        return Ok((fr, LoginAction::Reused));
-    }
-    // 组织来源优先级（P1a，绝不静默新铸）：active-org.json → 可解 token → orgs/ 目录。
-    // 只要定位到历史 org 就复用它（保住旧对话）；多个历史组织无法定位活动者则报错中止。
-    let (prior_org, action) = if let Some(o) = read_active_org(&resolved) {
-        (Some(o), LoginAction::Repaired)
-    } else if let Some(o) = read_token_org(&resolved) {
-        (Some(o), LoginAction::Repaired)
-    } else {
-        let dirs = scan_org_dirs(&resolved);
-        match dirs.len() {
-            0 => (None, LoginAction::Created), // 真首次：无任何历史
-            1 => (Some(dirs[0].clone()), LoginAction::Repaired), // 采用唯一历史 org
-            _ => {
-                return Err(format!(
-                    "检测到 {} 个历史组织，但 active-org.json 缺失且无可解令牌，无法确定当前活动组织；\
-                     为避免旧对话被孤儿化已中止。数据都在 {}/orgs/，请把想要的 org_uuid 写回 \
-                     {}/active-org.json 后重试。",
-                    dirs.len(),
-                    resolved.display(),
-                    resolved.display()
-                ));
+        match marker {
+            MarkerRead::Missing => write_marker(&resolved, sandbox_root, &fr.org_uuid)?,
+            MarkerRead::Valid(existing) if existing.org_uuid == fr.org_uuid => {}
+            MarkerRead::Valid(_) => {
+                let candidates = scan_org_dirs(&resolved);
+                if candidates.len() > 1 {
+                    return Err(EnsureVirtualLoginError::HistoryChoiceRequired(candidates));
+                }
+                return Err("CSSwitch 历史标记与当前完整登录不一致，已拒绝静默覆盖".into());
             }
         }
+        return Ok((fr, LoginAction::Reused));
+    }
+    let candidates = scan_org_dirs(&resolved);
+    let (prior_org, action) = match marker {
+        MarkerRead::Valid(existing) => match candidates
+            .iter()
+            .find(|candidate| candidate.org_uuid == existing.org_uuid)
+        {
+            Some(candidate) => (Some(candidate.org_uuid.clone()), LoginAction::Repaired),
+            // A marker is written before the first Science launch creates its
+            // org directory. If no history directory exists yet, preserving
+            // that marker org is safer than silently minting another one.
+            None if candidates.is_empty() => {
+                (Some(existing.org_uuid.clone()), LoginAction::Repaired)
+            }
+            None if candidates.len() > 1 => {
+                return Err(EnsureVirtualLoginError::HistoryChoiceRequired(candidates));
+            }
+            None => {
+                return Err(
+                    "上一次 CSSwitch 历史标记对应的目录已不存在，已拒绝静默改用另一份历史".into(),
+                )
+            }
+        },
+        MarkerRead::Missing => match candidates.len() {
+            0 => (None, LoginAction::Created),
+            1 => (Some(candidates[0].org_uuid.clone()), LoginAction::Repaired),
+            _ => return Err(EnsureVirtualLoginError::HistoryChoiceRequired(candidates)),
+        },
     };
-    let prior_account = read_prior_account(&resolved);
-    let fr = write_login(&resolved, email, prior_org, prior_account)?;
+    // Never borrow account/org identity from a decryptable token. The isolated
+    // data-dir may also contain a prior official login; only the CSSwitch marker
+    // or a verified history-directory choice may select an organization.
+    let fr = write_login(&resolved, email, prior_org, None)?;
+    write_marker(&resolved, sandbox_root, &fr.org_uuid)?;
     Ok((fr, action))
+}
+
+/// Complete an explicit legacy-history choice. The candidate is a backend-only
+/// inode snapshot created by `ensure_virtual_login`; it is revalidated before
+/// any credential file is written.
+pub(crate) fn restore_history_choice(
+    auth_dir: &Path,
+    email: &str,
+    sandbox_root: &Path,
+    candidate: &HistoryOrgCandidate,
+) -> Result<(ForgeResult, LoginAction), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("无 HOME 环境变量")?;
+    let resolved = resolve_guarded(auth_dir, email, sandbox_root, &home.join(".claude-science"))?;
+    if !candidate_is_current(&resolved, candidate) {
+        return Err("历史记录候选已变化，本次选择已作废；请重新点击一键开始".into());
+    }
+    let forged = write_login(&resolved, email, Some(candidate.org_uuid.clone()), None)?;
+    write_marker(&resolved, sandbox_root, &forged.org_uuid)?;
+    Ok((forged, LoginAction::Repaired))
 }
 
 /// 只读判定：沙箱里的虚拟登录当前是否「完整自洽」（可直接复用）。**绝不写任何文件**
@@ -874,7 +1143,7 @@ mod tests {
         let real = tmpdir("real-ensure");
         let r = ensure_virtual_login_guarded(&real, "virtual@localhost.invalid", &real, &real);
         assert!(r.is_err());
-        assert!(r.unwrap_err().contains("真实 Science 目录"));
+        assert!(r.unwrap_err().to_string().contains("真实 Science 目录"));
         assert!(
             !real.join("encryption.key").exists(),
             "拒绝路径不应写任何文件"
@@ -962,8 +1231,8 @@ mod tests {
     }
 
     #[test]
-    fn ensure_recovers_org_from_token_when_active_org_missing() {
-        // P1a：active-org.json 丢了，但 .enc 可解 → 从 token 取回原 org，绝不铸新。
+    fn ensure_recovers_org_from_marker_when_active_org_missing() {
+        // active-org.json 丢了，但 CSSwitch 私有标记仍在 → 取回原 org，绝不从 token 猜。
         let dir = tmpdir("tok-org");
         let fake_real = tmpdir("realcred-to");
         let email = "virtual@localhost.invalid";
@@ -972,7 +1241,7 @@ mod tests {
         std::fs::remove_file(dir.join("active-org.json")).unwrap();
         let (r, action) = ensure_virtual_login_guarded(&dir, email, &dir, &fake_real).unwrap();
         assert_eq!(action, LoginAction::Repaired);
-        assert_eq!(r.org_uuid, org0, "应从 token 取回原 org");
+        assert_eq!(r.org_uuid, org0, "应从私有标记取回原 org");
         assert_eq!(
             read_active_org_uuid(&dir),
             org0,
@@ -1018,12 +1287,190 @@ mod tests {
         std::fs::remove_file(dir.join("active-org.json")).unwrap();
         let r = ensure_virtual_login_guarded(&dir, email, &dir, &fake_real);
         assert!(r.is_err(), "多历史组织无法定位活动者应报错");
-        assert!(r.unwrap_err().contains("历史组织"));
+        assert!(matches!(
+            r.unwrap_err(),
+            EnsureVirtualLoginError::HistoryChoiceRequired(ref candidates) if candidates.len() == 2
+        ));
         assert!(
             !dir.join("active-org.json").exists(),
             "报错不应写 active-org.json"
         );
         assert_eq!(scan_org_dirs(&dir).len(), 2, "不应静默新铸 org");
+        for d in [dir, fake_real] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn marker_recovers_csswitch_history_after_signout_with_multiple_orgs() {
+        let dir = tmpdir("marker-signout");
+        let fake_real = tmpdir("realcred-marker-signout");
+        let email = "virtual@localhost.invalid";
+        forge_guarded(&dir, email, &dir, &fake_real).unwrap();
+        let csswitch_org = read_active_org_uuid(&dir);
+        let other_org = uuid_v4().unwrap();
+        std::fs::create_dir_all(dir.join("orgs").join(&csswitch_org)).unwrap();
+        std::fs::create_dir_all(dir.join("orgs").join(&other_org)).unwrap();
+        std::fs::remove_file(the_enc_file(&dir)).unwrap();
+        std::fs::remove_file(dir.join("active-org.json")).unwrap();
+
+        let (restored, action) =
+            ensure_virtual_login_guarded(&dir, email, &dir, &fake_real).unwrap();
+        assert_eq!(action, LoginAction::Repaired);
+        assert_eq!(restored.org_uuid, csswitch_org);
+        assert!(dir.join("orgs").join(other_org).is_dir());
+        for d in [dir, fake_real] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn production_marker_path_rejects_symlinked_state_parent() {
+        let base = tmpdir("marker-parent-link");
+        let sandbox_root = base.join("sandbox/home");
+        let auth_dir = sandbox_root.join(".claude-science");
+        let outside = base.join("outside-state");
+        let fake_real = base.join("real-science");
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("sandbox/state")).unwrap();
+
+        let error = ensure_virtual_login_guarded(
+            &auth_dir,
+            "virtual@localhost.invalid",
+            &sandbox_root,
+            &fake_real,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("私有状态目录"));
+        assert!(!outside.join(VIRTUAL_ORG_MARKER_FILE).exists());
+        assert!(!auth_dir.join("encryption.key").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn production_marker_read_rejects_group_or_world_writable_state_dir() {
+        let base = tmpdir("marker-parent-mode");
+        let sandbox_root = base.join("sandbox/home");
+        let auth_dir = sandbox_root.join(".claude-science");
+        let fake_real = base.join("real-science");
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+        forge_guarded(
+            &auth_dir,
+            "virtual@localhost.invalid",
+            &sandbox_root,
+            &fake_real,
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            base.join("sandbox/state"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let error = ensure_virtual_login_guarded(
+            &auth_dir,
+            "virtual@localhost.invalid",
+            &sandbox_root,
+            &fake_real,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("私有状态目录"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn running_intact_v080_login_bootstraps_production_marker_without_rewriting_credentials() {
+        let base = tmpdir("marker-bootstrap-running");
+        let sandbox_root = base.join("sandbox/home");
+        let auth_dir = sandbox_root.join(".claude-science");
+        let fake_real = base.join("real-science");
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+        let forged = forge_guarded(
+            &auth_dir,
+            "virtual@localhost.invalid",
+            &sandbox_root,
+            &fake_real,
+        )
+        .unwrap();
+        let marker = marker_path(&sandbox_root).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        let enc_before = std::fs::read(&forged.enc_file).unwrap();
+        let active_before = std::fs::read(auth_dir.join("active-org.json")).unwrap();
+
+        bootstrap_marker_for_intact_login(&auth_dir, "virtual@localhost.invalid", &sandbox_root)
+            .unwrap();
+        assert!(marker.is_file());
+        assert_eq!(std::fs::read(&forged.enc_file).unwrap(), enc_before);
+        assert_eq!(
+            std::fs::read(auth_dir.join("active-org.json")).unwrap(),
+            active_before
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn legacy_choice_revalidates_directory_identity_before_restore() {
+        let dir = tmpdir("choice-revalidate");
+        let fake_real = tmpdir("realcred-choice-revalidate");
+        let email = "virtual@localhost.invalid";
+        forge_guarded(&dir, email, &dir, &fake_real).unwrap();
+        let first = uuid_v4().unwrap();
+        let second = uuid_v4().unwrap();
+        std::fs::create_dir_all(dir.join("orgs").join(&first)).unwrap();
+        std::fs::create_dir_all(dir.join("orgs").join(&second)).unwrap();
+        std::fs::remove_file(the_enc_file(&dir)).unwrap();
+        std::fs::remove_file(dir.join("active-org.json")).unwrap();
+        std::fs::remove_file(marker_path(&dir).unwrap()).unwrap();
+        let candidates =
+            match ensure_virtual_login_guarded(&dir, email, &dir, &fake_real).unwrap_err() {
+                EnsureVirtualLoginError::HistoryChoiceRequired(candidates) => candidates,
+                other => panic!("expected history choice, got {other}"),
+            };
+        let chosen = candidates
+            .into_iter()
+            .find(|candidate| candidate.org_uuid == first)
+            .unwrap();
+        std::fs::remove_dir(dir.join("orgs").join(&first)).unwrap();
+        std::fs::create_dir(dir.join("orgs").join(&first)).unwrap();
+        assert!(restore_history_choice(&dir, email, &dir, &chosen).is_err());
+        assert!(!dir.join("active-org.json").exists());
+        for d in [dir, fake_real] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn org_directory_scan_ignores_symlinks() {
+        let dir = tmpdir("org-symlink");
+        let outside = tmpdir("org-symlink-outside");
+        std::fs::create_dir_all(dir.join("orgs")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let real_org = uuid_v4().unwrap();
+        let linked_org = uuid_v4().unwrap();
+        std::fs::create_dir(dir.join("orgs").join(&real_org)).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("orgs").join(&linked_org)).unwrap();
+        let candidates = scan_org_dirs(&dir);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].org_uuid, real_org);
+        for d in [dir, outside] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn legacy_decryptable_token_is_not_used_as_history_identity() {
+        let dir = tmpdir("token-not-identity");
+        let fake_real = tmpdir("realcred-token-not-identity");
+        let email = "virtual@localhost.invalid";
+        forge_guarded(&dir, email, &dir, &fake_real).unwrap();
+        let token_org = read_active_org_uuid(&dir);
+        std::fs::remove_file(dir.join("active-org.json")).unwrap();
+        std::fs::remove_file(marker_path(&dir).unwrap()).unwrap();
+
+        let (created, action) =
+            ensure_virtual_login_guarded(&dir, email, &dir, &fake_real).unwrap();
+        assert_eq!(action, LoginAction::Created);
+        assert_ne!(created.org_uuid, token_org, "不得从可解 token 借用组织身份");
         for d in [dir, fake_real] {
             let _ = std::fs::remove_dir_all(&d);
         }

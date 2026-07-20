@@ -69,6 +69,16 @@ pub struct GatewayHealth {
     pub intent: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct GatewayHealthExpectation<'a> {
+    pub gateway: &'a str,
+    pub provider: Option<&'a str>,
+    pub shim: Option<&'a str>,
+    pub launch_id: Option<&'a str>,
+    pub provider_contract_id: Option<&'a str>,
+    pub provider_contract_digest: Option<&'a str>,
+}
+
 /// 读取 Rust gateway 声明的运行身份。
 pub fn http_gateway_health(
     port: u16,
@@ -80,54 +90,46 @@ pub fn http_gateway_health(
 }
 
 /// CSSwitch proxy 强身份探活。Managed Rust launch 必须匹配
-/// gateway/provider/shim/launch_id；launch_id 防止同端口同 secret、甚至同
-/// provider/shim 的旧 gateway 冒充新 child。
+/// gateway/provider/shim/launch_id/provider contract；launch_id 防止同端口同
+/// secret、甚至同 provider/shim 的旧 gateway 冒充新 child。Managed launches
+/// 必须同时提供精确 contract id 与 catalog digest；不完整的期望身份失败关闭。
 pub fn http_health_gateway(
     port: u16,
     secret: Option<&str>,
     timeout_ms: u64,
-    expected_gateway: &str,
-    expected_provider: Option<&str>,
-    expected_shim: Option<&str>,
-    expected_launch_id: Option<&str>,
+    expected: GatewayHealthExpectation<'_>,
 ) -> bool {
     let Some(actual) = http_gateway_health(port, secret, timeout_ms) else {
         return false;
     };
-    gateway_health_matches(
-        &actual,
-        expected_gateway,
-        expected_provider,
-        expected_shim,
-        expected_launch_id,
-    )
+    gateway_health_matches(&actual, expected)
 }
 
-fn gateway_health_matches(
-    actual: &GatewayHealth,
-    expected_gateway: &str,
-    expected_provider: Option<&str>,
-    expected_shim: Option<&str>,
-    expected_launch_id: Option<&str>,
-) -> bool {
-    let contract_matches = match expected_provider {
-        Some("codex") => crate::provider_contracts::gateway_contract_identity("codex")
-            .ok()
-            .flatten()
-            .is_some_and(|identity| {
-                actual.provider_contract_id == identity.contract_id
-                    && actual.provider_contract_digest == identity.catalog_digest
-            }),
-        _ => true,
+fn gateway_health_matches(actual: &GatewayHealth, expected: GatewayHealthExpectation<'_>) -> bool {
+    let contract_matches = match (
+        expected.provider_contract_id,
+        expected.provider_contract_digest,
+    ) {
+        (None, None) => true,
+        (Some(id), Some(digest)) => {
+            !id.is_empty()
+                && !digest.is_empty()
+                && actual.provider_contract_id == id
+                && actual.provider_contract_digest == digest
+        }
+        _ => false,
     };
-    actual.gateway == expected_gateway
-        && expected_provider
+    actual.gateway == expected.gateway
+        && expected
+            .provider
             .map(|expected| actual.provider == expected)
             .unwrap_or(true)
-        && expected_shim
+        && expected
+            .shim
             .map(|expected| actual.shim == expected)
             .unwrap_or(true)
-        && expected_launch_id
+        && expected
+            .launch_id
             .map(|expected| !expected.is_empty() && actual.launch_id == expected)
             .unwrap_or(true)
         && contract_matches
@@ -521,56 +523,86 @@ mod tests {
         };
         assert!(!gateway_health_matches(
             &old,
-            "rust",
-            Some("deepseek"),
-            Some("off"),
-            Some("new-launch"),
+            GatewayHealthExpectation {
+                gateway: "rust",
+                provider: Some("deepseek"),
+                shim: Some("off"),
+                launch_id: Some("new-launch"),
+                provider_contract_id: None,
+                provider_contract_digest: None,
+            },
         ));
         assert!(gateway_health_matches(
             &old,
-            "rust",
-            Some("deepseek"),
-            Some("off"),
-            Some("old-launch"),
+            GatewayHealthExpectation {
+                gateway: "rust",
+                provider: Some("deepseek"),
+                shim: Some("off"),
+                launch_id: Some("old-launch"),
+                provider_contract_id: None,
+                provider_contract_digest: None,
+            },
         ));
         assert!(!gateway_health_matches(
             &old,
-            "rust",
-            Some("deepseek"),
-            Some("off"),
-            Some(""),
+            GatewayHealthExpectation {
+                gateway: "rust",
+                provider: Some("deepseek"),
+                shim: Some("off"),
+                launch_id: Some(""),
+                provider_contract_id: None,
+                provider_contract_digest: None,
+            },
         ));
     }
 
     #[test]
-    fn managed_codex_health_requires_compiled_provider_contract_identity() {
-        let identity = crate::provider_contracts::gateway_contract_identity("codex")
-            .unwrap()
-            .unwrap();
+    fn managed_health_requires_exact_provider_contract_identity_for_every_provider() {
+        let contract_id = "deepseek-native";
+        let contract_digest = crate::provider_contracts::static_catalog_digest();
         let mut health = GatewayHealth {
             gateway: "rust".into(),
-            provider: "codex".into(),
+            provider: "deepseek".into(),
             shim: "off".into(),
             launch_id: "launch".into(),
-            provider_contract_id: identity.contract_id,
-            provider_contract_digest: identity.catalog_digest,
+            provider_contract_id: contract_id.into(),
+            provider_contract_digest: contract_digest.clone(),
             catalog_fp: "".into(),
             intent: "formal".into(),
         };
         assert!(gateway_health_matches(
             &health,
-            "rust",
-            Some("codex"),
-            Some("off"),
-            Some("launch")
+            GatewayHealthExpectation {
+                gateway: "rust",
+                provider: Some("deepseek"),
+                shim: Some("off"),
+                launch_id: Some("launch"),
+                provider_contract_id: Some(contract_id),
+                provider_contract_digest: Some(&contract_digest),
+            },
         ));
         health.provider_contract_digest = "wrong".into();
         assert!(!gateway_health_matches(
             &health,
-            "rust",
-            Some("codex"),
-            Some("off"),
-            Some("launch")
+            GatewayHealthExpectation {
+                gateway: "rust",
+                provider: Some("deepseek"),
+                shim: Some("off"),
+                launch_id: Some("launch"),
+                provider_contract_id: Some(contract_id),
+                provider_contract_digest: Some(&contract_digest),
+            },
+        ));
+        assert!(!gateway_health_matches(
+            &health,
+            GatewayHealthExpectation {
+                gateway: "rust",
+                provider: Some("deepseek"),
+                shim: Some("off"),
+                launch_id: Some("launch"),
+                provider_contract_id: Some(contract_id),
+                provider_contract_digest: None,
+            },
         ));
     }
 

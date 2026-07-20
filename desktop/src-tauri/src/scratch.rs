@@ -171,6 +171,8 @@ pub fn scratch_env(
 /// `model` 非空注入 `CSSWITCH_RELAY_MODEL`（仅 relay 生效）。
 pub struct ScratchTarget<'a> {
     pub provider: &'a str,
+    pub contract_id: &'a str,
+    pub contract_digest: &'a str,
     pub key_env: &'a str,
     pub base_url: &'a str,
     pub key: &'a str,
@@ -289,6 +291,8 @@ pub fn scratch_probe(
             body: error,
         };
     }
+    cmd.env("CSSWITCH_PROVIDER_CONTRACT_ID", target.contract_id)
+        .env("CSSWITCH_PROVIDER_CONTRACT_DIGEST", target.contract_digest);
     let request_model = match kind {
         ProbeKind::Models => {
             cmd.env("CSSWITCH_GATEWAY_INTENT", "scratch-models");
@@ -399,10 +403,14 @@ pub fn scratch_probe(
             port,
             Some(&secret),
             operation::LOCAL_HEALTH_TIMEOUT_MS,
-            backend.gateway_kind(),
-            Some(target.provider),
-            Some(backend.shim_mode()),
-            Some(&launch_id),
+            crate::proc::GatewayHealthExpectation {
+                gateway: backend.gateway_kind(),
+                provider: Some(target.provider),
+                shim: Some(backend.shim_mode()),
+                launch_id: Some(&launch_id),
+                provider_contract_id: Some(target.contract_id),
+                provider_contract_digest: Some(target.contract_digest),
+            },
         );
         if healthy {
             alive = true;
@@ -542,6 +550,8 @@ mod tests {
             &backend,
             &ScratchTarget {
                 provider: "codex",
+                contract_id: "codex-oauth",
+                contract_digest: &crate::provider_contracts::static_catalog_digest(),
                 key_env: "",
                 base_url: "",
                 key: "",
@@ -578,19 +588,36 @@ mod tests {
             let (mut stream, _) = upstream.accept().unwrap();
             let mut buf = Vec::new();
             let mut chunk = [0_u8; 4096];
+            let mut expected_request_bytes = None;
             loop {
                 let n = stream.read(&mut chunk).unwrap();
                 if n == 0 {
                     break;
                 }
                 buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                if expected_request_bytes.is_none() {
+                    if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..head_end]);
+                        let content_length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then_some(value.trim())?
+                                    .parse::<usize>()
+                                    .ok()
+                            })
+                            .unwrap_or(0);
+                        expected_request_bytes = Some(head_end + 4 + content_length);
+                    }
+                }
+                if expected_request_bytes.is_some_and(|expected| buf.len() >= expected) {
                     break;
                 }
             }
             let head = String::from_utf8_lossy(&buf).to_string();
             let _ = tx.send(head.lines().next().unwrap_or("").to_string());
-            let body = br#"{"choices":[{"message":{"content":"pong"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+            let body = br#"{"id":"chatcmpl_scratch","choices":[{"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
@@ -609,6 +636,8 @@ mod tests {
             &backend,
             &ScratchTarget {
                 provider: "openai-custom",
+                contract_id: "custom-openai-chat",
+                contract_digest: &crate::provider_contracts::static_catalog_digest(),
                 key_env: "CSSWITCH_OPENAI_KEY",
                 base_url: &format!("http://127.0.0.1:{upstream_port}/up"),
                 key: "test-key",

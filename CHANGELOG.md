@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.8.1] — 2026-07-20
+
+### Added
+
+- Added two explicit OpenCode Go profiles for the official OpenAI Chat and Anthropic Messages transports, backed by a versioned official model-to-protocol route table and bare upstream model IDs.
+- Added Grok (xAI) and Gemini through their official OpenAI-compatible endpoints, with scratch model discovery, manual model entry, static Science selectors, and title/classifier/tool smoke coverage.
+- Added canonical Claude role aliases for Codex. Compatible aliases resolve deterministically against one authenticated account catalog snapshot while unknown aliases and raw OpenAI model IDs fail before inference.
+- Added an opt-in SSH preflight bridge for isolated Science. CSSwitch writes only a private sandbox config containing an absolute `Include` of the authorized system config; it does not copy keys or expose the real `.ssh` tree.
+
+### Changed
+
+- Made inference POSTs exactly once, separated stream header negotiation from body forwarding, and preserved bounded/redacted upstream HTTP classifications instead of flattening all failures into 502.
+- Added strict Anthropic SSE lifecycle validation. A failed or truncated stream emits one terminal error and never a synthetic `message_stop`.
+- Added strict Anthropic structured-output translation for Codex Responses and fail-closed handling when a Lite model cannot preserve a forced named tool.
+- Added a Sonnet-role fallback for the memory classifier without bypassing its fail-closed policy; title, summary, and status results remain plain text rather than JSON-encoded strings.
+
+### Fixed
+
+- Fixed OpenCode Go routes that previously reached the wrong protocol or endpoint and surfaced as “cannot connect to server.”
+- Fixed K3/Kimi multi-turn recovery by preserving signed reasoning and tool semantics across turns, rejecting tampered history locally, and refusing malformed OpenAI Chat responses instead of synthesizing success.
+- Fixed the stale Kimi preset to use canonical `kimi-k3`, aligned preset default/Sonnet invariants, and made profile cards show the actual Balanced/Quality/Fast/Fable routing instead of only the default model.
+- Fixed Kimi Anthropic relay filtering so only zero-information thinking and complete server-tool blocks are removed. Original indexes, hidden deltas, signatures, usage, stop reason, and terminal lifecycle are validated before compact output indexes are emitted.
+- Kept DeepSeek native Anthropic and DSML detect/rewrite/off behavior isolated from Kimi-specific filtering.
+- Fixed isolated Science history selection across v0.8.0 sign-out and upgrade paths with a private CSSwitch marker. Ambiguous legacy multi-org state now asks the user to choose an opaque candidate instead of guessing, deleting, or rewriting history.
+
+### Compatibility and release notes
+
+- OpenCode Go, Grok, and Gemini support text, multi-turn conversations, tools and `tool_choice`, model discovery/manual entry, titles, and classifiers. Images, provider-specific reasoning, native streaming, and structured outputs remain explicitly limited; Gemini native API is not included.
+- OpenSSH itself is covered by automated `Include` and fail-closed tests. The installed Claude Science preflight parser remains a separate real-machine acceptance step and is not claimed by those tests.
+- Version 0.8.1 remains macOS Apple Silicon only. Release artifacts must continue to describe ad-hoc signing and lack of notarization unless artifact-specific evidence proves otherwise.
+- Automated and loopback gates remain separate from installed-runtime, live-provider, real-account, signing, notarization, Gatekeeper, and public-release evidence.
+
 ## [0.8.0] — 2026-07-19
 
 ### Added

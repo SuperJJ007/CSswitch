@@ -17,6 +17,8 @@ pub struct Template {
     pub website_url: &'static str,
     pub icon: &'static str,
     pub icon_color: &'static str,
+    /// 用户可见的兼容边界；空表示该模板没有额外的 0.8.1 限制声明。
+    pub compatibility_notice: Option<&'static str>,
 }
 
 pub fn all() -> &'static [Template] {
@@ -53,6 +55,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://platform.deepseek.com",
         icon: "deepseek",
         icon_color: "#1E88E5",
+        compatibility_notice: None,
     },
     Template {
         id: "glm",
@@ -66,6 +69,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://open.bigmodel.cn",
         icon: "glm",
         icon_color: "#2E6BE6",
+        compatibility_notice: None,
     },
     Template {
         id: "xiaomi",
@@ -79,6 +83,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://xiaomimimo.com",
         icon: "xiaomi",
         icon_color: "#FF6900",
+        compatibility_notice: None,
     },
     Template {
         id: "siliconflow",
@@ -92,6 +97,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://siliconflow.cn",
         icon: "siliconflow",
         icon_color: "#7C3AED",
+        compatibility_notice: None,
     },
     Template {
         id: "kimi",
@@ -105,6 +111,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://platform.moonshot.cn",
         icon: "kimi",
         icon_color: "#16182F",
+        compatibility_notice: None,
     },
     Template {
         id: "minimax",
@@ -118,6 +125,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://platform.minimaxi.com",
         icon: "minimax",
         icon_color: "#E1341E",
+        compatibility_notice: None,
     },
     Template {
         id: "openrouter",
@@ -131,6 +139,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://openrouter.ai",
         icon: "openrouter",
         icon_color: "#6467F2",
+        compatibility_notice: None,
     },
     Template {
         id: "qwen",
@@ -144,6 +153,63 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://dashscope.aliyun.com",
         icon: "qwen",
         icon_color: "#615CED",
+        compatibility_notice: None,
+    },
+    Template {
+        id: "opencode-go-openai",
+        name: "OpenCode Go — OpenAI Chat",
+        category: "official",
+        api_format: "openai_chat",
+        base_url: "https://opencode.ai/zen/go/v1",
+        base_url_editable: false,
+        preset_catalog_id: None,
+        model_catalog_source: "manual_or_discovered",
+        website_url: "https://opencode.ai/docs/zh-cn/go/",
+        icon: "custom",
+        icon_color: "#111827",
+        compatibility_notice: Some("0.8.1 limited：文本、多轮、tools/tool_choice 与模型发现；图片、厂商 reasoning、原生流式和结构化输出尚未通过兼容门禁。"),
+    },
+    Template {
+        id: "opencode-go-anthropic",
+        name: "OpenCode Go — Anthropic Messages",
+        category: "official",
+        api_format: "anthropic",
+        base_url: "https://opencode.ai/zen/go/v1",
+        base_url_editable: false,
+        preset_catalog_id: None,
+        model_catalog_source: "manual_or_discovered",
+        website_url: "https://opencode.ai/docs/zh-cn/go/",
+        icon: "custom",
+        icon_color: "#111827",
+        compatibility_notice: Some("0.8.1 limited：文本、多轮、tools/tool_choice 与模型发现；图片、厂商 reasoning、原生流式和结构化输出尚未通过兼容门禁。"),
+    },
+    Template {
+        id: "grok",
+        name: "Grok（xAI）",
+        category: "official",
+        api_format: "openai_chat",
+        base_url: "https://api.x.ai/v1",
+        base_url_editable: false,
+        preset_catalog_id: None,
+        model_catalog_source: "manual_or_discovered",
+        website_url: "https://docs.x.ai/developers/rest-api-reference/inference",
+        icon: "custom",
+        icon_color: "#111827",
+        compatibility_notice: Some("0.8.1 limited：文本、多轮、tools/tool_choice 与模型发现；图片、厂商 reasoning、原生流式和结构化输出尚未通过兼容门禁。"),
+    },
+    Template {
+        id: "gemini",
+        name: "Gemini（OpenAI 兼容）",
+        category: "official",
+        api_format: "openai_chat",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url_editable: false,
+        preset_catalog_id: None,
+        model_catalog_source: "manual_or_discovered",
+        website_url: "https://ai.google.dev/gemini-api/docs/openai",
+        icon: "custom",
+        icon_color: "#4285F4",
+        compatibility_notice: Some("0.8.1 limited：仅实现官方 OpenAI compatibility；文本、多轮、tools/tool_choice 与模型发现已纳入门禁，图片、厂商 reasoning、原生流式和结构化输出尚未通过。"),
     },
     Template {
         id: "codex",
@@ -157,6 +223,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://developers.openai.com/codex/",
         icon: "custom",
         icon_color: "#111827",
+        compatibility_notice: None,
     },
     Template {
         id: "custom-openai",
@@ -170,6 +237,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "",
         icon: "custom",
         icon_color: "#2563EB",
+        compatibility_notice: None,
     },
     Template {
         id: "custom-openai-responses",
@@ -183,6 +251,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "",
         icon: "custom",
         icon_color: "#0F766E",
+        compatibility_notice: None,
     },
     Template {
         id: "custom",
@@ -196,6 +265,7 @@ static TEMPLATES: &[Template] = &[
         website_url: "",
         icon: "custom",
         icon_color: "#6B7280",
+        compatibility_notice: None,
     },
 ];
 
@@ -245,7 +315,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn table_has_twelve_templates_including_experimental_codex() {
+    fn table_has_sixteen_templates_including_v081_providers_and_experimental_codex() {
         let ids: Vec<&str> = all().iter().map(|t| t.id).collect();
         assert_eq!(
             ids,
@@ -258,6 +328,10 @@ mod tests {
                 "minimax",
                 "openrouter",
                 "qwen",
+                "opencode-go-openai",
+                "opencode-go-anthropic",
+                "grok",
+                "gemini",
                 "codex",
                 "custom-openai",
                 "custom-openai-responses",
@@ -281,7 +355,13 @@ mod tests {
                 (None, "dynamic_codex") => assert_eq!(template.id, "codex"),
                 (None, "manual_or_discovered") => assert!(matches!(
                     template.id,
-                    "custom" | "custom-openai" | "custom-openai-responses"
+                    "custom"
+                        | "custom-openai"
+                        | "custom-openai-responses"
+                        | "opencode-go-openai"
+                        | "opencode-go-anthropic"
+                        | "grok"
+                        | "gemini"
                 )),
                 other => panic!("template {} catalog strategy 非法：{other:?}", template.id),
             }
@@ -358,6 +438,10 @@ mod tests {
         assert_eq!(
             crate::model_catalog::preset_upstream_models("minimax").unwrap()[0],
             "MiniMax-M3"
+        );
+        assert_eq!(
+            crate::model_catalog::preset_upstream_models("kimi").unwrap()[0],
+            "kimi-k3"
         );
         assert_eq!(
             crate::model_catalog::preset_upstream_models("openrouter").unwrap()[0],

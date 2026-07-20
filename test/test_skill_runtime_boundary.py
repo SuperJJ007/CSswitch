@@ -244,7 +244,9 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("current == initial_for_probe", lifecycle)
         boot = lib.split("LaunchPath::BootScience", 1)[1].split("// ---------- 入口", 1)[0]
         self.assertIn("boot_result_error(&value)", boot)
-        self.assertIn("Some(message) => mark_boot_failed", boot)
+        self.assertIn("boot_result_needs_attention(&value)", boot)
+        self.assertIn("mark_boot_attention(&app, value)", boot)
+        self.assertIn("mark_boot_failed(&app, message)", boot)
 
     def test_science_runtime_identity_is_reused_for_serve_status_url_and_stop(self):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()

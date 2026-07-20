@@ -8,6 +8,19 @@ function boundedText(value, maxBytes = 512) {
   return text;
 }
 
+function normalizeCapabilities(value) {
+  const reasoning = ["none", "native", "csswitch_opaque"].includes(value?.reasoning_round_trip)
+    ? value.reasoning_round_trip
+    : "none";
+  const optionalBoolean = (candidate) => typeof candidate === "boolean" ? candidate : null;
+  return {
+    reasoning_round_trip: reasoning,
+    forced_tool_choice: optionalBoolean(value?.forced_tool_choice),
+    structured_output: optionalBoolean(value?.structured_output),
+    vision: optionalBoolean(value?.vision),
+  };
+}
+
 export function normalizeCatalogCandidate(item, enabled = false) {
   const upstream = boundedText(item?.upstream_model || item?.id);
   if (!upstream) return null;
@@ -18,6 +31,7 @@ export function normalizeCatalogCandidate(item, enabled = false) {
     display_name: display,
     upstream_model: upstream,
     supports_tools: typeof item?.supports_tools === "boolean" ? item.supports_tools : null,
+    capabilities: normalizeCapabilities(item?.capabilities),
     origin: boundedText(item?.origin, 64) || "manual",
     availability: boundedText(item?.availability, 64) || "unknown",
     enabled: !!enabled && item?.supports_tools !== false,
@@ -44,6 +58,7 @@ export function mergeCatalogCandidates(current, incoming, { enableNew = false } 
         merged[selectorIndex] = {
           ...discovered,
           selector_id: saved.selector_id,
+          capabilities: raw?.capabilities ? discovered.capabilities : saved.capabilities,
           enabled: saved.enabled && discovered.supports_tools !== false,
         };
       }
@@ -63,6 +78,7 @@ export function mergeCatalogCandidates(current, incoming, { enableNew = false } 
       merged[index] = {
         ...discovered,
         selector_id: saved.selector_id || discovered.selector_id,
+        capabilities: raw?.capabilities ? discovered.capabilities : saved.capabilities,
         display_name: matches.length > 1
           ? saved.display_name
           : (discovered.display_name || saved.display_name),
@@ -133,8 +149,8 @@ export function buildCatalogSubmission(items, references = {}) {
   const balancedRef = references.balanced || defaultRef;
   const qualityRef = references.quality || defaultRef;
   const fastRef = references.fast || defaultRef;
-  const cleanRoutes = routes.map(({ selector_id, display_name, upstream_model, supports_tools }) => ({
-    selector_id, display_name, upstream_model, supports_tools,
+  const cleanRoutes = routes.map(({ selector_id, display_name, upstream_model, supports_tools, capabilities }) => ({
+    selector_id, display_name, upstream_model, supports_tools, capabilities,
   }));
   return {
     model_catalog: cleanRoutes,
@@ -169,6 +185,60 @@ function routeByReference(routes, reference) {
   ) || null;
 }
 
+export function summarizeProfileRoleModels(profile) {
+  const routes = Array.isArray(profile?.model_catalog) ? profile.model_catalog : [];
+  if (!routes.length) return null;
+  const defaultRoute = routeByReference(
+    routes,
+    profile?.default_model_route_id || profile?.model,
+  ) || routes[0];
+  if (!defaultRoute?.upstream_model) return null;
+
+  const bindings = profile?.role_bindings || {};
+  const slots = [
+    ["默认", defaultRoute],
+    ["均衡", routeByReference(routes, bindings.sonnet) || defaultRoute],
+    ["高质量", routeByReference(routes, bindings.opus) || defaultRoute],
+    ["快速", routeByReference(routes, bindings.haiku) || defaultRoute],
+    ["Fable", routeByReference(routes, bindings.fable)
+      || routeByReference(routes, bindings.opus)
+      || defaultRoute],
+  ];
+  const groups = [];
+  const byUpstream = new Map();
+  for (const [label, route] of slots) {
+    const upstream = boundedText(route?.upstream_model);
+    if (!upstream) continue;
+    let group = byUpstream.get(upstream);
+    if (!group) {
+      const display = boundedText(route?.display_name);
+      group = {
+        labels: [],
+        model: !display || display.toLowerCase() === "default" ? upstream : display,
+      };
+      byUpstream.set(upstream, group);
+      groups.push(group);
+    }
+    group.labels.push(label);
+  }
+  if (!groups.length) return null;
+  if (groups.length === 1) {
+    return {
+      primary: groups[0].model,
+      secondary: "",
+      inline: groups[0].model,
+      split: false,
+    };
+  }
+  const formatted = groups.map((group) => `${group.labels.join("/")}：${group.model}`);
+  return {
+    primary: formatted[0],
+    secondary: formatted.slice(1).join(" · "),
+    inline: formatted.join(" · "),
+    split: true,
+  };
+}
+
 function simplifiedRoute(route, upstreamModel) {
   const display = boundedText(route?.display_name);
   return {
@@ -176,6 +246,7 @@ function simplifiedRoute(route, upstreamModel) {
     display_name: !display || display.toLowerCase() === "default" ? upstreamModel : display,
     upstream_model: upstreamModel,
     supports_tools: typeof route?.supports_tools === "boolean" ? route.supports_tools : null,
+    capabilities: normalizeCapabilities(route?.capabilities),
   };
 }
 
@@ -205,6 +276,12 @@ export function buildSimpleModelSubmission(fields, options = {}) {
   const existingRoutes = (options.existing_routes || [])
     .map((route) => normalizeCatalogCandidate(route, true))
     .filter(Boolean);
+  // Scratch discovery candidates may enrich a route the user explicitly
+  // selects, but they are never preserved merely because a probe returned
+  // them. This keeps fetch read-only with respect to the formal catalog.
+  const candidateRoutes = (options.candidate_routes || [])
+    .map((route) => normalizeCatalogCandidate(route, false))
+    .filter(Boolean);
   const preferred = options.existing_references || {};
   const selectedRoutes = [];
   const selectedKeys = new Set();
@@ -213,7 +290,11 @@ export function buildSimpleModelSubmission(fields, options = {}) {
     const preferredRoute = routeByReference(existingRoutes, preferredReference);
     const existing = preferredRoute?.upstream_model === model
       ? preferredRoute
-      : existingRoutes.find((route) => route.upstream_model === model);
+      : existingRoutes.find((route) => route.upstream_model === model)
+        || candidateRoutes.find((route) => route.upstream_model === model);
+    if (existing?.supports_tools === false) {
+      throw new Error(`模型 ${model} 已明确不支持 tools，不能用于 Science。`);
+    }
     const route = simplifiedRoute(existing, model);
     const key = route.selector_id ? `selector:${route.selector_id}` : `upstream:${route.upstream_model}`;
     if (!selectedKeys.has(key)) {

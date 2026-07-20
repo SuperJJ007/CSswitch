@@ -39,6 +39,8 @@ fn interrupted_health_matches(
     health: &proc::GatewayHealth,
     target_provider: &str,
     target_shim: &str,
+    target_contract_id: &str,
+    target_contract_digest: &str,
     target_catalog_fp: Option<&str>,
     previous: Option<&config::GatewayRuntimeJournalIdentity>,
 ) -> bool {
@@ -51,6 +53,10 @@ fn interrupted_health_matches(
             .all(|value| value.is_ascii_hexdigit());
     let target_matches = health.provider == target_provider
         && health.shim == target_shim
+        && !target_contract_id.is_empty()
+        && !target_contract_digest.is_empty()
+        && health.provider_contract_id == target_contract_id
+        && health.provider_contract_digest == target_contract_digest
         && target_catalog_fp
             .map(|expected| health.catalog_fp == expected)
             .unwrap_or(health.catalog_fp.is_empty());
@@ -58,6 +64,10 @@ fn interrupted_health_matches(
         health.provider == expected.provider
             && health.shim == expected.shim
             && health.launch_id == expected.launch_id
+            && !expected.provider_contract_id.is_empty()
+            && !expected.provider_contract_digest.is_empty()
+            && health.provider_contract_id == expected.provider_contract_id
+            && health.provider_contract_digest == expected.provider_contract_digest
             && health.catalog_fp == expected.catalog_fp
     });
     managed_identity && (target_matches || previous_matches)
@@ -127,16 +137,22 @@ fn recover_interrupted_gateway_from_dir<R: Runtime>(
         &initial,
         &formal.adapter,
         target_shim,
+        &formal.contract_id,
+        &formal.contract_digest,
         target_catalog_fp.as_deref(),
         journal.previous_gateway.as_ref(),
     ) || !proc::http_health_gateway(
         cfg.proxy_port,
         Some(&cfg.secret),
         operation::LOCAL_HEALTH_TIMEOUT_MS,
-        "rust",
-        Some(&initial.provider),
-        Some(&initial.shim),
-        Some(&initial.launch_id),
+        proc::GatewayHealthExpectation {
+            gateway: "rust",
+            provider: Some(&initial.provider),
+            shim: Some(&initial.shim),
+            launch_id: Some(&initial.launch_id),
+            provider_contract_id: Some(&initial.provider_contract_id),
+            provider_contract_digest: Some(&initial.provider_contract_digest),
+        },
     ) {
         return Err(
             "未完成事务的端口 listener 与已提交/上一受管 Gateway 身份不一致；已拒绝结束未知进程。"
@@ -166,10 +182,14 @@ fn recover_interrupted_gateway_from_dir<R: Runtime>(
                 cfg.proxy_port,
                 Some(&cfg.secret),
                 operation::LOCAL_HEALTH_TIMEOUT_MS,
-                "rust",
-                Some(&initial_for_probe.provider),
-                Some(&initial_for_probe.shim),
-                Some(&initial_for_probe.launch_id),
+                proc::GatewayHealthExpectation {
+                    gateway: "rust",
+                    provider: Some(&initial_for_probe.provider),
+                    shim: Some(&initial_for_probe.shim),
+                    launch_id: Some(&initial_for_probe.launch_id),
+                    provider_contract_id: Some(&initial_for_probe.provider_contract_id),
+                    provider_contract_digest: Some(&initial_for_probe.provider_contract_digest),
+                },
             )
     });
     match cleanup {
@@ -184,7 +204,17 @@ fn recover_interrupted_gateway_from_dir<R: Runtime>(
 }
 
 fn formal_proxy_env(launch: &FormalGatewayPlan) -> Result<Vec<(String, String)>, String> {
-    let mut env = vec![("CSSWITCH_GATEWAY_INTENT".into(), "formal".into())];
+    let mut env = vec![
+        ("CSSWITCH_GATEWAY_INTENT".into(), "formal".into()),
+        (
+            "CSSWITCH_PROVIDER_CONTRACT_ID".into(),
+            launch.contract_id.clone(),
+        ),
+        (
+            "CSSWITCH_PROVIDER_CONTRACT_DIGEST".into(),
+            launch.contract_digest.clone(),
+        ),
+    ];
     if let FormalCredential::ApiKey { env: key, value } = &launch.credential {
         env.push((key.clone(), value.clone()));
     }
@@ -245,10 +275,6 @@ pub(crate) fn configure_managed_proxy_command(
         "CSSWITCH_RELAY_THINKING",
     ] {
         cmd.env_remove(inherited);
-    }
-    if let Some(identity) = crate::provider_contracts::gateway_contract_identity(provider)? {
-        cmd.env("CSSWITCH_PROVIDER_CONTRACT_ID", identity.contract_id)
-            .env("CSSWITCH_PROVIDER_CONTRACT_DIGEST", identity.catalog_digest);
     }
     // CSSWITCH_UPSTREAM_URL is a native-provider test/diagnostic override. A stale
     // value inherited from the desktop process must never replace a candidate relay
@@ -650,10 +676,14 @@ pub(crate) fn start_proxy_for<R: Runtime>(
                 port,
                 Some(&st.secret),
                 operation::PROXY_REUSE_HEALTH_TIMEOUT_MS,
-                gateway_kind,
-                Some(&launch.adapter),
-                Some(st.shim_mode.as_str()),
-                Some(st.launch_id.as_str()),
+                proc::GatewayHealthExpectation {
+                    gateway: gateway_kind,
+                    provider: Some(&launch.adapter),
+                    shim: Some(st.shim_mode.as_str()),
+                    launch_id: Some(st.launch_id.as_str()),
+                    provider_contract_id: Some(&launch.contract_id),
+                    provider_contract_digest: Some(&launch.contract_digest),
+                },
             )
             && proc::http_gateway_health(
                 port,
@@ -784,10 +814,14 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             port,
             Some(&secret),
             operation::LOCAL_HEALTH_TIMEOUT_MS,
-            gateway_kind,
-            Some(&launch.adapter),
-            Some(shim_mode),
-            Some(&launch_id),
+            proc::GatewayHealthExpectation {
+                gateway: gateway_kind,
+                provider: Some(&launch.adapter),
+                shim: Some(shim_mode),
+                launch_id: Some(&launch_id),
+                provider_contract_id: Some(&launch.contract_id),
+                provider_contract_digest: Some(&launch.contract_digest),
+            },
         ) && proc::http_gateway_health(port, Some(&secret), operation::LOCAL_HEALTH_TIMEOUT_MS)
             .is_some_and(|health| {
                 health.intent == "formal"
@@ -878,13 +912,18 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn health(provider: &str, launch_id: &str, catalog_fp: &str) -> crate::proc::GatewayHealth {
+        let provider_contract_id = match provider {
+            "deepseek" => "deepseek-native",
+            "qwen" => "qwen-native",
+            other => panic!("missing test contract for {other}"),
+        };
         crate::proc::GatewayHealth {
             gateway: "rust".into(),
             provider: provider.into(),
             shim: "off".into(),
             launch_id: launch_id.into(),
-            provider_contract_id: String::new(),
-            provider_contract_digest: String::new(),
+            provider_contract_id: provider_contract_id.into(),
+            provider_contract_digest: crate::provider_contracts::static_catalog_digest(),
             catalog_fp: catalog_fp.into(),
             intent: "formal".into(),
         }
@@ -897,6 +936,8 @@ mod tests {
             &target,
             "qwen",
             "off",
+            "qwen-native",
+            &crate::provider_contracts::static_catalog_digest(),
             Some("target-catalog"),
             None,
         ));
@@ -905,6 +946,8 @@ mod tests {
             provider: "deepseek".into(),
             shim: "off".into(),
             launch_id: "abcdef0123456789abcdef0123456789".into(),
+            provider_contract_id: "deepseek-native".into(),
+            provider_contract_digest: crate::provider_contracts::static_catalog_digest(),
             catalog_fp: "previous-catalog".into(),
         };
         let previous = health(
@@ -916,6 +959,8 @@ mod tests {
             &previous,
             "qwen",
             "off",
+            "qwen-native",
+            &crate::provider_contracts::static_catalog_digest(),
             Some("target-catalog"),
             Some(&previous_identity),
         ));
@@ -925,6 +970,8 @@ mod tests {
             &spoof,
             "qwen",
             "off",
+            "qwen-native",
+            &crate::provider_contracts::static_catalog_digest(),
             Some("target-catalog"),
             Some(&previous_identity),
         ));
@@ -1024,7 +1071,19 @@ mod tests {
         thinking_policy: &'static str,
     ) -> FormalGatewayPlan {
         FormalGatewayPlan {
+            contract_id: if adapter == "openai-custom" {
+                "custom-openai-chat"
+            } else {
+                "anthropic-relay"
+            }
+            .into(),
+            contract_digest: crate::provider_contracts::static_catalog_digest(),
             adapter: adapter.to_string(),
+            auth_scheme: if matches!(adapter, "openai-custom" | "openai-responses") {
+                crate::provider_contracts::AuthScheme::Bearer
+            } else {
+                crate::provider_contracts::AuthScheme::AnthropicDual
+            },
             endpoint: "https://upstream.example/api".to_string(),
             model: model.to_string(),
             static_model_catalog: Some(format!(
@@ -1045,6 +1104,11 @@ mod tests {
                 Transport::AnthropicMessages
             },
             endpoint_policy: EndpointPolicy::ProfileRequired,
+            endpoint_join: if adapter == "openai-custom" {
+                crate::provider_contracts::EndpointJoin::OpenaiV1
+            } else {
+                crate::provider_contracts::EndpointJoin::AnthropicV1
+            },
             timeouts: TimeoutPolicy {
                 connect_ms: 10_000,
                 total_ms: 30_000,
@@ -1149,25 +1213,20 @@ mod tests {
                 .find(|(key, _)| *key == "CSSWITCH_PROVIDER_CONTRACT_DIGEST")
                 .and_then(|(_, value)| value)
                 .map(|value| value.to_string_lossy().into_owned());
-            if provider == "codex" {
-                let identity = crate::provider_contracts::gateway_contract_identity("codex")
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(contract_id.as_deref(), Some(identity.contract_id.as_str()));
-                assert_eq!(
-                    contract_digest.as_deref(),
-                    Some(identity.catalog_digest.as_str())
-                );
-            } else {
-                assert_eq!(contract_id, None);
-                assert_eq!(contract_digest, None);
-            }
+            assert_eq!(contract_id, None);
+            assert_eq!(contract_digest, None);
         }
     }
 
     #[test]
     fn formal_proxy_env_injects_openai_catalog_without_legacy_model_override() {
         let env = formal_proxy_env(&launch("openai-custom", "gpt-5.2")).unwrap();
+        assert!(env.iter().any(|(key, value)| {
+            key == "CSSWITCH_PROVIDER_CONTRACT_ID" && value == "custom-openai-chat"
+        }));
+        assert!(env.iter().any(|(key, value)| {
+            key == "CSSWITCH_PROVIDER_CONTRACT_DIGEST" && value.len() == 64
+        }));
         assert!(env.contains(&(
             "CSSWITCH_OPENAI_BASE_URL".to_string(),
             "https://upstream.example/api".to_string()

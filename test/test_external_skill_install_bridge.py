@@ -83,6 +83,7 @@ class ExternalSkillInstallBridge(unittest.TestCase):
             env.update(
                 {
                     "DEEPSEEK_API_KEY": "test-only-key",
+                    "CSSWITCH_GATEWAY_INTENT": "scratch-models",
                     "CSSWITCH_SKILL_DATA_DIR": str(data_dir),
                     "CSSWITCH_SKILL_BRIDGE_DIR": str(bridge_dir),
                     "CSSWITCH_SKILL_BRIDGE_TOKEN": self.BRIDGE_TOKEN,

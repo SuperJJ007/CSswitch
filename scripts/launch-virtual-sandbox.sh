@@ -25,6 +25,9 @@ REUSE_SYSTEM_SSH="${CSSWITCH_REUSE_SYSTEM_SSH:-0}"
 SYSTEM_SSH_CONFIG="$REAL_HOME/.ssh/config"
 SSH_BRIDGE_DIR="$PROJ/scripts/ssh-bridge"
 SSH_BRIDGE_BIN="$SSH_BRIDGE_DIR/ssh"
+SANDBOX_SSH_DIR="$SANDBOX_HOME/.ssh"
+SANDBOX_SSH_CONFIG="$SANDBOX_SSH_DIR/config"
+SSH_STUB_MARKER="# CSSwitch managed system SSH config bridge v1"
 PORT=8990
 PROXY_URL="${CSSWITCH_PROXY_URL:-http://127.0.0.1:18991}"
 EMAIL="virtual@localhost.invalid"
@@ -49,6 +52,85 @@ path_contains_symlink() {
     probe="${probe:h}"
   done
   return 1
+}
+
+is_managed_ssh_stub() {
+  local target="$1" escaped
+  [[ -f "$target" && ! -L "$target" ]] || return 1
+  [[ "$(/usr/bin/stat -f '%u' "$target" 2>/dev/null)" == "$(/usr/bin/id -u)" ]] || return 1
+  escaped="$(printf '%s' "$SYSTEM_SSH_CONFIG" | /usr/bin/sed 's/\\/\\\\/g; s/"/\\"/g')"
+  printf '%s\nInclude "%s"\n' "$SSH_STUB_MARKER" "$escaped" | /usr/bin/cmp -s - "$target"
+}
+
+prepare_sandbox_ssh_config() {
+  if path_contains_symlink "$SANDBOX_SSH_DIR"; then
+    echo "拒绝：隔离 SSH 配置目录包含符号链接"
+    return 1
+  fi
+  if [[ -e "$SANDBOX_SSH_DIR" && ! -d "$SANDBOX_SSH_DIR" ]]; then
+    echo "拒绝：隔离 SSH 配置目录不是普通目录"
+    return 1
+  fi
+  /bin/mkdir -p -m 700 "$SANDBOX_SSH_DIR" 2>/dev/null || {
+    echo "拒绝：无法创建隔离 SSH 配置目录"
+    return 1
+  }
+  /bin/chmod 700 "$SANDBOX_SSH_DIR" 2>/dev/null || {
+    echo "拒绝：无法收紧隔离 SSH 配置目录权限"
+    return 1
+  }
+  if [[ -e "$SANDBOX_SSH_CONFIG" || -L "$SANDBOX_SSH_CONFIG" ]]; then
+    if ! is_managed_ssh_stub "$SANDBOX_SSH_CONFIG"; then
+      echo "拒绝：隔离 SSH config 不是 CSSwitch 管理的安全入口"
+      return 1
+    fi
+  fi
+  local escaped tmp
+  escaped="$(printf '%s' "$SYSTEM_SSH_CONFIG" | /usr/bin/sed 's/\\/\\\\/g; s/"/\\"/g')"
+  tmp="$(/usr/bin/mktemp "$SANDBOX_SSH_DIR/.csswitch-config.XXXXXX" 2>/dev/null)" || {
+    echo "拒绝：无法创建隔离 SSH 临时配置"
+    return 1
+  }
+  /bin/chmod 600 "$tmp" 2>/dev/null || {
+    /bin/rm -f "$tmp" 2>/dev/null || true
+    echo "拒绝：无法收紧隔离 SSH 临时配置权限"
+    return 1
+  }
+  printf '%s\nInclude "%s"\n' "$SSH_STUB_MARKER" "$escaped" > "$tmp" 2>/dev/null || {
+    /bin/rm -f "$tmp" 2>/dev/null || true
+    echo "拒绝：无法写入隔离 SSH 配置"
+    return 1
+  }
+  /bin/mv -f "$tmp" "$SANDBOX_SSH_CONFIG" 2>/dev/null || {
+    /bin/rm -f "$tmp" 2>/dev/null || true
+    echo "拒绝：无法提交隔离 SSH 配置"
+    return 1
+  }
+  /bin/chmod 600 "$SANDBOX_SSH_CONFIG" 2>/dev/null || {
+    echo "拒绝：无法收紧隔离 SSH config 权限"
+    return 1
+  }
+}
+
+remove_sandbox_ssh_config() {
+  if [[ ! -e "$SANDBOX_SSH_DIR" && ! -L "$SANDBOX_SSH_DIR" ]]; then
+    return 0
+  fi
+  if path_contains_symlink "$SANDBOX_SSH_DIR" || [[ ! -d "$SANDBOX_SSH_DIR" ]]; then
+    echo "拒绝：未授权状态下的隔离 SSH 配置目录不安全"
+    return 1
+  fi
+  if [[ -e "$SANDBOX_SSH_CONFIG" || -L "$SANDBOX_SSH_CONFIG" ]]; then
+    if ! is_managed_ssh_stub "$SANDBOX_SSH_CONFIG"; then
+      echo "拒绝：未授权状态下存在非 CSSwitch 管理的隔离 SSH config"
+      return 1
+    fi
+    /bin/rm "$SANDBOX_SSH_CONFIG" 2>/dev/null || {
+      echo "拒绝：无法撤销隔离 SSH config"
+      return 1
+    }
+  fi
+  /bin/rmdir "$SANDBOX_SSH_DIR" 2>/dev/null || true
 }
 
 while [[ $# -gt 0 ]]; do
@@ -105,6 +187,11 @@ mkdir -p "$DATA_DIR"
 if path_contains_symlink "$DATA_DIR"; then
   echo "拒绝：Science data-dir 路径在初始化期间发生符号链接变化"
   exit 1
+fi
+if [[ "$REUSE_SYSTEM_SSH" == "1" ]]; then
+  prepare_sandbox_ssh_config
+else
+  remove_sandbox_ssh_config
 fi
 BIN_SOURCE="backend-selected runtime"
 if [[ -z "$BIN" ]]; then

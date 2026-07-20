@@ -1,4 +1,5 @@
 pub mod anthropic_compat;
+pub(crate) mod anthropic_sse;
 pub mod auth;
 pub mod codex_auth;
 pub(crate) mod codex_models;

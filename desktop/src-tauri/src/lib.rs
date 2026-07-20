@@ -18,6 +18,7 @@ mod config_legacy;
 mod lifecycle;
 mod model_catalog;
 mod oauth_forge;
+mod opencode_go_models;
 mod proc;
 mod provider_contracts;
 mod runtime;
@@ -107,8 +108,25 @@ pub(crate) struct AppState {
     pub(crate) science_confirmed_stopped: Option<runtime::science::ScienceRuntimeIdentity>,
     /// Science 版本探测缓存与 daemon 身份分离；停止 daemon 后仍可复用未变化二进制的版本。
     pub(crate) science_version_cache: runtime::science::ScienceVersionCache,
+    /// One-shot, backend-only mapping for the v0.8.0 multi-history recovery UI.
+    /// Neither organization UUIDs nor filesystem paths cross the invoke boundary.
+    pub(crate) history_recovery: Option<HistoryRecoverySession>,
     boot: BootState,
     pub(crate) boot_error: Option<String>,
+    pub(crate) boot_attention: Option<serde_json::Value>,
+}
+
+pub(crate) struct HistoryRecoverySession {
+    pub(crate) active_profile_id: String,
+    pub(crate) sandbox_port: u16,
+    pub(crate) auth_dir: std::path::PathBuf,
+    pub(crate) sandbox_root: std::path::PathBuf,
+    pub(crate) choices: Vec<HistoryRecoveryChoice>,
+}
+
+pub(crate) struct HistoryRecoveryChoice {
+    pub(crate) reference: String,
+    pub(crate) candidate: oauth_forge::HistoryOrgCandidate,
 }
 
 impl AppState {
@@ -255,9 +273,22 @@ fn mark_boot_failed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, error: String)
         let mut st = lock(state.inner());
         st.boot = BootState::Failed;
         st.boot_error = Some(error.clone());
+        st.boot_attention = None;
     }
     show_main_window(app);
     let _ = app.emit("boot://failed", error);
+}
+
+fn mark_boot_attention<R: tauri::Runtime>(app: &tauri::AppHandle<R>, value: serde_json::Value) {
+    let state = app.state::<SharedAppState>();
+    {
+        let mut st = lock(state.inner());
+        st.boot = BootState::Idle;
+        st.boot_error = None;
+        st.boot_attention = Some(value.clone());
+    }
+    show_main_window(app);
+    let _ = app.emit("boot://attention", value);
 }
 
 fn boot_result_error(value: &serde_json::Value) -> Option<String> {
@@ -268,6 +299,10 @@ fn boot_result_error(value: &serde_json::Value) -> Option<String> {
             .unwrap_or("自动启动未完成")
             .to_string()
     })
+}
+
+fn boot_result_needs_attention(value: &serde_json::Value) -> bool {
+    value.get("status").and_then(serde_json::Value::as_str) == Some("attention")
 }
 
 fn run_boot_coordinator(app: tauri::AppHandle) {
@@ -295,6 +330,7 @@ fn run_boot_coordinator(app: tauri::AppHandle) {
                 let mut st = lock(state.inner());
                 st.boot = BootState::Idle;
                 st.boot_error = None;
+                st.boot_attention = None;
                 show_main_window(&app);
             }
             LaunchPath::OpenOfficial => match commands::runtime::open_official() {
@@ -302,6 +338,7 @@ fn run_boot_coordinator(app: tauri::AppHandle) {
                     let mut st = lock(state.inner());
                     st.boot = BootState::Idle;
                     st.boot_error = None;
+                    st.boot_attention = None;
                 }
                 Err(e) => mark_boot_failed(&app, e),
             },
@@ -314,14 +351,18 @@ fn run_boot_coordinator(app: tauri::AppHandle) {
                     lifecycle,
                     None,
                 ) {
-                    Ok(value) => match boot_result_error(&value) {
-                        Some(message) => mark_boot_failed(&app, message),
-                        None => {
+                    Ok(value) => {
+                        if boot_result_needs_attention(&value) {
+                            mark_boot_attention(&app, value);
+                        } else if let Some(message) = boot_result_error(&value) {
+                            mark_boot_failed(&app, message);
+                        } else {
                             let mut st = lock(state.inner());
                             st.boot = BootState::Ready;
                             st.boot_error = None;
+                            st.boot_attention = None;
                         }
-                    },
+                    }
                     Err(e) => mark_boot_failed(&app, e.to_string()),
                 }
             }
@@ -370,10 +411,12 @@ pub fn run() {
             commands::runtime::fetch_models,
             commands::runtime::stop_all,
             commands::runtime::one_click_login,
+            commands::runtime::restore_history_choice,
             commands::runtime::science_runtime_preflight,
             commands::runtime::open_science_download_page,
             commands::runtime::status,
             commands::runtime::boot_error,
+            commands::runtime::boot_attention,
             commands::runtime::open_url,
             commands::skill_install::install_local_skill_package,
             commands::skill_listing::list_installed_skills,
@@ -422,8 +465,8 @@ mod tests {
     use crate::config::{Config, Profile};
     use crate::runtime::system::redact;
     use crate::{
-        boot_result_error, decide_launch_with_auto_boot, should_begin_boot, AppState, BootState,
-        LaunchPath,
+        boot_result_error, boot_result_needs_attention, decide_launch_with_auto_boot,
+        should_begin_boot, AppState, BootState, LaunchPath,
     };
 
     #[test]
@@ -437,6 +480,12 @@ mod tests {
             Some("gateway recovery degraded")
         );
         assert!(boot_result_error(&serde_json::json!({"status": "ok"})).is_none());
+        assert!(boot_result_needs_attention(
+            &serde_json::json!({"status": "attention", "action": "history_choice_required"})
+        ));
+        assert!(!boot_result_needs_attention(
+            &serde_json::json!({"status": "ok"})
+        ));
     }
 
     #[test]

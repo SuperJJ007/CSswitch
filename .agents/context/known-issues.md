@@ -1,6 +1,12 @@
 # 当前已知问题与证据缺口
 
-最后整理：2026-07-19。已解决历史放入 CHANGELOG 或 dated evidence，不在这里重复。
+最后整理：2026-07-20。已解决历史放入 CHANGELOG 或 dated evidence，不在这里重复。
+
+## v0.8.1 源码候选
+
+- OpenCode Go、Grok 与 Gemini 的 0.8.1 门禁覆盖文本、多轮、tools / `tool_choice`、模型发现或手填、标题和 classifier；图片、厂商专有 reasoning、原生流式与结构化输出仍为 limited，Gemini native API 不在本版范围。
+- 当前建立的是源码、单测与隔离 mock / loopback 证据。OpenCode Go、Grok、Gemini、Kimi、DeepSeek 与 Codex 的用户 key / OAuth live 验收，以及最终安装态 Science 复核，仍需用户逐项授权和凭据输入，不能由本地门禁替代。
+- v0.8.1 尚未形成干净发布 commit、tag、公开附件或 release 回读；在这些层完成前，`.agents/context/current-release.md` 继续以 v0.8.0 为当前公开版本。
 
 ## 分发
 

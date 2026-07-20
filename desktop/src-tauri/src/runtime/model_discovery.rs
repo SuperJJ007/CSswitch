@@ -348,6 +348,8 @@ pub(crate) fn fetch_models(
         &backend,
         &scratch::ScratchTarget {
             provider: &scratch_plan.provider,
+            contract_id: &scratch_plan.contract_id,
+            contract_digest: &scratch_plan.contract_digest,
             key_env,
             base_url: &scratch_plan.endpoint,
             key,
@@ -377,6 +379,7 @@ pub(crate) fn fetch_models(
                 &builtin,
                 &saved_catalog,
             )?;
+            let response = crate::opencode_go_models::filter_discovery_response(tid, response)?;
             let source = response
                 .get("source")
                 .and_then(Value::as_str)
@@ -386,13 +389,14 @@ pub(crate) fn fetch_models(
         }
         scratch::ProbeOutcome::Auth(code) => {
             trace.finish(format!("rejected status={code}"));
-            build_fetch_models_contract_response(
+            let response = build_fetch_models_contract_response(
                 &outcome,
                 res.status,
                 &res.body,
                 &builtin,
                 &saved_catalog,
-            )
+            )?;
+            crate::opencode_go_models::filter_discovery_response(tid, response)
         }
         // 非 200 且非 Auth：一律 builtin 兜底，但按语义分「发现不支持」(4xx) 与「网络/上游临时」(5xx/429/无响应)，
         // 供前端区分提示（spec v3 §3.4.3）。绝不把 Auth 混进来掩盖坏 key。
@@ -403,13 +407,14 @@ pub(crate) fn fetch_models(
                 scratch::discovery_fallback_source(other)
             };
             trace.finish(format!("fallback source={source} outcome={other:?}"));
-            build_fetch_models_contract_response(
+            let response = build_fetch_models_contract_response(
                 &outcome,
                 res.status,
                 &res.body,
                 &builtin,
                 &saved_catalog,
-            )
+            )?;
+            crate::opencode_go_models::filter_discovery_response(tid, response)
         }
     }
 }

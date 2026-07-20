@@ -94,6 +94,10 @@ pub struct GatewayRuntimeJournalIdentity {
     pub provider: String,
     pub shim: String,
     pub launch_id: String,
+    #[serde(default)]
+    pub provider_contract_id: String,
+    #[serde(default)]
+    pub provider_contract_digest: String,
     pub catalog_fp: String,
 }
 
@@ -517,6 +521,11 @@ pub fn migrate_v3_to_v4(v3: crate::config_legacy::ConfigV3) -> io::Result<Config
                     default = manual_default;
                 }
             }
+            let mut bindings = bindings;
+            // A v3 profile had only one model field, so its migrated Sonnet
+            // route must follow that selected default. The remaining role
+            // bindings retain the preset's quality/fast choices.
+            bindings.sonnet = default.clone();
             (routes, default, bindings)
         } else {
             if let Some(model) = legacy_native_model(&p.template_id, &p.model) {
@@ -2678,6 +2687,11 @@ mod tests {
                 "{template_id}:{old_model}"
             );
             assert_eq!(migrated.profiles[0].model_catalog.len(), expected_len);
+            assert_eq!(
+                migrated.profiles[0].role_bindings.sonnet,
+                migrated.profiles[0].default_model_route_id,
+                "{template_id}:{old_model} must keep migrated default/Sonnet aligned"
+            );
         }
 
         let selector = crate::model_catalog::selector_id_v1("qwen", "qwen-turbo");

@@ -7,6 +7,10 @@ pub struct GatewayConfig {
     pub upstream_url: String,
     pub models_url: Option<String>,
     pub relay_thinking: Option<String>,
+    /// Validated contract selected by the Tauri control plane. Standalone
+    /// invocations may use the unique adapter fallback, but managed launches
+    /// always bind an exact id plus the embedded catalog digest.
+    pub(crate) provider_contract: Option<crate::provider_contracts::ProviderRuntimeContract>,
     pub intent: GatewayIntent,
     /// Non-Codex profiles receive a validated, non-sensitive selector snapshot.
     pub static_model_resolver: Option<crate::static_profile::StaticProfileResolver>,
@@ -148,6 +152,69 @@ pub fn openai_endpoint(base: &str, suffix: &str) -> String {
     root
 }
 
+fn normalize_anthropic_v1_base(base: &str) -> String {
+    let mut root = base.trim().trim_end_matches('/').to_string();
+    for suffix in ["/messages", "/models"] {
+        if root.ends_with(suffix) {
+            root.truncate(root.len() - suffix.len());
+            while root.ends_with('/') {
+                root.pop();
+            }
+            break;
+        }
+    }
+    if !root.ends_with("/v1") {
+        root.push_str("/v1");
+    }
+    root
+}
+
+fn joined_endpoints(
+    join: crate::provider_contracts::EndpointJoin,
+    transport: &str,
+    base: &str,
+) -> Result<(String, Option<String>), String> {
+    use crate::provider_contracts::EndpointJoin;
+
+    let inference_suffix = match transport {
+        "anthropic_messages" => "/messages",
+        "openai_chat" => "/chat/completions",
+        "openai_responses" => "/responses",
+        _ => return Err("provider contract transport cannot use a profile endpoint".into()),
+    };
+    match join {
+        EndpointJoin::AnthropicV1 => {
+            if transport != "anthropic_messages" {
+                return Err("anthropic endpoint join requires Anthropic transport".into());
+            }
+            let root = normalize_anthropic_v1_base(base);
+            Ok((format!("{root}/messages"), Some(format!("{root}/models"))))
+        }
+        EndpointJoin::OpenaiV1 => {
+            if !matches!(transport, "openai_chat" | "openai_responses") {
+                return Err("OpenAI endpoint join requires OpenAI transport".into());
+            }
+            Ok((
+                openai_endpoint(base, inference_suffix),
+                Some(openai_endpoint(base, "/models")),
+            ))
+        }
+        EndpointJoin::OpenaiPath => {
+            if !matches!(transport, "openai_chat" | "openai_responses") {
+                return Err("OpenAI path join requires OpenAI transport".into());
+            }
+            let root = normalize_openai_base(base);
+            Ok((
+                format!("{root}{inference_suffix}"),
+                Some(format!("{root}/models")),
+            ))
+        }
+        EndpointJoin::ManagedOfficial => {
+            Err("managed official endpoint cannot use a profile base".into())
+        }
+    }
+}
+
 fn upstream_url_for(
     provider: &str,
     default_upstream: String,
@@ -199,22 +266,24 @@ impl GatewayConfig {
             ));
         }
 
-        let key_env = match provider.as_str() {
-            "qwen" => "DASHSCOPE_API_KEY",
-            "openai-custom" | "openai-responses" => "CSSWITCH_OPENAI_KEY",
-            "relay" => "CSSWITCH_RELAY_KEY",
-            _ => "DEEPSEEK_API_KEY",
-        };
-        let api_key = if provider == "codex" {
-            None
-        } else {
-            Some(
+        let expected_contract_id = std::env::var("CSSWITCH_PROVIDER_CONTRACT_ID").ok();
+        let expected_contract_digest = std::env::var("CSSWITCH_PROVIDER_CONTRACT_DIGEST").ok();
+        let provider_contract = crate::provider_contracts::load_runtime_contract(
+            &provider,
+            expected_contract_id.as_deref(),
+            expected_contract_digest.as_deref(),
+        )?;
+        let key_env = provider_contract.api_key_env.as_deref().unwrap_or("");
+        let api_key = match provider_contract.auth_mode.as_str() {
+            "csswitch_oauth" | "none" => None,
+            "api_key" => Some(
                 std::env::var(key_env)
                     .ok()
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty())
                     .ok_or_else(|| format!("缺少 {key_env}"))?,
-            )
+            ),
+            _ => return Err("provider contract auth mode is unsupported".into()),
         };
         let auth_secret = std::env::var("CSSWITCH_AUTH_TOKEN")
             .ok()
@@ -223,35 +292,35 @@ impl GatewayConfig {
             .filter(|v| !v.is_empty());
         let mut models_url = None;
         let mut relay_thinking = None;
-        let default_upstream = if provider == "openai-custom" || provider == "openai-responses" {
-            let base = std::env::var("CSSWITCH_OPENAI_BASE_URL")
-                .ok()
-                .map(|v| normalize_openai_base(&v))
-                .filter(|v| {
-                    !v.is_empty() && (v.starts_with("http://") || v.starts_with("https://"))
-                })
-                .ok_or_else(|| format!("{provider} 需要 CSSWITCH_OPENAI_BASE_URL=http(s)://..."))?;
-            models_url = Some(openai_endpoint(&base, "/models"));
-            let suffix = if provider == "openai-responses" {
-                "/responses"
+        let default_upstream = if provider_contract.endpoint_policy == "profile_required" {
+            let base_env = if matches!(
+                provider_contract.transport.as_str(),
+                "openai_chat" | "openai_responses"
+            ) {
+                "CSSWITCH_OPENAI_BASE_URL"
             } else {
-                "/chat/completions"
+                "CSSWITCH_RELAY_BASE_URL"
             };
-            openai_endpoint(&base, suffix)
-        } else if provider == "relay" {
-            let base = std::env::var("CSSWITCH_RELAY_BASE_URL")
+            let base = std::env::var(base_env)
                 .ok()
-                .map(|v| v.trim().trim_end_matches('/').to_string())
+                .map(|value| value.trim().trim_end_matches('/').to_string())
                 .filter(|v| {
                     !v.is_empty() && (v.starts_with("http://") || v.starts_with("https://"))
                 })
-                .ok_or("relay 需要 CSSWITCH_RELAY_BASE_URL=http(s)://...")?;
-            models_url = Some(format!("{base}/v1/models"));
-            relay_thinking = std::env::var("CSSWITCH_RELAY_THINKING")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty());
-            format!("{base}/v1/messages")
+                .ok_or_else(|| format!("{provider} 需要 {base_env}=http(s)://..."))?;
+            let (inference, discovered_models) = joined_endpoints(
+                provider_contract.endpoint_join,
+                &provider_contract.transport,
+                &base,
+            )?;
+            models_url = discovered_models;
+            if provider_contract.transport == "anthropic_messages" {
+                relay_thinking = std::env::var("CSSWITCH_RELAY_THINKING")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+            }
+            inference
         } else if provider == "qwen" {
             DEFAULT_QWEN_UPSTREAM_URL.to_string()
         } else if provider == "codex" {
@@ -268,6 +337,15 @@ impl GatewayConfig {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let managed_launch_id = (24..=128).contains(&launch_id.len())
+            && launch_id.chars().all(|value| value.is_ascii_hexdigit());
+        if managed_launch_id
+            && (expected_contract_id.is_none() || expected_contract_digest.is_none())
+        {
+            return Err(
+                "managed gateway launch requires an exact provider contract identity".into(),
+            );
+        }
         let codex_state_root = if provider == "codex" {
             Some(
                 std::env::var_os("HOME")
@@ -280,17 +358,9 @@ impl GatewayConfig {
             None
         };
         let codex_contract = if provider == "codex" {
-            let contract = crate::provider_contracts::load_codex_runtime_contract()?;
-            crate::provider_contracts::validate_managed_identity(
-                &contract,
-                std::env::var("CSSWITCH_PROVIDER_CONTRACT_ID")
-                    .ok()
-                    .as_deref(),
-                std::env::var("CSSWITCH_PROVIDER_CONTRACT_DIGEST")
-                    .ok()
-                    .as_deref(),
-            )?;
-            Some(contract)
+            Some(crate::provider_contracts::codex_contract_from_runtime(
+                &provider_contract,
+            )?)
         } else {
             None
         };
@@ -356,6 +426,7 @@ impl GatewayConfig {
             upstream_url,
             models_url,
             relay_thinking,
+            provider_contract: Some(provider_contract),
             intent,
             static_model_resolver,
             shim_mode: shim.to_string(),
@@ -373,9 +444,10 @@ impl GatewayConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_shim_mode, normalize_openai_base, openai_endpoint, provider_supported, shim_mode,
-        upstream_url_for,
+        canonical_shim_mode, joined_endpoints, normalize_openai_base, openai_endpoint,
+        provider_supported, shim_mode, upstream_url_for,
     };
+    use crate::provider_contracts::EndpointJoin;
 
     #[test]
     fn shim_mode_parses_deepseek_off_contract() {
@@ -436,6 +508,75 @@ mod tests {
         assert_eq!(
             openai_endpoint("https://api.siliconflow.cn", "/chat/completions"),
             "https://api.siliconflow.cn/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn endpoint_join_policies_cover_full_urls_xai_gemini_and_opencode() {
+        assert_eq!(
+            joined_endpoints(EndpointJoin::OpenaiV1, "openai_chat", "https://api.x.ai/v1").unwrap(),
+            (
+                "https://api.x.ai/v1/chat/completions".into(),
+                Some("https://api.x.ai/v1/models".into())
+            )
+        );
+        assert_eq!(
+            joined_endpoints(
+                EndpointJoin::OpenaiV1,
+                "openai_chat",
+                "https://api.x.ai/v1/chat/completions"
+            )
+            .unwrap()
+            .0,
+            "https://api.x.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            joined_endpoints(
+                EndpointJoin::OpenaiPath,
+                "openai_chat",
+                "https://generativelanguage.googleapis.com/v1beta/openai"
+            )
+            .unwrap(),
+            (
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".into(),
+                Some("https://generativelanguage.googleapis.com/v1beta/openai/models".into())
+            )
+        );
+        assert_eq!(
+            joined_endpoints(
+                EndpointJoin::AnthropicV1,
+                "anthropic_messages",
+                "https://opencode.ai/zen/go/v1/messages"
+            )
+            .unwrap(),
+            (
+                "https://opencode.ai/zen/go/v1/messages".into(),
+                Some("https://opencode.ai/zen/go/v1/models".into())
+            )
+        );
+        assert_eq!(
+            joined_endpoints(
+                EndpointJoin::AnthropicV1,
+                "anthropic_messages",
+                "https://opencode.ai/zen/go/v1"
+            )
+            .unwrap(),
+            (
+                "https://opencode.ai/zen/go/v1/messages".into(),
+                Some("https://opencode.ai/zen/go/v1/models".into())
+            )
+        );
+        assert_eq!(
+            joined_endpoints(
+                EndpointJoin::AnthropicV1,
+                "anthropic_messages",
+                "https://relay.example.test/anthropic"
+            )
+            .unwrap(),
+            (
+                "https://relay.example.test/anthropic/v1/messages".into(),
+                Some("https://relay.example.test/anthropic/v1/models".into())
+            )
         );
     }
 

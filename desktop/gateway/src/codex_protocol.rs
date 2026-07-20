@@ -351,7 +351,26 @@ pub fn translate_anthropic_request(
     }
     let tools = translate_tools(object.get("tools"), &mut text_bytes)?;
     let has_tools = !tools.is_empty();
+    if context.use_responses_lite {
+        if let Some(choice) = object.get("tool_choice") {
+            let kind = choice
+                .as_str()
+                .or_else(|| choice.get("type").and_then(Value::as_str))
+                .ok_or_else(|| ProtocolError::invalid("tool choice is invalid"))?;
+            if kind != "auto" {
+                return Err(ProtocolError::invalid(
+                    "tool choice is unsupported for Responses Lite",
+                ));
+            }
+        }
+    }
     let tool_choice = translate_tool_choice(object.get("tool_choice"), &tools)?;
+    let output_format = translate_output_format(object)?;
+    if context.use_responses_lite && output_format.is_some() {
+        return Err(ProtocolError::invalid(
+            "structured output is unsupported for Responses Lite",
+        ));
+    }
     let instructions = translate_system(object.get("system"), &mut text_bytes)?;
     let reasoning_disabled = !context.use_responses_lite
         && object
@@ -437,6 +456,12 @@ pub fn translate_anthropic_request(
             .as_object_mut()
             .expect("translated request is an object")
             .insert("reasoning".into(), reasoning);
+    }
+    if let Some(format) = output_format {
+        translated
+            .as_object_mut()
+            .expect("translated request is an object")
+            .insert("text".into(), json!({"format": format}));
     }
     if !context.use_responses_lite && instructions.is_empty() {
         translated
@@ -735,15 +760,375 @@ fn translate_tools(
                 .get("input_schema")
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+            let strict = match tool.get("strict") {
+                Some(Value::Bool(strict)) => *strict,
+                Some(_) => return Err(ProtocolError::invalid("tool strict flag is invalid")),
+                None => false,
+            };
+            if strict {
+                validate_openai_strict_schema(&parameters)?;
+            }
             Ok(json!({
                 "type": "function",
                 "name": name,
                 "description": description,
                 "parameters": parameters,
-                "strict": false,
+                "strict": strict,
             }))
         })
         .collect()
+}
+
+fn translate_output_format(object: &Map<String, Value>) -> Result<Option<Value>, ProtocolError> {
+    let current = match object.get("output_config") {
+        None => None,
+        Some(Value::Object(config)) => {
+            if config.contains_key("effort") {
+                return Err(ProtocolError::invalid(
+                    "output_config.effort is unsupported for Codex",
+                ));
+            }
+            if config.keys().any(|key| key != "format") {
+                return Err(ProtocolError::invalid(
+                    "output_config field is unsupported for Codex",
+                ));
+            }
+            config.get("format")
+        }
+        Some(_) => return Err(ProtocolError::invalid("output_config is invalid")),
+    };
+    let legacy = object.get("output_format");
+    if current.is_some() && legacy.is_some() {
+        return Err(ProtocolError::invalid(
+            "output_config.format and output_format cannot both be set",
+        ));
+    }
+    let Some(format) = current.or(legacy) else {
+        return Ok(None);
+    };
+    let format = format
+        .as_object()
+        .ok_or_else(|| ProtocolError::invalid("structured output format is invalid"))?;
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return Err(ProtocolError::invalid(
+            "structured output format type is unsupported",
+        ));
+    }
+    let schema = format
+        .get("schema")
+        .filter(|schema| schema.is_object())
+        .cloned()
+        .ok_or_else(|| ProtocolError::invalid("structured output schema is invalid"))?;
+    validate_openai_strict_schema(&schema)?;
+    let encoded = serde_json::to_vec(&schema)
+        .map_err(|_| ProtocolError::invalid("structured output schema is invalid"))?;
+    if encoded.len() > MAX_REQUEST_BYTES {
+        return Err(ProtocolError::bounds("request is too large"));
+    }
+    let digest = hex_digest(&encoded);
+    Ok(Some(json!({
+        "type": "json_schema",
+        "name": format!("csswitch_{}", &digest[..16]),
+        "schema": schema,
+        "strict": true,
+    })))
+}
+
+fn validate_openai_strict_schema(schema: &Value) -> Result<(), ProtocolError> {
+    const MAX_SCHEMA_DEPTH: usize = 10;
+    const MAX_SCHEMA_NODES: usize = 20_000;
+    const MAX_PROPERTIES: usize = 5_000;
+    const MAX_STRING_CHARS: usize = 120_000;
+    const MAX_ENUM_VALUES: usize = 1_000;
+    const LARGE_ENUM_THRESHOLD: usize = 250;
+    const MAX_LARGE_ENUM_STRING_CHARS: usize = 15_000;
+    const ALLOWED_TYPES: [&str; 7] = [
+        "string", "number", "boolean", "integer", "object", "array", "null",
+    ];
+    const COMMON_KEYS: [&str; 5] = ["type", "description", "enum", "const", "$defs"];
+
+    fn checked_add(total: &mut usize, amount: usize, limit: usize) -> bool {
+        let Some(next) = total.checked_add(amount) else {
+            return false;
+        };
+        if next > limit {
+            return false;
+        }
+        *total = next;
+        true
+    }
+
+    fn parsed_types(object: &Map<String, Value>) -> Option<Vec<&str>> {
+        let raw = object.get("type")?;
+        let kinds = match raw {
+            Value::String(kind) => vec![kind.as_str()],
+            Value::Array(kinds) => {
+                let kinds: Vec<_> = kinds.iter().map(Value::as_str).collect::<Option<_>>()?;
+                if kinds.len() != 2
+                    || !kinds.contains(&"null")
+                    || kinds.iter().all(|kind| *kind == "null")
+                {
+                    return None;
+                }
+                kinds
+            }
+            _ => return None,
+        };
+        let unique: std::collections::HashSet<_> = kinds.iter().copied().collect();
+        (unique.len() == kinds.len() && kinds.iter().all(|kind| ALLOWED_TYPES.contains(kind)))
+            .then_some(kinds)
+    }
+
+    fn value_matches_types(value: &Value, kinds: &[&str]) -> bool {
+        kinds.iter().any(|kind| match *kind {
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "integer" => value
+                .as_number()
+                .is_some_and(|number| number.is_i64() || number.is_u64()),
+            "null" => value.is_null(),
+            _ => false,
+        })
+    }
+
+    let Some(root) = schema.as_object() else {
+        return Err(ProtocolError::invalid(
+            "schema is incompatible with OpenAI strict mode",
+        ));
+    };
+    if root.get("type").and_then(Value::as_str) != Some("object") || root.contains_key("anyOf") {
+        return Err(ProtocolError::invalid(
+            "schema is incompatible with OpenAI strict mode",
+        ));
+    }
+
+    // OpenAI's ten-level limit counts the root schema as level one. Every
+    // property, items, anyOf branch, or definition schema advances one level.
+    let mut stack = vec![(schema, 1_usize)];
+    let mut nodes = 0_usize;
+    let mut properties_total = 0_usize;
+    let mut string_chars_total = 0_usize;
+    let mut enum_values_total = 0_usize;
+    let mut valid = true;
+
+    while let Some((current, schema_depth)) = stack.pop() {
+        if schema_depth > MAX_SCHEMA_DEPTH || !checked_add(&mut nodes, 1, MAX_SCHEMA_NODES) {
+            valid = false;
+            break;
+        }
+        let Some(object) = current.as_object() else {
+            valid = false;
+            break;
+        };
+
+        if let Some(reference) = object.get("$ref") {
+            let Some(reference) = reference.as_str() else {
+                valid = false;
+                break;
+            };
+            let definition_name = reference.strip_prefix("#/$defs/");
+            let exact_definition = definition_name.is_some_and(|name| {
+                !name.is_empty()
+                    && !name.contains('/')
+                    && schema
+                        .pointer(&reference[1..])
+                        .and_then(Value::as_object)
+                        .is_some()
+            });
+            if object.len() != 1 || (reference != "#" && !exact_definition) {
+                valid = false;
+                break;
+            }
+            continue;
+        }
+
+        if object
+            .get("description")
+            .is_some_and(|description| !description.is_string())
+        {
+            valid = false;
+            break;
+        }
+
+        if let Some(branches) = object.get("anyOf") {
+            let allowed = ["anyOf", "description", "$defs"];
+            let Some(branches) = branches.as_array() else {
+                valid = false;
+                break;
+            };
+            if branches.len() < 2 || object.keys().any(|key| !allowed.contains(&key.as_str())) {
+                valid = false;
+                break;
+            }
+            for branch in branches {
+                stack.push((branch, schema_depth + 1));
+            }
+        } else {
+            let Some(kinds) = parsed_types(object) else {
+                valid = false;
+                break;
+            };
+            let is_object = kinds.contains(&"object");
+            let is_array = kinds.contains(&"array");
+            let mut allowed: std::collections::HashSet<&str> = COMMON_KEYS.into_iter().collect();
+            if is_object {
+                allowed.extend(["properties", "required", "additionalProperties"]);
+                let Some(properties) = object.get("properties").and_then(Value::as_object) else {
+                    valid = false;
+                    break;
+                };
+                if object.get("additionalProperties").and_then(Value::as_bool) != Some(false)
+                    || !checked_add(&mut properties_total, properties.len(), MAX_PROPERTIES)
+                {
+                    valid = false;
+                    break;
+                }
+                let Some(required) = object.get("required").and_then(Value::as_array) else {
+                    valid = false;
+                    break;
+                };
+                let Some(required_names): Option<Vec<_>> =
+                    required.iter().map(Value::as_str).collect()
+                else {
+                    valid = false;
+                    break;
+                };
+                let required_set: std::collections::HashSet<_> =
+                    required_names.iter().copied().collect();
+                if required_set.len() != required_names.len()
+                    || required_set.len() != properties.len()
+                    || properties
+                        .keys()
+                        .any(|key| !required_set.contains(key.as_str()))
+                {
+                    valid = false;
+                    break;
+                }
+                for (name, child) in properties {
+                    if !checked_add(
+                        &mut string_chars_total,
+                        name.chars().count(),
+                        MAX_STRING_CHARS,
+                    ) {
+                        valid = false;
+                        break;
+                    }
+                    stack.push((child, schema_depth + 1));
+                }
+                if !valid {
+                    break;
+                }
+            }
+            if is_array {
+                allowed.insert("items");
+                let Some(items) = object.get("items").filter(|items| items.is_object()) else {
+                    valid = false;
+                    break;
+                };
+                stack.push((items, schema_depth + 1));
+            }
+            if object.keys().any(|key| !allowed.contains(key.as_str())) {
+                valid = false;
+                break;
+            }
+
+            if object.contains_key("enum") && object.contains_key("const") {
+                valid = false;
+                break;
+            }
+            if let Some(values) = object.get("enum") {
+                let Some(values) = values.as_array() else {
+                    valid = false;
+                    break;
+                };
+                if values.is_empty()
+                    || !checked_add(&mut enum_values_total, values.len(), MAX_ENUM_VALUES)
+                {
+                    valid = false;
+                    break;
+                }
+                let mut encoded = std::collections::HashSet::new();
+                let mut enum_string_chars = 0_usize;
+                for value in values {
+                    let Ok(serialized) = serde_json::to_string(value) else {
+                        valid = false;
+                        break;
+                    };
+                    let Some(next_enum_chars) = enum_string_chars
+                        .checked_add(value.as_str().map_or(0, |value| value.chars().count()))
+                    else {
+                        valid = false;
+                        break;
+                    };
+                    enum_string_chars = next_enum_chars;
+                    if !value_matches_types(value, &kinds)
+                        || !encoded.insert(serialized.clone())
+                        || !checked_add(
+                            &mut string_chars_total,
+                            serialized.chars().count(),
+                            MAX_STRING_CHARS,
+                        )
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+                if !valid
+                    || (values.len() > LARGE_ENUM_THRESHOLD
+                        && enum_string_chars > MAX_LARGE_ENUM_STRING_CHARS)
+                {
+                    valid = false;
+                    break;
+                }
+            }
+            if let Some(value) = object.get("const") {
+                let Ok(serialized) = serde_json::to_string(value) else {
+                    valid = false;
+                    break;
+                };
+                if !value_matches_types(value, &kinds)
+                    || !checked_add(
+                        &mut string_chars_total,
+                        serialized.chars().count(),
+                        MAX_STRING_CHARS,
+                    )
+                {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+
+        if let Some(definitions) = object.get("$defs") {
+            let Some(definitions) = definitions.as_object() else {
+                valid = false;
+                break;
+            };
+            for (name, definition) in definitions {
+                if !checked_add(
+                    &mut string_chars_total,
+                    name.chars().count(),
+                    MAX_STRING_CHARS,
+                ) {
+                    valid = false;
+                    break;
+                }
+                stack.push((definition, schema_depth + 1));
+            }
+            if !valid {
+                break;
+            }
+        }
+    }
+
+    if valid {
+        Ok(())
+    } else {
+        Err(ProtocolError::invalid(
+            "schema is incompatible with OpenAI strict mode",
+        ))
+    }
 }
 
 struct ToolChoiceTranslation {
@@ -2114,7 +2499,7 @@ mod tests {
                 "description": "read a file",
                 "input_schema": {"type": "object"}
             }],
-            "tool_choice": {"type": "tool", "name": "read"},
+            "tool_choice": {"type": "auto"},
             "thinking": {"type": "disabled"}
         });
         let lite = RequestContext {
@@ -2138,6 +2523,343 @@ mod tests {
         assert_eq!(translated["reasoning"]["effort"], "high");
         assert_eq!(translated["reasoning"]["summary"], "auto");
         assert_eq!(translated["reasoning"]["context"], "all_turns");
+    }
+
+    #[test]
+    fn translator_rejects_non_equivalent_lite_tool_choices_before_transport() {
+        let lite = RequestContext {
+            target_model: "gpt-5.6-sol",
+            use_responses_lite: true,
+            ..context()
+        };
+        for (tool_choice, tools) in [
+            (
+                json!({"type": "tool", "name": "read"}),
+                json!([{"name": "read", "input_schema": {"type": "object"}}]),
+            ),
+            (
+                json!({"type": "any"}),
+                json!([{"name": "read", "input_schema": {"type": "object"}}]),
+            ),
+            (
+                json!({"type": "none"}),
+                json!([{"name": "read", "input_schema": {"type": "object"}}]),
+            ),
+            (json!({"type": "none"}), json!([])),
+            (json!({"type": "required"}), json!([])),
+        ] {
+            let request = json!({
+                "messages": [{"role": "user", "content": "use it"}],
+                "tools": tools,
+                "tool_choice": tool_choice,
+            });
+            assert!(matches!(
+                translate_anthropic_request(&request, &lite, &signer()),
+                Err(ProtocolError {
+                    kind: ProtocolErrorKind::InvalidRequest,
+                    detail: "tool choice is unsupported for Responses Lite"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn translator_preserves_strict_tools_and_maps_both_structured_output_inputs() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+            "additionalProperties": false,
+        });
+        for request_format in [
+            json!({"output_config": {"format": {"type": "json_schema", "schema": schema}}}),
+            json!({"output_format": {"type": "json_schema", "schema": schema}}),
+        ] {
+            let mut request = json!({
+                "messages": [{"role": "user", "content": "make a title"}],
+                "tools": [{
+                    "name": "create_work_item",
+                    "strict": true,
+                    "input_schema": schema,
+                }],
+                "tool_choice": {"type": "tool", "name": "create_work_item"},
+            });
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(request_format.as_object().unwrap().clone());
+            let translated = translate_anthropic_request(&request, &context(), &signer()).unwrap();
+            assert_eq!(translated["tools"][0]["strict"], true);
+            assert_eq!(translated["tools"][0]["parameters"], schema);
+            assert_eq!(translated["text"]["format"]["type"], "json_schema");
+            assert_eq!(translated["text"]["format"]["schema"], schema);
+            assert_eq!(translated["text"]["format"]["strict"], true);
+            assert!(translated["text"]["format"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("csswitch_")));
+        }
+    }
+
+    #[test]
+    fn translator_rejects_structured_output_ambiguity_and_lite_before_transport() {
+        let schema = json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false,
+        });
+        let ambiguous = json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "output_config": {"format": {"type": "json_schema", "schema": schema}},
+            "output_format": {"type": "json_schema", "schema": schema},
+        });
+        assert!(translate_anthropic_request(&ambiguous, &context(), &signer()).is_err());
+
+        let lite = RequestContext {
+            target_model: "gpt-5.6-sol",
+            use_responses_lite: true,
+            ..context()
+        };
+        let request = json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "output_config": {"format": {"type": "json_schema", "schema": schema}},
+        });
+        assert!(matches!(
+            translate_anthropic_request(&request, &lite, &signer()),
+            Err(ProtocolError {
+                kind: ProtocolErrorKind::InvalidRequest,
+                detail: "structured output is unsupported for Responses Lite"
+            })
+        ));
+    }
+
+    #[test]
+    fn translator_rejects_anthropic_schemas_that_are_not_openai_strict() {
+        let optional_property = json!({
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+            "required": ["title"],
+            "additionalProperties": false,
+        });
+        let nested_object_without_closed_properties = json!({
+            "type": "object",
+            "properties": {
+                "metadata": {
+                    "type": "object",
+                    "properties": {"source": {"type": "string"}},
+                    "required": ["source"],
+                },
+            },
+            "required": ["metadata"],
+            "additionalProperties": false,
+        });
+        let malformed_ref_target = json!({
+            "type": "object",
+            "properties": {"item": {"$ref": "#/$defs"}},
+            "$defs": {"item": {"type": "string"}},
+            "required": ["item"],
+            "additionalProperties": false,
+        });
+
+        for schema in [
+            optional_property.clone(),
+            nested_object_without_closed_properties,
+            malformed_ref_target,
+        ] {
+            let request = json!({
+                "messages": [{"role": "user", "content": "make a title"}],
+                "output_config": {
+                    "format": {"type": "json_schema", "schema": schema},
+                },
+            });
+            assert!(matches!(
+                translate_anthropic_request(&request, &context(), &signer()),
+                Err(ProtocolError {
+                    kind: ProtocolErrorKind::InvalidRequest,
+                    detail: "schema is incompatible with OpenAI strict mode"
+                })
+            ));
+        }
+
+        let strict_tool = json!({
+            "messages": [{"role": "user", "content": "make a title"}],
+            "tools": [{
+                "name": "create_work_item",
+                "strict": true,
+                "input_schema": optional_property,
+            }],
+        });
+        assert!(matches!(
+            translate_anthropic_request(&strict_tool, &context(), &signer()),
+            Err(ProtocolError {
+                kind: ProtocolErrorKind::InvalidRequest,
+                detail: "schema is incompatible with OpenAI strict mode"
+            })
+        ));
+    }
+
+    #[test]
+    fn strict_schema_validator_is_whitelist_based_bounded_and_ref_safe() {
+        let valid = json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/item"},
+                },
+                "note": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "null"},
+                    ],
+                },
+            },
+            "$defs": {
+                "item": {
+                    "type": "object",
+                    "properties": {"value": {"type": "integer"}},
+                    "required": ["value"],
+                    "additionalProperties": false,
+                },
+            },
+            "required": ["items", "note"],
+            "additionalProperties": false,
+        });
+        validate_openai_strict_schema(&valid).unwrap();
+
+        for invalid in [
+            json!({
+                "type": "object",
+                "properties": {"bad": {"type": "bogus"}},
+                "required": ["bad"],
+                "additionalProperties": false,
+            }),
+            json!({
+                "type": "object",
+                "properties": {"bad": {"$ref": "#/$defs/missing"}},
+                "required": ["bad"],
+                "additionalProperties": false,
+            }),
+            json!({
+                "type": "object",
+                "properties": {"bad": {"$ref": "#/$defs"}},
+                "$defs": {"item": {"type": "string"}},
+                "required": ["bad"],
+                "additionalProperties": false,
+            }),
+            json!({
+                "type": "object",
+                "properties": {"bad": {"$ref": "#/properties"}},
+                "required": ["bad"],
+                "additionalProperties": false,
+            }),
+            json!({
+                "type": "object",
+                "properties": {"bad": {"$ref": "https://example.invalid/schema"}},
+                "required": ["bad"],
+                "additionalProperties": false,
+            }),
+            json!({
+                "type": "object",
+                "properties": {"bad": {"type": "array"}},
+                "required": ["bad"],
+                "additionalProperties": false,
+            }),
+            json!({
+                "type": "object",
+                "properties": {"bad": {"type": "string", "minLength": 1}},
+                "required": ["bad"],
+                "additionalProperties": false,
+            }),
+        ] {
+            assert!(
+                validate_openai_strict_schema(&invalid).is_err(),
+                "{invalid}"
+            );
+        }
+
+        let mut too_deep = json!({"type": "string"});
+        for _ in 0..10 {
+            too_deep = json!({
+                "type": "object",
+                "properties": {"next": too_deep},
+                "required": ["next"],
+                "additionalProperties": false,
+            });
+        }
+        let too_deep = json!({
+            "type": "object",
+            "properties": {"next": too_deep},
+            "required": ["next"],
+            "additionalProperties": false,
+        });
+        assert!(validate_openai_strict_schema(&too_deep).is_err());
+
+        let mut too_many_properties = Map::new();
+        let mut too_many_required = Vec::new();
+        for index in 0..=5_000 {
+            let name = format!("field_{index}");
+            too_many_properties.insert(name.clone(), json!({"type": "string"}));
+            too_many_required.push(Value::String(name));
+        }
+        let too_many_properties = json!({
+            "type": "object",
+            "properties": too_many_properties,
+            "required": too_many_required,
+            "additionalProperties": false,
+        });
+        assert!(validate_openai_strict_schema(&too_many_properties).is_err());
+
+        fn wrap_root(child: Value) -> Value {
+            json!({
+                "type": "object",
+                "properties": {"value": child},
+                "required": ["value"],
+                "additionalProperties": false,
+            })
+        }
+        fn nested_arrays(count: usize) -> Value {
+            (0..count).fold(
+                json!({"type": "string"}),
+                |child, _| json!({"type": "array", "items": child}),
+            )
+        }
+        fn nested_any_of(count: usize) -> Value {
+            (0..count).fold(
+                json!({"type": "string"}),
+                |child, _| json!({"anyOf": [child, {"type": "null"}]}),
+            )
+        }
+
+        // root (1) + eight wrappers + leaf (10) is accepted.
+        validate_openai_strict_schema(&wrap_root(nested_arrays(8))).unwrap();
+        validate_openai_strict_schema(&wrap_root(nested_any_of(8))).unwrap();
+        // A ninth wrapper puts the leaf at level 11 and must fail locally.
+        assert!(validate_openai_strict_schema(&wrap_root(nested_arrays(9))).is_err());
+        assert!(validate_openai_strict_schema(&wrap_root(nested_any_of(9))).is_err());
+        let mixed = (0..5).fold(
+            nested_arrays(4),
+            |child, _| json!({"anyOf": [child, {"type": "null"}]}),
+        );
+        assert!(validate_openai_strict_schema(&wrap_root(mixed)).is_err());
+    }
+
+    #[test]
+    fn translator_rejects_unmapped_anthropic_effort_before_transport() {
+        let request = json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "output_config": {"effort": "high"},
+        });
+        assert!(matches!(
+            translate_anthropic_request(&request, &context(), &signer()),
+            Err(ProtocolError {
+                kind: ProtocolErrorKind::InvalidRequest,
+                detail: "output_config.effort is unsupported for Codex"
+            })
+        ));
     }
 
     #[test]
@@ -2256,6 +2978,46 @@ mod tests {
         assert!(reducer
             .apply(json!({"type": "response.output_item.done", "item": {"type": "function_call", "id": "fc", "call_id": "c", "name": "t", "arguments": "{\"different\":true}"}}))
             .is_err());
+    }
+
+    #[test]
+    fn reducer_preserves_title_summary_and_status_as_plain_strings() {
+        let signer = signer();
+        let mut reducer = ResponsesReducer::new("gpt-standard", EPOCH, ACCOUNT, &signer);
+        let arguments = json!({
+            "title": "Plan the migration",
+            "task_summary": "Review the gateway contracts",
+            "status_description": "Checking model routing",
+        });
+        let encoded = serde_json::to_string(&arguments).unwrap();
+        for event in [
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "item": {
+                "type": "function_call",
+                "id": "fc",
+                "call_id": "call",
+                "name": "create_work_item",
+            }}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc", "delta": encoded}),
+            json!({"type": "response.output_item.done", "item": {
+                "type": "function_call",
+                "id": "fc",
+                "call_id": "call",
+                "name": "create_work_item",
+                "arguments": encoded,
+            }}),
+            json!({"type": "response.completed", "response": {
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }}),
+        ] {
+            reducer.apply(event).unwrap();
+        }
+        let response = reducer.nonstream_response().unwrap();
+        let input = &response["content"][0]["input"];
+        assert_eq!(input, &arguments);
+        for field in ["title", "task_summary", "status_description"] {
+            assert!(input[field].is_string());
+        }
     }
 
     #[test]

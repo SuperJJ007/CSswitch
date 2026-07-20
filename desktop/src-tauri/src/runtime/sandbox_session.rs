@@ -23,7 +23,10 @@ use crate::runtime::skill_install_bridge::{
     register_before_science_start, route_configuration_is_current, RegistrationStatus,
 };
 use crate::runtime::system::{asset_root, log_path, open_in_browser, open_log, redact, tail_file};
-use crate::{config, lifecycle, lock, oauth_forge, proc, AppState, SharedAppState};
+use crate::{
+    config, lifecycle, lock, oauth_forge, proc, AppState, HistoryRecoveryChoice,
+    HistoryRecoverySession, SharedAppState,
+};
 
 fn stop_sandbox_state<R: Runtime>(
     app: &tauri::AppHandle<R>,
@@ -430,6 +433,12 @@ fn one_click_login_with_options<R: Runtime>(
             let login_intact =
                 oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home);
             if login_intact && science_binding_matches {
+                oauth_forge::bootstrap_marker_for_intact_login(
+                    &auth_dir,
+                    "virtual@localhost.invalid",
+                    &sbx_home,
+                )
+                .map_err(|error| format!("补齐历史恢复标记失败：{error}"))?;
                 let (_pport, secret, proxy_action) = ensure_proxy(
                     &app,
                     &state,
@@ -567,9 +576,66 @@ fn one_click_login_with_options<R: Runtime>(
     lock(&state).science_confirmed_stopped = None;
 
     trace.stage(OperationStage::SandboxLogin, "ensure_virtual_login");
-    let (forged, login_action) =
-        oauth_forge::ensure_virtual_login(&auth_dir, "virtual@localhost.invalid", &sbx_home)
-            .map_err(|e| format!("写虚拟登录失败：{e}"))?;
+    let (forged, login_action) = match oauth_forge::ensure_virtual_login(
+        &auth_dir,
+        "virtual@localhost.invalid",
+        &sbx_home,
+    ) {
+        Ok(result) => result,
+        Err(oauth_forge::EnsureVirtualLoginError::HistoryChoiceRequired(candidates)) => {
+            if candidates.len() > 64 {
+                return Err("历史记录候选超过安全上限（64），已拒绝生成恢复会话".into());
+            }
+            let choices: Vec<HistoryRecoveryChoice> = candidates
+                .into_iter()
+                .map(|candidate| HistoryRecoveryChoice {
+                    reference: config::new_id(),
+                    candidate,
+                })
+                .collect();
+            let visible_choices: Vec<Value> = choices
+                .iter()
+                .enumerate()
+                .map(|(index, choice)| {
+                    let label = if index < 26 {
+                        format!("历史记录 {}", (b'A' + index as u8) as char)
+                    } else {
+                        format!("历史记录 {}", index + 1)
+                    };
+                    json!({
+                        "reference": choice.reference,
+                        "label": label
+                    })
+                })
+                .collect();
+            {
+                let mut app_state = lock(&state);
+                app_state.science_confirmed_stopped = Some(launch_runtime.clone());
+                app_state.history_recovery = Some(HistoryRecoverySession {
+                    active_profile_id: active_profile.id.clone(),
+                    sandbox_port: sport,
+                    auth_dir: auth_dir.clone(),
+                    sandbox_root: sbx_home.clone(),
+                    choices,
+                });
+            }
+            config::update(&dir, |current| current.runtime_transaction = None)
+                .map_err(|error| error.to_string())?;
+            trace.finish("attention=history_choice_required");
+            return Ok(json!({
+                "msg": "检测到多份旧历史记录。请选择要恢复的一份；CSSwitch 不会删除其他记录。",
+                "action": "history_choice_required",
+                "stage": "history_recovery",
+                "status": "attention",
+                "recovery_status": "choice_required",
+                "choices": visible_choices,
+                "fallback_url": null
+            }));
+        }
+        Err(oauth_forge::EnsureVirtualLoginError::Message(message)) => {
+            return Err(format!("写虚拟登录失败：{message}"));
+        }
+    };
     // Keep the full identity available for internal validation without writing
     // UUIDs or filesystem paths to the sandbox log or frontend error state.
     let _validated_login_identity = (

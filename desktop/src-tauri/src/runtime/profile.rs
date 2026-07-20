@@ -182,7 +182,9 @@ pub(crate) fn build_list_templates(experimental_codex_enabled: bool) -> Vec<serd
                 "recommended_default_model_route_id": recommended_default_model_route_id,
                 "recommended_role_bindings": recommended_role_bindings,
                 "icon": t.icon, "icon_color": t.icon_color,
-                "website_url": t.website_url, "capabilities": template_capabilities(t),
+                "website_url": t.website_url,
+                "compatibility_notice": t.compatibility_notice,
+                "capabilities": template_capabilities(t),
             })
         })
         .collect()
@@ -1294,7 +1296,7 @@ mod tests {
             .any(|t| t["id"] == "codex"));
 
         let v = build_list_templates(false);
-        assert_eq!(v.len(), 11);
+        assert_eq!(v.len(), 15);
         assert!(!v.iter().any(|t| t["id"] == "codex"));
         assert!(v.iter().any(|t| t["id"] == "custom"));
         assert!(v.iter().any(|t| t["id"] == "custom-openai"));
@@ -1310,9 +1312,21 @@ mod tests {
             "openai_models_or_manual"
         );
         assert_eq!(custom["capabilities"]["base_url_required"], true);
+        for id in [
+            "opencode-go-openai",
+            "opencode-go-anthropic",
+            "grok",
+            "gemini",
+        ] {
+            let template = v.iter().find(|template| template["id"] == id).unwrap();
+            assert_eq!(template["capabilities"]["model_required"], true);
+            assert!(template["compatibility_notice"]
+                .as_str()
+                .is_some_and(|notice| notice.contains("limited")));
+        }
 
         let enabled = build_list_templates(true);
-        assert_eq!(enabled.len(), 12);
+        assert_eq!(enabled.len(), 16);
         let codex = enabled.iter().find(|t| t["id"] == "codex").unwrap();
         assert_eq!(codex["capabilities"]["auth_mode"], "csswitch_oauth");
         assert_eq!(
