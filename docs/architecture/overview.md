@@ -44,7 +44,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 | Codex OAuth / thinking / generation records | CSSwitch data root 下的私有 `codex-*.v1.json` | CSSwitch Gateway |
 | v0.4.2 / v0.4.3 legacy Skill store / inventory | 原样保留但不参与当前 runtime | 非当前运行路径 |
 
-持久 data-dir 提供状态连续性，不固定 executable 版本。正常新启动优先用户当前安装的 App；历史缓存只有在 App 不可用、版本可读且用户仅本次授权时才可使用。详见 [Science runtime 合同](science-runtime.md)。
+持久 data-dir 提供状态连续性，不固定 executable 版本。正常新启动优先只读复用官方 updater 已下载并通过预检的 `~/.claude-science/bin/claude-science`，不可用时回退当前 App；历史缓存只有在二者都不可用、版本可读且用户仅本次授权时才可使用。详见 [Science runtime 合同](science-runtime.md)。
 
 ## 组件边界
 
@@ -78,7 +78,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 - Science preview port 由 CSSwitch 显式分配并检查冲突、保留端口和溢出。
 - 原始 Science `serve` 输出可能含 data-dir 或一次性 URL，因此不直接进入 CSSwitch 日志。
 - 一次性 Science URL、nonce 与 CSRF 状态只在 backend 内存和限界控制流中使用，不序列化到普通 Tauri status。
-- 第三方模式不读取或复制真实 Claude 登录数据。
+- 第三方模式不读取或复制真实 Claude 登录数据；只按 runtime 合同校验和执行精确官方 downloaded executable，并为其注入独立 HOME/data-dir。
 - 系统浏览器使用自身网络配置；CSSwitch 的 Codex route 只控制 sidecar / Gateway 的 HTTPS socket，不声称检测系统 TUN。
 
 ## 失败边界

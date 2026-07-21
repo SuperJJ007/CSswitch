@@ -5,7 +5,7 @@
 ## 1. 安全护栏
 
 - Test 编译期固定使用 `$HOME/.csswitch-acceptance`，正式构建使用 `$HOME/.csswitch`；即使都从 Finder 启动也不得互相迁移、覆盖或读取配置。自动验收仍使用每次全新的独立 `HOME`、独立 Science data-dir 和动态测试端口，形成第二层隔离。
-- 准备环境时不读取、修改或删除真实 `~/.claude-science`、任何 Keychain / OAuth、SSH 私钥或真实 `~/.csswitch`。
+- 准备环境时不枚举、修改或删除真实 `~/.claude-science`、任何 Keychain / OAuth、SSH 私钥或真实 `~/.csswitch`。Production installed-runtime 验收经单独授权后，只能校验/执行精确 `~/.claude-science/bin/claude-science`；Acceptance artifact 仍禁用该 candidate。
 - Codex OAuth 只写入 Acceptance data root 下的 `codex-oauth.v1.json` 与 `codex-thinking.v1.json`；guard 不创建、不选择、不解锁任何 Keychain。只有用户在 Acceptance app 中明确点击 Codex 登录 / 退出后，才允许写入或删除这些文件；不得读取、覆盖或删除正式 CSSwitch、原生 Codex 的 `~/.codex` 会话或任何 macOS Keychain 项。
 - 真实 Science 的 `8765` 端口只用 `lsof` 观察基线 PID，不停止或接管。
 - 已安装 CSSwitch 正在运行时，不强退用户实例；构建独立 bundle ID 的 Acceptance app。
@@ -126,8 +126,9 @@ RM-01～RM-34 保留历史编号；Codex 场景从 RM-35 继续，0.8.1 新增 p
 | RM-16 | 重启恢复 | 同一隔离 HOME 重开 | profiles / active / notes / ports 持久；不自动启动；恢复不能仅凭端口冒认 runtime |
 | RM-17 | 包资源 | 从 `.app` 与挂载 DMG 启动 | `Contents/MacOS/{desktop,csswitch-gateway}` 与 `Contents/Resources/scripts` 齐全；无旧 `Resources/proxy`；正式包无需 `CSSWITCH_REPO` |
 | RM-18 | 发布安全 | hash、codesign、spctl、stapler | 签名完整性、身份、公证、ticket、Gatekeeper 分栏；不把 ad-hoc 写成已公证 |
-| RM-19 | installed App 优先 | App 与 stale cache 同时存在 | 选择 App executable，复用原 data-dir，cache 不被改写 |
+| RM-19 | 官方 downloaded runtime 优先 | 官方 downloaded runtime、App 与 stale cache 同时存在 | 选择 `official_downloaded`，复用隔离 data-dir，App/cache 不被改写；candidate 无效时明确回退 App |
 | RM-20 | explicit / cache preflight | 合法 / 非法 `SCIENCE_BIN`，App 缺失与 cache 组合 | override 无效 fail closed；cache 仅版本可读时提供 one-shot；选择不持久化 |
+| RM-53 | 官方 / 隔离并行共享 executable | 官方 8765 已运行，启动隔离动态端口或 8990 | 两个 PID 可解析到同一 official downloaded executable/build；官方 PID 不变，隔离 HOME/data-dir、端口与 managed identity 独立；隔离保持 `--no-auto-update` |
 | RM-21 | Science 升级与强身份 | 替换测试 App 后 stopped-to-started；再恢复 / stop | 新 executable + 原 data-dir；启动 / 恢复 / stop 核对 PID、binary、data-dir、port；UI status 仍只代表 HTTP health |
 | RM-22 | Skill Agent 控制面 | 首次配置、重复启动、注入中途失败 | 管理固定 route / connector / `customize` / prompt；成功 marker 后跳过重复；失败 warning 且如实报告可能的部分配置 |
 | RM-23 | 外部 Skill 安装 | 精确公开 GitHub URL | connector -> host approval -> commit -> native attach -> `skill()` load，各阶段分开记录 |
