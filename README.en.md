@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="./LICENSE">MIT License</a> · <strong>CSSwitch v0.8.0</strong> · macOS Apple Silicon · Tauri 2
+  <a href="./LICENSE">MIT License</a> · <strong>CSSwitch v0.8.1</strong> · macOS Apple Silicon · Tauri 2
 </p>
 
 <p align="center">
@@ -11,14 +11,16 @@
   Switch between mainstream providers, Codex, and custom compatible endpoints.
 </p>
 
+> Linux x64 users can use the [CSSwitch v0.8.1 Linux x64 prerelease](https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.8.1-linux-x64), provided as an amd64 `.deb` package.
+
 <p align="center">
-  <img src="docs/assets/csswitch-v0.8-ui-demo.gif" alt="CSSwitch v0.8.0 UI demo" width="942">
+  <img src="docs/assets/csswitch-v0.8-ui-demo.gif" alt="CSSwitch v0.8 series UI demo" width="942">
 </p>
 
 ---
 
 <p align="center">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.0/CSSwitch_0.8.0_aarch64.dmg">Download v0.8.0</a> ·
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.1/CSSwitch_0.8.1_aarch64.dmg">Download v0.8.1</a> ·
   <a href="#install-and-start">Install and start</a> ·
   <a href="#providers-and-models">Providers and models</a> ·
   <a href="#skills-and-mcp">Skills and MCP</a> ·
@@ -29,7 +31,7 @@
 
 You need an Apple Silicon Mac, [Claude Science](https://claude.com/download), and either a third-party model API key or a Codex account.
 
-1. Download [`CSSwitch_0.8.0_aarch64.dmg`](https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.0/CSSwitch_0.8.0_aarch64.dmg) and drag CSSwitch into Applications.
+1. Download [`CSSwitch_0.8.1_aarch64.dmg`](https://github.com/SuperJJ007/CSSwitch/releases/download/v0.8.1/CSSwitch_0.8.1_aarch64.dmg) and drag CSSwitch into Applications.
 2. Create a profile and enter the API key, model names, and `base_url` when required.
 3. Choose **Set active**, then **Start**.
 4. Select the model from the model picker at the top of Science.
