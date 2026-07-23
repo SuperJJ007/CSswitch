@@ -2,15 +2,15 @@
 
 最后整理：2026-07-20。已解决历史放入 CHANGELOG 或 dated evidence，不在这里重复。
 
-## v0.8.1 源码候选
+## v0.8.1 已发布后的边界
 
 - OpenCode Go、Grok 与 Gemini 的 0.8.1 门禁覆盖文本、多轮、tools / `tool_choice`、模型发现或手填、标题和 classifier；图片、厂商专有 reasoning、原生流式与结构化输出仍为 limited，Gemini native API 不在本版范围。
-- 当前建立的是源码、单测与隔离 mock / loopback 证据。OpenCode Go、Grok、Gemini、Kimi、DeepSeek 与 Codex 的用户 key / OAuth live 验收，以及最终安装态 Science 复核，仍需用户逐项授权和凭据输入，不能由本地门禁替代。
-- v0.8.1 尚未形成干净发布 commit、tag、公开附件或 release 回读；在这些层完成前，`.agents/context/current-release.md` 继续以 v0.8.0 为当前公开版本。
+- 当前已建立 clean source、单测、隔离 mock / loopback、最终安装 UI 和公开附件回读。最终 artifact 没有执行 OpenCode Go、Grok、Gemini、Kimi、DeepSeek 或 Codex 的用户 key / OAuth live 推理，不能由本地门禁替代。
+- 多历史组织恢复已有精确 marker / choice / identity 测试，最终安装版没有构造真实多组织 Sign out 数据集；SSH bridge 已通过系统 OpenSSH 测试，尚未证明 Claude Science 自身前置解析器接受该 `Include`。
 
 ## 分发
 
-- v0.8.0 公开附件只有经过完整性验证的 ad-hoc seal，没有建立 Developer ID、notarization、stapled ticket 或 Gatekeeper acceptance 证据。首次打开可能需要用户右键选择“打开”。
+- v0.8.1 公开附件只有经过完整性验证的 ad-hoc seal，没有建立 Developer ID、notarization、stapled ticket 或 Gatekeeper acceptance 证据。首次打开可能需要用户右键选择“打开”。
 
 ## Codex
 
@@ -30,4 +30,4 @@
 
 ## 测试
 
-- 真机验收矩阵描述应执行的场景，不表示最终 v0.8.0 DMG 已逐项全部执行。每次验收必须绑定 exact artifact，并把通过、失败、环境阻塞与未执行分开记录。
+- 真机验收矩阵描述应执行的场景，不表示最终 v0.8.1 DMG 已逐项全部执行。每次验收必须绑定 exact artifact，并把通过、失败、环境阻塞与未执行分开记录。
